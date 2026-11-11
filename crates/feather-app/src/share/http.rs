@@ -65,6 +65,19 @@ const APP_JS: &str = include_str!("web/app.js");
 const LOGIN_JS: &str = include_str!("web/login.js");
 const ICON_SVG: &str = include_str!("web/icon.svg");
 
+/// A page file. The browser test server can read them from
+/// `FEATHER_WEB_DIR` instead, so changes show without a rebuild.
+fn asset(name: &str, built_in: &'static str) -> &'static str {
+    #[cfg(test)]
+    if let Some(folder) = std::env::var_os("FEATHER_WEB_DIR") {
+        if let Ok(text) = std::fs::read_to_string(Path::new(&folder).join(name)) {
+            return Box::leak(text.into_boxed_str());
+        }
+    }
+    let _ = name;
+    built_in
+}
+
 /// Sent with every response.
 const SECURITY_HEADERS: &str = "Strict-Transport-Security: max-age=31536000\r\n\
 X-Content-Type-Options: nosniff\r\n\
@@ -689,13 +702,26 @@ fn handle(shared: &Shared, conn: &mut Conn, request: &Request, client: IpAddr) -
     };
     let e2e = shared.e2e.is_some();
     match (request.method.as_str(), request.path.as_str()) {
-        ("GET", "/app.css") => static_file(conn, request, "text/css; charset=utf-8", APP_CSS),
-        ("GET", "/app.js") => static_file(conn, request, "text/javascript; charset=utf-8", APP_JS),
-        ("GET", "/login.js") => {
-            static_file(conn, request, "text/javascript; charset=utf-8", LOGIN_JS)
-        }
+        ("GET", "/app.css") => static_file(
+            conn,
+            request,
+            "text/css; charset=utf-8",
+            asset("app.css", APP_CSS),
+        ),
+        ("GET", "/app.js") => static_file(
+            conn,
+            request,
+            "text/javascript; charset=utf-8",
+            asset("app.js", APP_JS),
+        ),
+        ("GET", "/login.js") => static_file(
+            conn,
+            request,
+            "text/javascript; charset=utf-8",
+            asset("login.js", LOGIN_JS),
+        ),
         ("GET", "/icon.svg" | "/favicon.ico") => {
-            static_file(conn, request, "image/svg+xml", ICON_SVG)
+            static_file(conn, request, "image/svg+xml", asset("icon.svg", ICON_SVG))
         }
         ("GET", "/login") => {
             if session.is_some() {
@@ -735,7 +761,8 @@ fn handle(shared: &Shared, conn: &mut Conn, request: &Request, client: IpAddr) -
         ("POST", "/e2e/login") if e2e => e2e_login(shared, conn, request, client),
         ("GET", "/") => {
             if session.is_some() {
-                let page = APP_HTML.replace("{{e2e}}", if e2e { "1" } else { "0" });
+                let page =
+                    asset("app.html", APP_HTML).replace("{{e2e}}", if e2e { "1" } else { "0" });
                 send(
                     conn,
                     200,
@@ -841,7 +868,7 @@ fn login_page(conn: &mut Conn, e2e: bool, status: u16, message: &str) -> io::Res
             escape_html(message)
         )
     };
-    let page = LOGIN_HTML
+    let page = asset("login.html", LOGIN_HTML)
         .replace("{{note}}", &note)
         .replace("{{e2e}}", if e2e { "1" } else { "0" });
     send(
