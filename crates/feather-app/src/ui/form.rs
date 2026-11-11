@@ -4598,6 +4598,30 @@ unsafe fn host_ref<'a>(hwnd: HWND) -> Option<&'a mut Host> {
     (!pointer.is_null()).then(|| &mut *pointer)
 }
 
+/// Asks every dialog that `owner` has open on this thread to close, as its
+/// close button would (a dialog with a result to give cancels).
+pub fn close_owned_by(owner: HWND) {
+    use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumThreadWindows, GetClassNameW, GetWindow, GW_OWNER,
+    };
+
+    unsafe extern "system" fn each(hwnd: HWND, owner: LPARAM) -> i32 {
+        let mut class = [0u16; 32];
+        let len = GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32).max(0) as usize;
+        if GetWindow(hwnd, GW_OWNER) as LPARAM == owner
+            && String::from_utf16_lossy(&class[..len]) == "FeatherFormWindow"
+        {
+            PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        }
+        1
+    }
+
+    unsafe {
+        EnumThreadWindows(GetCurrentThreadId(), Some(each), owner as LPARAM);
+    }
+}
+
 fn lparam_point(lparam: LPARAM) -> (f32, f32) {
     let x = (lparam & 0xffff) as u16 as i16 as f32;
     let y = ((lparam >> 16) & 0xffff) as u16 as i16 as f32;

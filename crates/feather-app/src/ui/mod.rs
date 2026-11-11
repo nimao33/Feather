@@ -197,6 +197,15 @@ pub struct Ui {
     summoned: bool,
     /// Set by Quit, so closing really exits instead of hiding to the tray.
     quitting: bool,
+    /// Window procedure calls using this `Ui` right now. More than one
+    /// means a handler is running a message loop of its own (Settings, a
+    /// menu, a file picker) and is still using it.
+    entered: u32,
+    /// Closing was asked for while a handler was still using the window; it
+    /// closes when that handler returns.
+    close_pending: bool,
+    /// The window is gone; the outermost call still using this `Ui` frees it.
+    destroyed: bool,
     /// The sidebar's width, animated between folded and open.
     sidebar_w: anim::Tween,
     /// How far the details pane is out, animated by its toggle.
@@ -320,6 +329,9 @@ impl Ui {
             tray_on: false,
             summoned: false,
             quitting: false,
+            entered: 0,
+            close_pending: false,
+            destroyed: false,
             sidebar_w: anim::Tween::new(if settings_collapsed {
                 layout::SIDEBAR_COLLAPSED_W
             } else {
@@ -1921,7 +1933,10 @@ impl Ui {
                 }
                 self.register_hotkey();
                 self.update_tray();
-                wallpaper::cleanup(&self.settings.background_image);
+                // Test and screenshot runs never touch the person's pictures.
+                if self.persist {
+                    wallpaper::cleanup(&self.settings.background_image);
+                }
                 self.update_sharing();
                 if self.settings.index_roots != old_roots {
                     self.start_watcher();
@@ -1934,7 +1949,10 @@ impl Ui {
                 let mut before = before;
                 copy_sharing(&self.settings, &mut before);
                 self.apply_settings(before);
-                wallpaper::cleanup(&self.settings.background_image);
+                // Test and screenshot runs never touch the person's pictures.
+                if self.persist {
+                    wallpaper::cleanup(&self.settings.background_image);
+                }
                 if had_hotkey {
                     self.register_hotkey();
                 }
@@ -3289,6 +3307,9 @@ unsafe extern "system" fn wndproc(
 
     let pointer = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Ui;
     if !pointer.is_null() {
+        // Keeps the `Ui` alive until this call is done with it, even if a
+        // nested message loop below destroys the window.
+        let _entered = Entered::new(pointer);
         let ui = &mut *pointer;
         match message {
             WM_PAINT => {
@@ -3489,6 +3510,16 @@ unsafe extern "system" fn wndproc(
                     ui.dismiss();
                     return 0;
                 }
+                if ui.entered > 1 {
+                    // Quit arrived while Settings, a menu or a picker runs
+                    // its own message loop for a handler further up, which
+                    // still uses this window. Ask those to end; the window
+                    // closes when that handler returns.
+                    ui.close_pending = true;
+                    form::close_owned_by(hwnd);
+                    windows_sys::Win32::UI::WindowsAndMessaging::EndMenu();
+                    return 0;
+                }
                 ui.save_settings();
                 DestroyWindow(hwnd);
                 return 0;
@@ -3508,13 +3539,51 @@ unsafe extern "system" fn wndproc(
             }
             WM_NCDESTROY => {
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-                drop(Box::from_raw(pointer));
+                // Freed by `Entered` once no call is using it any more.
+                ui.destroyed = true;
                 return DefWindowProcW(hwnd, message, wparam, lparam);
             }
             _ => {}
         }
     }
     DefWindowProcW(hwnd, message, wparam, lparam)
+}
+
+/// One window procedure call using the `Ui` behind the main window.
+///
+/// A handler that runs a message loop of its own (Settings, a menu, a file
+/// picker) still holds the `Ui` while that loop handles more messages for
+/// the window. Counting the calls lets closing wait for the outermost one,
+/// and the `Ui` is freed only once nothing is using it; freeing it under
+/// Settings is what made quitting while Settings was open a double free.
+struct Entered(*mut Ui);
+
+impl Entered {
+    /// `pointer` must be the live `Ui` stored in the window.
+    unsafe fn new(pointer: *mut Ui) -> Self {
+        (*pointer).entered += 1;
+        Self(pointer)
+    }
+}
+
+impl Drop for Entered {
+    fn drop(&mut self) {
+        // SAFETY: the `Ui` is freed only here, by the last call to leave,
+        // so it is still alive.
+        unsafe {
+            let pointer = self.0;
+            (*pointer).entered -= 1;
+            if (*pointer).entered > 0 {
+                return;
+            }
+            if (*pointer).destroyed {
+                drop(Box::from_raw(pointer));
+            } else if (*pointer).close_pending {
+                (*pointer).close_pending = false;
+                PostMessageW((*pointer).hwnd, WM_CLOSE, 0, 0);
+            }
+        }
+    }
 }
 
 /// The `TaskbarCreated` message id, looked up once.
@@ -4359,4 +4428,60 @@ pub fn run_scenarios(index: Arc<IndexSet>, screenshots: &Path) -> Result<(), Str
     }
     pump_messages(std::ptr::null_mut());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{IsWindow, WM_QUIT};
+
+    /// Quitting while Settings is open (`feather quit`, or Quit in the tray
+    /// menu) used to destroy the window, and free its state, under the
+    /// Settings call that was still using it: a double free once Settings
+    /// returned. Now the window closes after Settings does.
+    #[test]
+    #[ignore = "opens a Settings window on the desktop; run with --ignored"]
+    fn quitting_while_settings_is_open_waits_for_settings() {
+        let base = std::env::temp_dir().join(format!("feather-quit-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        // Nothing here may touch the person's own settings or pictures.
+        std::env::set_var("APPDATA", &base);
+        std::env::set_var("LOCALAPPDATA", &base);
+
+        let index = Arc::new(IndexSet::empty());
+        let hwnd = create_window(index, false, Settings::default(), false).unwrap();
+        let rect = unsafe { ui_ref(hwnd) }
+            .and_then(|ui| ui.layout.button(Button::Settings))
+            .expect("the Settings button");
+        let (x, y) = ((rect.l + rect.r) / 2.0, (rect.t + rect.b) / 2.0);
+        let hit = unsafe { ui_ref(hwnd) }.map(|ui| ui.hit_at(x, y));
+        assert!(hit == Some(Hit::Button(Button::Settings)));
+        let point = (x as isize & 0xffff) | ((y as isize & 0xffff) << 16);
+        unsafe {
+            PostMessageW(hwnd, WM_LBUTTONDOWN, 0, point);
+            PostMessageW(hwnd, WM_LBUTTONUP, 0, point);
+            // Handled by the loop Settings runs while it is open.
+            PostMessageW(hwnd, WM_QUIT_FEATHER, 0, 0);
+        }
+        let started = Instant::now();
+        let mut message = MSG::default();
+        while unsafe { IsWindow(hwnd) } != 0 {
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "the window never closed"
+            );
+            if unsafe { PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) } > 0 {
+                if message.message != WM_QUIT {
+                    unsafe {
+                        TranslateMessage(&message);
+                        DispatchMessageW(&message);
+                    }
+                }
+            } else {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
