@@ -204,6 +204,15 @@ main { max-width: 1100px; margin: 0 auto; padding: 16px 20px 48px; }
 .icon-button { display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 28px; margin-right: 4px; border-radius: 7px; color: var(--text2); vertical-align: middle; }
 .icon-button:hover { background: var(--hover); color: var(--text); }
 
+/* Download a folder */
+.zip { flex: none; color: var(--text2); }
+.zip svg, .tile-action svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+.zip[hidden] { display: none; }
+.list .actions .icon-button { height: 28px; padding: 0; border: 0; background: none; }
+.tile { position: relative; min-width: 0; }
+.tile-action { position: absolute; top: 6px; right: 6px; width: 32px; height: 32px; padding: 0; justify-content: center; border-radius: 8px; background: var(--panel); color: var(--text2); opacity: 0.9; }
+.tile-action:hover { color: var(--text); }
+
 /* Thumbnails view */
 .grid { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(156px, 1fr)); gap: 14px 12px; }
 .tile-link { display: flex; flex-direction: column; gap: 6px; width: 100%; height: auto; padding: 0; border: 0; background: none; text-decoration: none; text-align: left; cursor: pointer; }
@@ -395,6 +404,8 @@ body.viewing { overflow: hidden; }
   .list .actions { white-space: normal; }
   .list .actions button { width: 100%; justify-content: center; margin: 3px 0; }
   .list td, .list th { padding-left: 10px; padding-right: 10px; }
+  .zip { width: 36px; padding: 0; justify-content: center; }
+  .zip span { display: none; }
   .grid { grid-template-columns: repeat(auto-fill, minmax(104px, 1fr)); gap: 10px 8px; }
   .viewer-top { padding-left: 16px; }
   .strip-item { width: 48px; height: 48px; }

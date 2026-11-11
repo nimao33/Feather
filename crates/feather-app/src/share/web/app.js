@@ -214,6 +214,42 @@ function downloadLink(root, path) {
   return '/api/download?' + query({ root, path });
 }
 
+const DOWNLOAD_ICON = '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 3v10m-4-4 4 4 4-4M4 16h12"/></svg>';
+
+function zipLink(root, path, names) {
+  const params = { root, path };
+  let link = '/api/zip?' + query(params);
+  for (const name of names || []) link += '&' + query({ name });
+  return link;
+}
+
+/**
+ * Saves a folder, or some of what's in it, as one zip. The server streams
+ * it, so the browser's own download list shows the progress. End to end,
+ * folders can't be zipped: sealed downloads are decrypted in the page's
+ * memory, and a folder can be far bigger than a phone can hold.
+ */
+function saveZip(root, path, label, names) {
+  if (e2e) {
+    status('Folders can’t be downloaded as a zip while the share is encrypted end to end. '
+      + 'Open the folder and download its files one at a time.', true);
+    return;
+  }
+  const link = document.createElement('a');
+  link.href = zipLink(root, path, names);
+  link.setAttribute('download', label + '.zip');
+  document.body.append(link);
+  link.click();
+  link.remove();
+  status('Zipping ' + label + '… Your browser shows the download as it arrives.');
+  setTimeout(() => { if ($('status').textContent.startsWith('Zipping ' + label)) status(''); }, 8000);
+}
+
+function folderLabel(root, path) {
+  const parts = path.split('/').filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : rootName(root);
+}
+
 async function save(root, path, name) {
   status('Downloading ' + name + '…');
   try {
@@ -921,8 +957,10 @@ function row(entry) {
     const get = saveLink(entry, 'icon-button', '');
     get.setAttribute('aria-label', 'Download ' + entry.name);
     get.title = 'Download';
-    get.innerHTML = '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 3v10m-4-4 4 4 4-4M4 16h12"/></svg>';
+    get.innerHTML = DOWNLOAD_ICON;
     actions.append(get);
+  } else if (entry.dir && !e2e) {
+    actions.append(zipButton(entry, 'icon-button'));
   }
   if (state.info.mode === 'full' && !entry.top) {
     const rename = element('button', '', 'Rename');
@@ -935,6 +973,20 @@ function row(entry) {
   }
   tr.append(actions);
   return tr;
+}
+
+/** A button that saves a folder as a zip. */
+function zipButton(entry, className) {
+  const button = element('button', className);
+  button.type = 'button';
+  button.setAttribute('aria-label', 'Download ' + entry.name + ' as a zip');
+  button.title = 'Download as .zip';
+  button.innerHTML = DOWNLOAD_ICON;
+  button.addEventListener('click', (event) => {
+    event.stopPropagation();
+    saveZip(entry.root, entry.path, entry.name);
+  });
+  return button;
 }
 
 function tile(entry) {
@@ -962,6 +1014,7 @@ function tile(entry) {
   link.append(caption);
   if (entry.where !== undefined) link.append(element('span', 'where', entry.where));
   li.append(link);
+  if (entry.dir && !e2e) li.append(zipButton(entry, 'tile-action'));
   return li;
 }
 
@@ -1008,6 +1061,7 @@ async function open(root, path) {
   state.root = root;
   state.path = path;
   $('tools').hidden = !(state.info.mode === 'full' && root !== null);
+  $('zip').hidden = e2e || root === null;
   trail();
   status('');
   if (root === null) {
@@ -1028,6 +1082,7 @@ async function search(text) {
   state.query = text;
   // Uploads go to a folder, not into search results.
   $('tools').hidden = true;
+  $('zip').hidden = true;
   trail();
   status('Searching…');
   try {
@@ -1158,6 +1213,7 @@ async function start() {
     if (files.length) upload(files);
   });
   $('mkdir').addEventListener('click', makeFolder);
+  $('zip').addEventListener('click', () => saveZip(state.root, state.path, folderLabel(state.root, state.path)));
   offerLocal();
   $('as-list').addEventListener('click', () => chooseView('list'));
   $('as-grid').addEventListener('click', () => chooseView('grid'));

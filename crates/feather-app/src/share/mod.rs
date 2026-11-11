@@ -1041,7 +1041,11 @@ mod tests {
         config.folders = vec![shared.to_string_lossy().to_string()];
         let sharing = Sharing::start_with(config, Arc::new(IndexSet::empty()), &state, true);
         println!("ready {:?}", sharing.status().problems);
-        std::thread::sleep(Duration::from_secs(180));
+        let seconds = std::env::var("FEATHER_PAGE_SECONDS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(180);
+        std::thread::sleep(Duration::from_secs(seconds));
     }
 
     #[test]
@@ -1543,6 +1547,30 @@ mod tests {
         assert!(entries
             .iter()
             .any(|entry| entry.name == "shared/docs/a.txt"));
+
+        // Some of a folder: only what was chosen, and only visible names.
+        let (code, _, body) = https(
+            &tls_config,
+            port,
+            &format!(
+                "GET /api/zip?root=0&path=docs&name=a.txt&name=sub&name=private HTTP/1.1\r\n{signed}\r\n"
+            ),
+            b"",
+        );
+        assert_eq!(code, 200);
+        let entries = zip::read::entries(&unchunk(&body));
+        let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert!(names.contains(&"docs/a.txt") && names.contains(&"docs/sub/Fotó 1.bin"));
+        assert!(!names
+            .iter()
+            .any(|name| name.contains("empty") || name.contains("private")));
+        let (code, _, _) = https(
+            &tls_config,
+            port,
+            &format!("GET /api/zip?root=0&path=docs&name=..%2Fouter HTTP/1.1\r\n{signed}\r\n"),
+            b"",
+        );
+        assert_eq!(code, 400);
 
         // HTTP/1.0 has no chunks: the zip ends with the connection.
         let (code, head, body) = https(

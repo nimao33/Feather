@@ -275,6 +275,15 @@ impl Params {
             .map(|(_, value)| value.as_str())
     }
 
+    /// Every value given for `name`.
+    fn all(&self, name: &str) -> Vec<&str> {
+        self.0
+            .iter()
+            .filter(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+            .collect()
+    }
+
     fn root(&self) -> usize {
         self.get("root")
             .and_then(|value| value.parse().ok())
@@ -1001,8 +1010,9 @@ enum Reply {
     File(PathBuf, bool),
     /// A JPEG preview of a file, at most this many pixels across.
     Thumb(PathBuf, u32),
-    /// A folder as a zip: the shared folder's number and the path in it.
-    Zip(usize, String),
+    /// A folder as a zip: the shared folder's number, the path in it, and
+    /// when only some of what's in it is wanted, their names.
+    Zip(usize, String, Vec<String>),
     /// Signed out.
     Logout,
 }
@@ -1107,11 +1117,20 @@ fn call(
         },
         ("GET", "/api/zip") => match shared.roots.resolve(params.root(), params.path()) {
             Ok(folder) if folder.is_dir() => {
+                let names: Vec<String> = params.all("name").into_iter().map(String::from).collect();
+                if names.iter().any(|name| files::check_name(name).is_err()) {
+                    return refuse(Denied::BadName);
+                }
+                let what = if names.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({} chosen)", names.len())
+                };
                 shared.log(
                     client,
-                    &format!("download folder {}", files::display_path(&folder)),
+                    &format!("download folder {}{what}", files::display_path(&folder)),
                 );
-                Reply::Zip(params.root(), params.path().to_string())
+                Reply::Zip(params.root(), params.path().to_string(), names)
             }
             Ok(_) => Reply::Json(400, error_json("That is a file, not a folder.")),
             Err(denied) => refuse(denied),
@@ -1258,8 +1277,8 @@ fn plain_api(
             return download_plain(conn, request, &path, inline);
         }
         Reply::Thumb(path, side) => return thumb_plain(conn, request, &path, side),
-        Reply::Zip(root, relative) => {
-            return zip_plain(shared, conn, request, client, root, &relative)
+        Reply::Zip(root, relative, names) => {
+            return zip_plain(shared, conn, request, client, root, &relative, &names)
         }
     }
     Ok(true)
@@ -1607,6 +1626,7 @@ pub(crate) fn pack_folder<W: Write>(
     roots: &files::Roots,
     root: usize,
     relative: &str,
+    only: &[String],
     top: &str,
     zip: &mut ZipWriter<W>,
     stop: &dyn Fn() -> bool,
@@ -1646,6 +1666,9 @@ pub(crate) fn pack_folder<W: Write>(
         names.sort_by_key(|name| name.to_lowercase());
         let mut folders = Vec::new();
         for name in names {
+            if depth == 0 && !only.is_empty() && !only.contains(&name) {
+                continue;
+            }
             let path = if folder.is_empty() {
                 name.clone()
             } else {
@@ -1740,6 +1763,7 @@ fn zip_plain(
     client: IpAddr,
     root: usize,
     relative: &str,
+    only: &[String],
 ) -> io::Result<bool> {
     let top = zip_top(shared, root, relative);
     let disposition: String = disposition(&format!("{top}.zip"), false)
@@ -1762,7 +1786,7 @@ fn zip_plain(
     };
     let mut zip = ZipWriter::new(&mut body);
     let stop = || shared.stopping();
-    let Ok(packed) = pack_folder(&shared.roots, root, relative, &top, &mut zip, &stop) else {
+    let Ok(packed) = pack_folder(&shared.roots, root, relative, only, &top, &mut zip, &stop) else {
         // The visitor left; the download shows as failed.
         return Ok(false);
     };
