@@ -40,7 +40,9 @@ web page.
 - **Details pane** with the icon, type, size, dates, and Open, Show in folder
   and Copy path.
 - **Real Explorer context menu** on right-click.
-- **Global shortcut** (Ctrl+Shift+Space by default), tray icon, start at login.
+- **Global shortcut** (Ctrl+Space by default), tray icon, start at login.
+- **First-run guide** that walks through where to search, the look, the
+  shortcut and a few search tips.
 - **Themes**: light, dark, Mica, Acrylic or solid backgrounds, accent colors,
   and a custom theme with your own colors and background picture. The color
   picker works in OKLCH, RGB and HSL and can pick colors from the screen.

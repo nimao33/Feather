@@ -151,6 +151,8 @@ pub trait FormDialog {
     fn on_button(&mut self, form: &mut Form, id: Id) -> Action;
     /// A value changed.
     fn on_change(&mut self, _form: &Form, _id: Id) {}
+    /// Another page was chosen in the page list.
+    fn on_page(&mut self, _form: &mut Form, _page: usize) {}
     /// A button inside the page (not the footer) was pressed.
     fn on_action(&mut self, _form: &mut Form, _id: Id) {}
     /// The round-arrow button on one item of a list was pressed.
@@ -279,6 +281,8 @@ struct FooterButton {
     id: Id,
     label: String,
     style: ButtonStyle,
+    /// Left out of the footer, as Back on the first step of a guide.
+    hidden: bool,
 }
 
 /// The content of a dialog.
@@ -615,7 +619,21 @@ impl Form {
             id,
             label: label.to_string(),
             style,
+            hidden: false,
         });
+    }
+
+    /// Renames footer button `id`, as Next becoming Finish on the last step.
+    pub fn set_button_label(&mut self, id: Id, label: &str) {
+        if let Some(button) = self.buttons.iter_mut().find(|button| button.id == id) {
+            button.label = label.to_string();
+        }
+    }
+
+    pub fn set_button_hidden(&mut self, id: Id, hidden: bool) {
+        if let Some(button) = self.buttons.iter_mut().find(|button| button.id == id) {
+            button.hidden = hidden;
+        }
     }
 
     fn widget(&self, id: Id) -> Option<&Widget> {
@@ -1482,14 +1500,14 @@ fn arrange(form: &Form, gfx: &Gfx, width: f32, height: f32, scroll: f32) -> Arra
     for &index in order.iter().rev() {
         let button = &form.buttons[index];
         let w = button_width(gfx, &button.label);
-        if button.style == ButtonStyle::Quiet {
+        if button.style == ButtonStyle::Quiet || button.hidden {
             continue;
         }
         buttons[index] = Rect::new(right - w, button_t, right, button_t + BUTTON_H);
         right -= w + 8.0;
     }
     for (index, button) in form.buttons.iter().enumerate() {
-        if button.style == ButtonStyle::Quiet {
+        if button.style == ButtonStyle::Quiet && !button.hidden {
             let w = button_width(gfx, &button.label);
             buttons[index] = Rect::new(left - 12.0, button_t, left - 12.0 + w, button_t + BUTTON_H);
             left += w + 8.0;
@@ -1937,7 +1955,11 @@ impl Host {
                 stops.push(stop);
             }
         }
-        stops.extend((0..self.form.buttons.len()).map(Part::Button));
+        stops.extend(
+            (0..self.form.buttons.len())
+                .filter(|&index| !self.form.buttons[index].hidden)
+                .map(Part::Button),
+        );
         stops
     }
 
@@ -2022,6 +2044,7 @@ impl Host {
         }
         self.stop_recording();
         self.form.set_page(page);
+        self.dialog.on_page(&mut self.form, page);
         self.scroll.jump(0.0);
         self.focus = if self.focus_visible {
             Some(Part::Page(0))
@@ -2260,11 +2283,24 @@ impl Host {
     }
 
     fn press_button(&mut self, index: usize) {
-        let Some(id) = self.form.buttons.get(index).map(|button| button.id) else {
+        let Some(id) = self
+            .form
+            .buttons
+            .get(index)
+            .filter(|button| !button.hidden)
+            .map(|button| button.id)
+        else {
             return;
         };
+        let page = self.form.current_page();
         match self.dialog.on_button(&mut self.form, id) {
             Action::Stay => {
+                // A button that moved to another page, like Next.
+                if self.form.current_page() != page {
+                    self.stop_recording();
+                    self.scroll.jump(0.0);
+                    self.set_hover(None);
+                }
                 self.refresh_look();
                 self.apply_focus_request();
                 self.kick();
@@ -3454,6 +3490,9 @@ impl View<'_> {
             p.text(error, Font::Body, a.error, pal.danger);
         }
         for (index, button) in self.form.buttons.iter().enumerate() {
+            if button.hidden {
+                continue;
+            }
             let rect = a.buttons[index];
             let part = Part::Button(index);
             let level = self.level(part);

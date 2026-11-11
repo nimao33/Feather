@@ -314,7 +314,7 @@ dependencies = [
 
 [[package]]
 name = "feather-app"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "argon2",
  "cosmic-text",
@@ -336,7 +336,7 @@ dependencies = [
 
 [[package]]
 name = "feather-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "crc32fast",
  "memchr",

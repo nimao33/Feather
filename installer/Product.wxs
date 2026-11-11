@@ -1,70 +1,86 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
-  <Package Name="Feather" Manufacturer="Feather" Version="1.0.0" UpgradeCode="11ca2731-01e7-4edf-b504-b8a5943598fc" InstallerVersion="200" Compressed="yes">
-    <MajorUpgrade DowngradeErrorMessage="A newer version of Feather is already installed." />
-    <!-- Media element omitted: WiX v4 7.0.1 bug ignores File elements in cabinet.
-         File injection required post-build (use Inno Setup or WiX v3 for working installer). -->
-  </Package>
+<!--
+  Feather's Windows installer. Build it with installer\build-msi.ps1, which
+  passes the variables below:
+    Version  the product version, like 1.0.0
+    Exe      the release feather.exe
+    Icon     feather.ico
+    License  License.rtf
 
-  <Fragment>
-    <Feature Id="MainFeature" Title="Feather" Level="1" Display="expand">
-      <Feature Id="FeatherApp" Title="Feather Application" Level="1">
-        <ComponentGroupRef Id="FeatherFiles" />
-      </Feature>
-      <Feature Id="StartMenuFeature" Title="Start Menu Shortcut" Level="1">
-        <ComponentRef Id="StartMenuShortcut" />
-      </Feature>
-      <Feature Id="DesktopFeature" Title="Desktop Shortcut" Level="1">
-        <ComponentRef Id="DesktopShortcut" />
-      </Feature>
-    </Feature>
-  </Fragment>
+  It installs for the current user only, into
+  %LOCALAPPDATA%\Programs\Feather, so it needs no admin rights. Feather asks
+  for those itself, once, when it reads whole NTFS drives.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+  <Package Name="Feather"
+           Manufacturer="nimao33"
+           Version="$(Version)"
+           UpgradeCode="11ca2731-01e7-4edf-b504-b8a5943598fc"
+           Scope="perUser"
+           Language="1033">
+    <SummaryInformation Description="Feather: fast, low-memory file search" />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Feather is already installed."
+                  Schedule="afterInstallInitialize" />
+    <MediaTemplate EmbedCab="yes" />
 
-  <Fragment>
-    <StandardDirectory Id="ProgramFiles64Folder">
-      <Directory Id="INSTALLFOLDER" Name="Feather" />
+    <Icon Id="FeatherIcon" SourceFile="$(Icon)" />
+    <Property Id="ARPPRODUCTICON" Value="FeatherIcon" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/nimao33/Feather" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/nimao33/Feather/issues" />
+    <Property Id="ARPNOREPAIR" Value="1" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="ProgramsFolder" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="Feather" />
+      </Directory>
     </StandardDirectory>
-  </Fragment>
 
-  <Fragment>
-    <ComponentGroup Id="FeatherFiles" Directory="INSTALLFOLDER">
-      <Component Id="FeatherExe" Guid="f93c1faf-9645-4543-8d89-2a243426e508" Directory="INSTALLFOLDER">
-        <File Id="FeatherExe" Source="feather.exe" KeyPath="yes" Name="feather.exe" />
+    <Feature Id="Main" Title="Feather" Level="1">
+      <Component Id="App" Directory="INSTALLFOLDER" Guid="f93c1faf-9645-4543-8d89-2a243426e508">
+        <File Id="FeatherExe" Name="feather.exe" Source="$(Exe)" />
+        <!-- Per-user components keep their key in the registry. -->
+        <RegistryValue Root="HKCU" Key="Software\Feather\Installer" Name="Folder"
+                       Type="string" Value="[INSTALLFOLDER]" KeyPath="yes" />
+        <RemoveFolder Id="RemoveInstallFolder" On="uninstall" />
       </Component>
-      <Component Id="StartMenuShortcut" Guid="75b10bd0-5817-4472-a416-3c5b3571e5c1">
-        <Shortcut Id="StartMenuShortcut" Directory="ProgramMenuFolder" Name="Feather" Target="[INSTALLFOLDER]feather.exe" WorkingDirectory="INSTALLFOLDER" />
+      <Component Id="StartMenu" Directory="ProgramMenuFolder" Guid="75b10bd0-5817-4472-a416-3c5b3571e5c1">
+        <!-- The same Feather.lnk the app's "Start menu shortcut" switch manages. -->
+        <Shortcut Id="StartMenuShortcut" Name="Feather"
+                  Description="Find files and folders by name"
+                  Target="[INSTALLFOLDER]feather.exe" WorkingDirectory="INSTALLFOLDER" />
+        <RegistryValue Root="HKCU" Key="Software\Feather\Installer" Name="StartMenu"
+                       Type="integer" Value="1" KeyPath="yes" />
       </Component>
-      <Component Id="DesktopShortcut" Guid="a2023cad-57d2-4fe1-b684-7f38afbbb53b" Directory="DesktopFolder">
-        <Shortcut Id="DesktopShortcut" Name="Feather" Target="[INSTALLFOLDER]feather.exe" WorkingDirectory="INSTALLFOLDER" />
-        <RemoveFolder Id="CleanupDesktop" On="uninstall" />
-      </Component>
-    </ComponentGroup>
-  </Fragment>
+    </Feature>
 
-  <Fragment>
-    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
-    <UIRef Id="WixUI_FeatureTree" />
-    <UIRef Id="WixUI_ErrorProgressText" />
-    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Launch Feather" />
-  </Fragment>
-
-  <Fragment>
-    <InstallUISequence>
-      <Show Dialog="WelcomeDlg" Before="ProgressDlg" />
-      <Show Dialog="LicenseAgreementDlg" After="WelcomeDlg" />
-      <Show Dialog="InstallDirDlg" After="LicenseAgreementDlg" />
-      <Show Dialog="VerifyReadyDlg" After="InstallDirDlg" />
-    </InstallUISequence>
-
+    <!--
+      Before files are removed (uninstall, and the old copy during an
+      upgrade), the installed Feather is asked to quit. Only that copy:
+      another feather.exe elsewhere keeps running. On a real uninstall it
+      also takes away its start-at-sign-in entry and its shortcuts.
+    -->
+    <CustomAction Id="QuitFeather" FileRef="FeatherExe" ExeCommand="quit"
+                  Execute="deferred" Impersonate="yes" Return="ignore" />
+    <CustomAction Id="ForgetFeather" FileRef="FeatherExe" ExeCommand="uninstall"
+                  Execute="deferred" Impersonate="yes" Return="ignore" />
+    <!-- Starts Feather from the last page of the installer when ticked. -->
+    <CustomAction Id="LaunchFeather" FileRef="FeatherExe" ExeCommand=""
+                  Execute="immediate" Return="asyncNoWait" />
     <InstallExecuteSequence>
-      <Custom Action="LaunchApplication" After="InstallFinalize" Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1" />
+      <Custom Action="QuitFeather" Before="RemoveFiles" Condition='REMOVE="ALL"' />
+      <Custom Action="ForgetFeather" After="QuitFeather"
+              Condition='REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE' />
     </InstallExecuteSequence>
-  </Fragment>
 
-  <Fragment>
-    <CustomAction Id="LaunchApplication" Property="WixShellExecTarget" Value="[INSTALLFOLDER]feather.exe" Execute="immediate" />
+    <!-- Welcome and license, then install, then a finish page that can start Feather. -->
+    <WixVariable Id="WixUILicenseRtf" Value="$(License)" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Start Feather now" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
+    <ui:WixUI Id="WixUI_Minimal" />
     <UI>
-      <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="LaunchApplication" Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1" />
+      <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="LaunchFeather"
+               Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 AND NOT Installed" />
     </UI>
-  </Fragment>
+  </Package>
 </Wix>

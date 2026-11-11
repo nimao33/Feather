@@ -107,6 +107,8 @@ const DEFAULT_HEIGHT: i32 = 760;
 const WM_RUN_SETUP: u32 = windows_sys::Win32::UI::WindowsAndMessaging::WM_APP + 0x41;
 /// Posted by a second copy of Feather to bring this one forward.
 const WM_SHOW_FEATHER: u32 = windows_sys::Win32::UI::WindowsAndMessaging::WM_APP + 0x43;
+/// Quit, as from the tray menu: sent by `feather quit`.
+const WM_QUIT_FEATHER: u32 = windows_sys::Win32::UI::WindowsAndMessaging::WM_APP + 0x48;
 const HOTKEY_ID: i32 = 1;
 /// Settings changed in the open Settings window; `lparam` owns a boxed
 /// `Settings` to show right away.
@@ -1024,14 +1026,34 @@ impl Ui {
 
     /// First-run setup: where to search and how Feather looks.
     fn run_setup(&mut self) {
-        match setup::show(self.hwnd, self.look()) {
+        let start = setup::SetupStart {
+            hotkey: self.settings.hotkey.clone(),
+            // A fresh install starts at sign-in unless turned off here.
+            start_at_login: true,
+            close_to_tray: self.settings.close_to_tray,
+        };
+        match setup::show(self.hwnd, self.look(), &start) {
             Ok(Some(choice)) => {
                 self.settings.setup_done = true;
                 self.settings.dark_mode = choice.dark_mode;
                 self.settings.accent = choice.accent;
-                if !choice.roots.is_empty() {
-                    self.settings.index_roots = choice.roots;
+                if !choice.skipped {
+                    if !choice.roots.is_empty() {
+                        self.settings.index_roots = choice.roots;
+                    }
+                    self.settings.hotkey = choice.hotkey;
+                    self.settings.close_to_tray = choice.close_to_tray;
+                    self.settings.start_at_login = choice.start_at_login;
                     self.settings.normalize();
+                    if self.persist && startup::enabled() != choice.start_at_login {
+                        if let Err(error) = startup::set(choice.start_at_login) {
+                            self.set_notice(format!(
+                                "Could not change starting at sign-in: {error}"
+                            ));
+                        }
+                    }
+                    self.register_hotkey();
+                    self.update_tray();
                 }
                 self.refresh_theme(true);
                 self.save_settings();
@@ -3343,6 +3365,10 @@ unsafe extern "system" fn wndproc(
                 ui.summon();
                 return 0;
             }
+            WM_QUIT_FEATHER => {
+                ui.quit();
+                return 0;
+            }
             tray::WM_TRAY => {
                 ui.on_tray(lparam);
                 return 0;
@@ -3499,6 +3525,88 @@ fn taskbar_created() -> u32 {
 
 /// Brings an already running Feather forward. Returns false when none is
 /// running, so this copy should start normally.
+/// Removes what this copy of Feather set up for the user outside its own
+/// folder: starting at sign-in and its shortcuts. Run by the uninstaller.
+/// Entries that start another copy (a second install, a build) are left.
+pub fn forget_installation() {
+    if startup::enabled() {
+        let _ = startup::set(false);
+    }
+    for place in [shortcuts::Place::StartMenu, shortcuts::Place::Desktop] {
+        if shortcuts::points_here(place) {
+            let _ = shortcuts::set(place, false);
+        }
+    }
+}
+
+/// Asks every running copy of this same Feather executable to quit, and
+/// waits for them, so an uninstaller or upgrade can replace the file. Other
+/// copies (a build elsewhere) keep running. True when one was running.
+pub fn quit_running_copies() -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, LPARAM, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcessId, OpenProcess, QueryFullProcessImageNameW, TerminateProcess,
+        WaitForSingleObject, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+        PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{EnumWindows, GetClassNameW};
+
+    unsafe extern "system" fn collect(hwnd: HWND, list: LPARAM) -> i32 {
+        let mut class = [0u16; 64];
+        let len = unsafe { GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32) };
+        if String::from_utf16_lossy(&class[..len.max(0) as usize]) == "FeatherMainWindow" {
+            unsafe { (*(list as *mut Vec<HWND>)).push(hwnd) };
+        }
+        1
+    }
+
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let exe = exe.to_string_lossy().to_string();
+    let mut windows: Vec<HWND> = Vec::new();
+    unsafe {
+        EnumWindows(Some(collect), &mut windows as *mut Vec<HWND> as LPARAM);
+    }
+    let mut found = false;
+    for hwnd in windows {
+        let mut process = 0u32;
+        unsafe { GetWindowThreadProcessId(hwnd, &mut process) };
+        if process == 0 || process == unsafe { GetCurrentProcessId() } {
+            continue;
+        }
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_TERMINATE,
+                0,
+                process,
+            )
+        };
+        if handle.is_null() {
+            continue;
+        }
+        let mut name = [0u16; 1024];
+        let mut size = name.len() as u32;
+        let same = unsafe {
+            QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, name.as_mut_ptr(), &mut size)
+        } != 0
+            && String::from_utf16_lossy(&name[..size as usize]).eq_ignore_ascii_case(&exe);
+        if same {
+            found = true;
+            unsafe {
+                PostMessageW(hwnd, WM_QUIT_FEATHER, 0, 0);
+                // Quitting takes a moment; a copy stuck in a dialog is ended.
+                if WaitForSingleObject(handle, 5000) != WAIT_OBJECT_0 {
+                    TerminateProcess(handle, 0);
+                    WaitForSingleObject(handle, 2000);
+                }
+            }
+        }
+        unsafe { CloseHandle(handle) };
+    }
+    found
+}
+
 pub fn activate_running() -> bool {
     unsafe {
         let hwnd = FindWindowW(w!("FeatherMainWindow"), std::ptr::null());
@@ -3869,9 +3977,23 @@ pub fn run_scenarios(index: Arc<IndexSet>, screenshots: &Path) -> Result<(), Str
         "18-help-{suffix}: screenshot={}\n",
         path.display()
     ));
-    let path = screenshots.join("19-setup.png");
-    setup::capture(hwnd, look, &path)?;
-    report.push_str(&format!("19-setup: screenshot={}\n", path.display()));
+    let start = setup::SetupStart {
+        hotkey: hotkey::DEFAULT.to_string(),
+        start_at_login: true,
+        close_to_tray: true,
+    };
+    for (step, name) in ["welcome", "places", "look", "shortcut", "ready"]
+        .iter()
+        .enumerate()
+    {
+        let path = screenshots.join(format!("19-setup-{}-{name}.png", step + 1));
+        setup::capture(hwnd, look, &start, step, &path)?;
+        report.push_str(&format!(
+            "19-setup-{}-{name}: screenshot={}\n",
+            step + 1,
+            path.display()
+        ));
+    }
     let path = screenshots.join("21-settings-places.png");
     let places = Settings {
         index_roots: vec![r"C:\".into(), r"D:\Projects".into()],

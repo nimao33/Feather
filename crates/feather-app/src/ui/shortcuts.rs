@@ -7,11 +7,11 @@ use std::path::PathBuf;
 use windows::core::{Interface, HSTRING};
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, IPersistFile, CLSCTX_INPROC_SERVER,
-    COINIT_APARTMENTTHREADED,
+    COINIT_APARTMENTTHREADED, STGM_READ,
 };
 use windows::Win32::UI::Shell::{
     FOLDERID_Desktop, FOLDERID_Programs, IShellLinkW, SHGetKnownFolderPath, ShellLink,
-    KF_FLAG_DEFAULT,
+    KF_FLAG_DEFAULT, SLGP_RAWPATH,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -42,6 +42,40 @@ fn link(place: Place) -> Option<PathBuf> {
 /// True when the shortcut is there.
 pub fn exists(place: Place) -> bool {
     link(place).is_some_and(|path| path.is_file())
+}
+
+/// True when the shortcut is there and starts this copy of Feather, so an
+/// uninstaller only takes away shortcuts that belong to the copy it removes.
+pub fn points_here(place: Place) -> bool {
+    let (Some(path), Ok(exe)) = (link(place), std::env::current_exe()) else {
+        return false;
+    };
+    link_target(&path).is_some_and(|target| {
+        target
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&exe.to_string_lossy())
+    })
+}
+
+/// The program a shortcut file starts.
+fn link_target(path: &std::path::Path) -> Option<PathBuf> {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let shortcut: IShellLinkW =
+            CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).ok()?;
+        let file: IPersistFile = shortcut.cast().ok()?;
+        file.Load(&HSTRING::from(path.as_os_str()), STGM_READ)
+            .ok()?;
+        let mut buffer = [0u16; 1024];
+        shortcut
+            .GetPath(&mut buffer, std::ptr::null_mut(), SLGP_RAWPATH.0 as u32)
+            .ok()?;
+        let end = buffer
+            .iter()
+            .position(|&unit| unit == 0)
+            .unwrap_or(buffer.len());
+        (end > 0).then(|| PathBuf::from(String::from_utf16_lossy(&buffer[..end])))
+    }
 }
 
 /// Adds the shortcut, pointing at this copy of Feather, or removes it.

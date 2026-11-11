@@ -547,6 +547,23 @@ fn open_set(args: &Args) -> Result<Arc<IndexSet>, String> {
         .map_err(|error| format!("could not open index: {error}"))
 }
 
+/// On Windows the installer runs `feather uninstall` while removing Feather,
+/// to take away what the app made itself: starting at sign-in and its
+/// shortcuts. On Linux it removes the menu and autostart entries.
+#[cfg(windows)]
+fn uninstall() -> Result<(), String> {
+    ui::forget_installation();
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn uninstall() -> Result<(), String> {
+    crate::local::desktop::set_menu_entry(false)?;
+    crate::local::desktop::set_autostart(false)?;
+    println!("Feather's menu and autostart entries are gone.");
+    Ok(())
+}
+
 pub fn run(args: impl IntoIterator<Item = String>) -> i32 {
     match run_inner(args) {
         Ok(()) => 0,
@@ -601,7 +618,11 @@ fn run_inner(args: impl IntoIterator<Item = String>) -> Result<(), String> {
         Some(Command::IndexStatus) => run_index_status(&parsed),
         Some(Command::Window) => crate::local::run(parsed.index.clone(), parsed.background),
         Some(Command::Quit) => {
-            if crate::local::quit() {
+            #[cfg(windows)]
+            let running = ui::quit_running_copies();
+            #[cfg(not(windows))]
+            let running = crate::local::quit();
+            if running {
                 Ok(())
             } else {
                 Err("Feather isn't running.".into())
@@ -615,12 +636,7 @@ fn run_inner(args: impl IntoIterator<Item = String>) -> Result<(), String> {
             println!("Feather is in your applications menu.");
             Ok(())
         }
-        Some(Command::Uninstall) => {
-            crate::local::desktop::set_menu_entry(false)?;
-            crate::local::desktop::set_autostart(false)?;
-            println!("Feather's menu and autostart entries are gone.");
-            Ok(())
-        }
+        Some(Command::Uninstall) => uninstall(),
         Some(Command::Search) => {
             ensure_index(&parsed, false)?;
             let set = open_set(&parsed)?;
