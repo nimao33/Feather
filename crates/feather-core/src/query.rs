@@ -1,3 +1,4 @@
+use crate::date::{parse_date_filter, Clock, DateRange};
 use crate::entry::EntryView;
 use crate::index::VolumeIndex;
 use crate::path::{is_absolute_path, normalize_path, path_within};
@@ -238,6 +239,9 @@ pub struct Query {
     kind: Option<Kind>,
     min_size: Option<u64>,
     max_size: Option<u64>,
+    /// Modification-date bounds from `dm:`/`date:`, already ANDed together
+    /// and converted to FILETIMEs.
+    dates: Option<DateRange>,
     scopes: Vec<String>,
     negated_scopes: Vec<String>,
     match_mode: MatchMode,
@@ -246,7 +250,18 @@ pub struct Query {
 }
 
 impl Query {
+    /// Parses a query, reading date filters against the system clock and
+    /// time zone.
     pub fn parse(input: &str) -> Self {
+        Self::parse_with(input, None)
+    }
+
+    /// Parses a query with date filters read against `clock`.
+    pub fn parse_at(input: &str, clock: &Clock) -> Self {
+        Self::parse_with(input, Some(*clock))
+    }
+
+    fn parse_with(input: &str, mut clock: Option<Clock>) -> Self {
         let mut query = Query {
             raw: input.to_string(),
             ..Query::default()
@@ -359,10 +374,27 @@ impl Query {
                 continue;
             }
 
-            if lower.starts_with("dm:") || lower.starts_with("date:") {
-                query
-                    .warnings
-                    .push("date filters are not implemented yet".into());
+            if let Some(value) = lower
+                .strip_prefix("dm:")
+                .or_else(|| lower.strip_prefix("date:"))
+            {
+                if negative {
+                    query
+                        .warnings
+                        .push("negated date filters are not supported yet".into());
+                    continue;
+                }
+                // The clock is read once per query, and only when needed.
+                let clock = clock.get_or_insert_with(Clock::system);
+                match parse_date_filter(value, clock) {
+                    Some(range) => {
+                        query.dates = Some(match query.dates {
+                            Some(current) => current.intersect(range),
+                            None => range,
+                        });
+                    }
+                    None => query.warnings.push(format!("invalid date: {value}")),
+                }
                 continue;
             }
 
@@ -460,6 +492,7 @@ impl Query {
             && self.kind.is_none()
             && self.min_size.is_none()
             && self.max_size.is_none()
+            && self.dates.is_none()
             && self.scopes.is_empty()
             && self.negated_scopes.is_empty()
     }
@@ -484,6 +517,37 @@ impl Query {
             && self.kind.is_none()
             && self.min_size.is_none()
             && self.max_size.is_none()
+            && self.dates.is_none()
+    }
+
+    /// True when the query filters by modification date. Matching then needs
+    /// each entry's mtime, which [`Query::matches_name`] does not see.
+    pub fn has_dates(&self) -> bool {
+        self.dates.is_some()
+    }
+
+    /// The modification-date bounds, as FILETIMEs: start included, end not.
+    pub fn dates(&self) -> Option<DateRange> {
+        self.dates
+    }
+
+    /// True when `mtime` (a FILETIME) passes the date filters. Folders are
+    /// filtered by their own mtime, like files and like Everything does; an
+    /// unknown mtime of 0 matches no date filter.
+    #[inline]
+    pub fn matches_mtime(&self, mtime: u64) -> bool {
+        self.dates.is_none_or(|range| range.contains(mtime))
+    }
+
+    /// [`Query::matches_mtime`] for entry `id` of `volume`, reading its mtime
+    /// only when there is a date filter. Call it beside
+    /// [`Query::matches_name`] wherever entries come from summaries.
+    #[inline]
+    pub fn matches_date_of(&self, volume: &VolumeIndex, id: u32) -> bool {
+        match self.dates {
+            None => true,
+            Some(range) => range.contains(volume.entry_mtime(id)),
+        }
     }
 
     /// True when matching depends on the resolved path. The search worker uses
@@ -550,12 +614,13 @@ impl Query {
     }
 
     pub fn matches(&self, name_lower: &str, entry: &EntryView<'_>) -> bool {
-        self.matches_name(name_lower, entry.size, entry.flags)
+        self.matches_name(name_lower, entry.size, entry.flags) && self.matches_mtime(entry.mtime)
     }
 
     /// Name matching from the raw fields, without building an [`EntryView`].
     /// This is the hot path: the search worker reads only the metadata that
-    /// filters actually use.
+    /// filters actually use. Date filters are not checked here, since the
+    /// summary has no mtime: pair it with [`Query::matches_date_of`].
     #[inline]
     pub fn matches_name(&self, name_lower: &str, size: u64, flags: u16) -> bool {
         let is_dir = flags & 1 != 0;
@@ -608,12 +673,14 @@ impl Query {
     }
 
     /// True when a name filter is the whole query: no kind, size, extension,
-    /// or path work is needed. The worker uses this to skip reading metadata.
+    /// date, or path work is needed. The worker uses this to skip reading
+    /// metadata.
     pub fn name_only(&self) -> bool {
         self.kind.is_none()
             && self.extensions.is_empty()
             && self.min_size.is_none()
             && self.max_size.is_none()
+            && self.dates.is_none()
             && !self.needs_path()
             && self.browse.is_none()
     }
@@ -884,6 +951,10 @@ impl Query {
             && self.kind == previous.kind
             && self.min_size == previous.min_size
             && self.max_size == previous.max_size
+            && self
+                .dates
+                .unwrap_or(DateRange::ALL)
+                .within(&previous.dates.unwrap_or(DateRange::ALL))
             && self.scopes == previous.scopes
             && self.negated_scopes == previous.negated_scopes
             && self.match_mode == previous.match_mode
@@ -1469,5 +1540,158 @@ mod tests {
         assert!(narrows("match:start report", "match:start rep"));
         assert!(!narrows("match:start xrep", "match:start rep"));
         assert!(narrows("match:end report.pdf", "match:end .pdf"));
+    }
+
+    mod dates {
+        use super::*;
+        use crate::date::filetime_utc;
+
+        /// Wednesday 2026-11-11 14:30 local time, UTC+2.
+        fn clock() -> Clock {
+            Clock::fixed(filetime_utc(2026, 11, 11, 12, 30), 120)
+        }
+
+        fn parse(text: &str) -> Query {
+            Query::parse_at(text, &clock())
+        }
+
+        /// Local midnight at UTC+2 as a FILETIME.
+        fn local(year: i64, month: i64, day: i64) -> u64 {
+            filetime_utc(year, month, day, 0, 0) - 2 * 3600 * 10_000_000
+        }
+
+        fn bounds(text: &str) -> (u64, u64) {
+            let query = parse(text);
+            assert!(
+                query.warnings().is_empty(),
+                "{text}: {:?}",
+                query.warnings()
+            );
+            let range = query
+                .dates()
+                .unwrap_or_else(|| panic!("{text} has no dates"));
+            (range.start, range.end)
+        }
+
+        #[test]
+        fn every_form_parses() {
+            let cases: &[(&str, (u64, u64))] = &[
+                ("dm:today", (local(2026, 11, 11), local(2026, 11, 12))),
+                ("dm:yesterday", (local(2026, 11, 10), local(2026, 11, 11))),
+                ("dm:thisweek", (local(2026, 11, 9), local(2026, 11, 16))),
+                ("dm:lastweek", (local(2026, 11, 2), local(2026, 11, 9))),
+                ("dm:thismonth", (local(2026, 11, 1), local(2026, 12, 1))),
+                ("dm:lastmonth", (local(2026, 10, 1), local(2026, 11, 1))),
+                ("dm:thisyear", (local(2026, 1, 1), local(2027, 1, 1))),
+                ("dm:lastyear", (local(2025, 1, 1), local(2026, 1, 1))),
+                ("dm:last7days", (local(2026, 11, 5), u64::MAX)),
+                ("dm:last30days", (local(2026, 10, 13), u64::MAX)),
+                ("dm:7days", (local(2026, 11, 5), u64::MAX)),
+                ("dm:2hours", (filetime_utc(2026, 11, 11, 10, 30), u64::MAX)),
+                (
+                    "dm:last24hours",
+                    (filetime_utc(2026, 11, 10, 12, 30), u64::MAX),
+                ),
+                ("dm:2026", (local(2026, 1, 1), local(2027, 1, 1))),
+                ("dm:2026-11", (local(2026, 11, 1), local(2026, 12, 1))),
+                ("dm:2026-11-11", (local(2026, 11, 11), local(2026, 11, 12))),
+                (
+                    "dm:2026-01-01..2026-03-31",
+                    (local(2026, 1, 1), local(2026, 4, 1)),
+                ),
+                ("dm:>2026-01-01", (local(2026, 1, 2), u64::MAX)),
+                ("dm:>=2026-01-01", (local(2026, 1, 1), u64::MAX)),
+                ("dm:<2025", (0, local(2025, 1, 1))),
+                ("dm:<=2025", (0, local(2026, 1, 1))),
+                ("dm:..2026-06", (0, local(2026, 7, 1))),
+                ("dm:2026-06..", (local(2026, 6, 1), u64::MAX)),
+                ("date:today", (local(2026, 11, 11), local(2026, 11, 12))),
+                ("DM:Today", (local(2026, 11, 11), local(2026, 11, 12))),
+            ];
+            for (text, expected) in cases {
+                assert_eq!(bounds(text), *expected, "{text}");
+                let query = parse(text);
+                assert!(query.has_dates());
+                assert!(!query.is_empty());
+                assert!(!query.matches_everything());
+                assert!(!query.name_only());
+                assert!(!query.needs_path());
+            }
+        }
+
+        #[test]
+        fn bounds_include_the_start_and_exclude_the_end() {
+            let query = parse("dm:2026-11-11");
+            let (start, end) = (local(2026, 11, 11), local(2026, 11, 12));
+            assert!(!query.matches_mtime(start - 1));
+            assert!(query.matches_mtime(start));
+            assert!(query.matches_mtime(end - 1));
+            assert!(!query.matches_mtime(end));
+            // Unknown dates never match a date filter...
+            assert!(!parse("dm:<2025").matches_mtime(0));
+            // ...but do match without one.
+            assert!(parse("report").matches_mtime(0));
+        }
+
+        #[test]
+        fn date_tokens_and_together() {
+            assert_eq!(
+                bounds("dm:2026 dm:<2026-07 date:>=2026-03"),
+                (local(2026, 3, 1), local(2026, 7, 1))
+            );
+            let disjoint = parse("dm:2025 dm:2026");
+            assert!(disjoint.warnings().is_empty());
+            assert!(!disjoint.matches_mtime(local(2025, 6, 1)));
+            assert!(!disjoint.matches_mtime(local(2026, 6, 1)));
+        }
+
+        #[test]
+        fn date_filters_combine_with_names() {
+            let query = parse("report ext:pdf dm:today");
+            let noon = local(2026, 11, 11) + 12 * 3600 * 10_000_000;
+            assert!(query.matches_name("report.pdf", 0, 0));
+            assert!(query.matches_mtime(noon));
+            assert!(!query.matches_mtime(local(2026, 11, 10)));
+            assert_eq!(query.match_spans("report.pdf"), vec![(0, 6)]);
+        }
+
+        #[test]
+        fn invalid_and_negated_dates_warn() {
+            for text in [
+                "dm:soon",
+                "dm:2026-13",
+                "date:",
+                "dm:2026-02-30",
+                "dm:..",
+                "dm:>",
+            ] {
+                let query = parse(text);
+                assert_eq!(query.warnings().len(), 1, "{text}");
+                assert!(query.warnings()[0].starts_with("invalid date"), "{text}");
+                assert!(!query.has_dates(), "{text}");
+            }
+            let negated = parse("!dm:today");
+            assert_eq!(negated.warnings().len(), 1);
+            assert!(negated.warnings()[0].contains("negated"));
+            assert!(!negated.has_dates());
+        }
+
+        #[test]
+        fn the_system_clock_is_used_by_default() {
+            let query = Query::parse("dm:today");
+            assert!(query.warnings().is_empty());
+            let now = crate::date::Clock::system().now;
+            assert!(query.matches_mtime(now));
+        }
+
+        #[test]
+        fn narrower_dates_narrow() {
+            let narrows = |now: &str, before: &str| parse(now).narrows(&parse(before));
+            assert!(narrows("rep dm:today", "rep"));
+            assert!(narrows("rep dm:today", "rep dm:thisweek"));
+            assert!(narrows("rep dm:today", "re dm:today"));
+            assert!(!narrows("rep dm:thisweek", "rep dm:today"));
+            assert!(!narrows("rep", "rep dm:today"));
+        }
     }
 }

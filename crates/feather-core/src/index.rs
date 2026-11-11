@@ -218,6 +218,15 @@ impl VolumeIndex {
         }
     }
 
+    /// The modification time of entry `id` as a FILETIME (0 when unknown).
+    /// Date filters read it beside [`VolumeIndex::entry_summary`], so plain
+    /// name searches never touch it.
+    #[inline]
+    pub fn entry_mtime(&self, id: u32) -> u64 {
+        let id = id.min(self.manifest.entry_count.saturating_sub(1));
+        read_u64(self.meta.as_slice(), id as usize * META_SIZE + 24)
+    }
+
     pub fn lookup_frn(&self, frn: u64) -> Option<u32> {
         let count = self.manifest.entry_count as usize;
         let data = self.frn.as_slice();
