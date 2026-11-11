@@ -4,6 +4,7 @@ pub mod entry;
 pub mod format;
 pub mod index;
 pub mod index_set;
+pub mod live;
 pub mod mapped;
 #[cfg(windows)]
 pub mod mft;
@@ -11,6 +12,7 @@ pub mod path;
 pub mod query;
 pub mod scan;
 pub mod synthetic;
+pub mod usn;
 
 pub use entry::{EntrySummary, EntryView};
 pub use index::VolumeIndex;

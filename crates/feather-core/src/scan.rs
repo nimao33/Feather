@@ -132,6 +132,11 @@ pub struct Entries {
     pub mtime: Vec<u64>,
     /// Bit 0: folder. Bit 1: hidden. Bit 2: system.
     pub flags: Vec<u16>,
+    /// The file system's own file reference number of each entry, when the
+    /// reader knows it (the NTFS reader does). Empty otherwise; then the
+    /// writer makes up references from the entry order. Either empty or one
+    /// per entry.
+    pub frn: Vec<u64>,
 }
 
 impl Entries {
@@ -143,6 +148,7 @@ impl Entries {
             size: Vec::with_capacity(count),
             mtime: Vec::with_capacity(count),
             flags: Vec::with_capacity(count),
+            frn: Vec::new(),
         }
     }
 
@@ -196,6 +202,12 @@ impl Entries {
         self.size.shrink_to_fit();
         self.mtime.shrink_to_fit();
         self.flags.shrink_to_fit();
+        self.frn.shrink_to_fit();
+    }
+
+    /// True when every entry carries a real file reference number.
+    pub fn has_frns(&self) -> bool {
+        !self.frn.is_empty() && self.frn.len() == self.len()
     }
 }
 
@@ -216,9 +228,15 @@ pub struct Tree {
     pub root_display: String,
     pub entries: Entries,
     pub report: ScanReport,
+    /// Where the volume's change journal stood just before the tree was
+    /// read, for a whole NTFS drive. Stored beside the index so the app can
+    /// replay what changed since instead of reading the drive again.
+    pub journal: Option<crate::live::JournalCursor>,
 }
 
-const TREE_MAGIC: &[u8; 4] = b"FTR1";
+/// Version 1 had no file references or journal position.
+const TREE_MAGIC_V1: &[u8; 4] = b"FTR1";
+const TREE_MAGIC: &[u8; 4] = b"FTR2";
 
 impl Tree {
     /// Writes the tree as a compact byte stream (for the elevated helper's
@@ -232,7 +250,20 @@ impl Tree {
         out.write_all(&[u8::from(self.report.truncated)])?;
         out.write_all(&(self.entries.len() as u32).to_le_bytes())?;
         let entries = &self.entries;
+        let frns = entries.has_frns();
+        out.write_all(&[u8::from(frns)])?;
+        match self.journal {
+            Some(cursor) => {
+                out.write_all(&[1])?;
+                out.write_all(&cursor.journal_id.to_le_bytes())?;
+                out.write_all(&cursor.next_usn.to_le_bytes())?;
+            }
+            None => out.write_all(&[0])?,
+        }
         for index in 0..entries.len() {
+            if frns {
+                out.write_all(&entries.frn[index].to_le_bytes())?;
+            }
             let name = entries.name(index).as_bytes();
             let len = name.len().min(u16::MAX as usize);
             out.write_all(&entries.parent[index].to_le_bytes())?;
@@ -251,9 +282,13 @@ impl Tree {
         let bad = |what: &str| io::Error::new(io::ErrorKind::InvalidData, what.to_string());
         let mut magic = [0u8; 4];
         input.read_exact(&mut magic)?;
-        if &magic != TREE_MAGIC {
+        let version = if &magic == TREE_MAGIC {
+            2
+        } else if &magic == TREE_MAGIC_V1 {
+            1
+        } else {
             return Err(bad("not a Feather tree stream"));
-        }
+        };
         let mut u32_buf = [0u8; 4];
         let mut u64_buf = [0u8; 8];
         let mut u16_buf = [0u8; 2];
@@ -272,8 +307,32 @@ impl Tree {
         input.read_exact(&mut u32_buf)?;
         let count = u32::from_le_bytes(u32_buf) as usize;
         let mut entries = Entries::with_capacity(count.min(64 << 20));
+        let mut frns = false;
+        let mut journal = None;
+        if version >= 2 {
+            let mut byte = [0u8; 1];
+            input.read_exact(&mut byte)?;
+            frns = byte[0] != 0;
+            input.read_exact(&mut byte)?;
+            if byte[0] != 0 {
+                input.read_exact(&mut u64_buf)?;
+                let journal_id = u64::from_le_bytes(u64_buf);
+                input.read_exact(&mut u64_buf)?;
+                journal = Some(crate::live::JournalCursor {
+                    journal_id,
+                    next_usn: i64::from_le_bytes(u64_buf),
+                });
+            }
+        }
+        if frns {
+            entries.frn.reserve(count.min(64 << 20));
+        }
         let mut name = Vec::new();
         for index in 0..count {
+            if frns {
+                input.read_exact(&mut u64_buf)?;
+                entries.frn.push(u64::from_le_bytes(u64_buf));
+            }
             input.read_exact(&mut u32_buf)?;
             let parent = u32::from_le_bytes(u32_buf);
             input.read_exact(&mut u64_buf)?;
@@ -299,6 +358,7 @@ impl Tree {
                 ..ScanReport::default()
             },
             entries,
+            journal,
         })
     }
 }
@@ -313,7 +373,11 @@ pub fn write_tree(out: &Path, tree: Tree, started: Instant) -> io::Result<ScanRe
             "the tree is empty",
         ));
     }
-    write_entries(out, &tree.root_display, tree.entries, started, report)
+    let report = write_entries(out, &tree.root_display, tree.entries, started, report)?;
+    if let Some(cursor) = tree.journal {
+        crate::live::write_cursor(out, cursor)?;
+    }
+    Ok(report)
 }
 
 /// Scans `root` and replaces the index files in `out`.
@@ -848,6 +912,18 @@ pub(crate) fn write_entries(
     for (new_id, &old_id) in order.iter().enumerate() {
         remap[old_id as usize] = new_id as u32;
     }
+    // With real file references the FRN table is not in entry order: it is
+    // sorted here, by reference, as (reference, new id) pairs.
+    let real = entries.has_frns();
+    let frn_table: Vec<(u64, u32)> = if real {
+        let mut pairs: Vec<(u64, u32)> = (0..count)
+            .map(|old_id| (entries.frn[old_id], remap[old_id]))
+            .collect();
+        parallel_sort(&mut pairs, |a, b| a.cmp(b));
+        pairs
+    } else {
+        Vec::new()
+    };
     phase("sort", phase_start);
 
     // Encode and write a slice of entries at a time, so the finished index
@@ -906,12 +982,24 @@ pub(crate) fn write_entries(
                                 display_len += 1;
                             }
                             part.display.extend_from_slice(&0u16.to_le_bytes());
-                            let parent = if new_id == 0 {
-                                1
+                            // Real references when the reader knows them;
+                            // otherwise made up from the new order.
+                            let (file_reference, parent) = if real {
+                                let own = entries.frn[old_id];
+                                let parent = if new_id == 0 {
+                                    own
+                                } else {
+                                    entries.frn[entries.parent[old_id] as usize]
+                                };
+                                (own, parent)
+                            } else if new_id == 0 {
+                                (1, 1)
                             } else {
-                                remap[entries.parent[old_id] as usize] as u64 + 1
+                                (
+                                    new_id as u64 + 1,
+                                    remap[entries.parent[old_id] as usize] as u64 + 1,
+                                )
                             };
-                            let file_reference = new_id as u64 + 1;
                             let meta = &mut part.meta;
                             meta.extend_from_slice(&file_reference.to_le_bytes());
                             meta.extend_from_slice(&parent.to_le_bytes());
@@ -923,8 +1011,10 @@ pub(crate) fn write_entries(
                             meta.extend_from_slice(&(search_name.len() as u16).to_le_bytes());
                             meta.extend_from_slice(&entries.flags[old_id].to_le_bytes());
                             meta.extend_from_slice(&0u16.to_le_bytes());
-                            part.frn.extend_from_slice(&file_reference.to_le_bytes());
-                            part.frn.extend_from_slice(&(new_id as u32).to_le_bytes());
+                            if !real {
+                                part.frn.extend_from_slice(&file_reference.to_le_bytes());
+                                part.frn.extend_from_slice(&(new_id as u32).to_le_bytes());
+                            }
                         }
                         part
                     })
@@ -975,6 +1065,19 @@ pub(crate) fn write_entries(
         }
         first = last;
     }
+    if real {
+        let mut bytes = Vec::with_capacity(FRN_SIZE * 4096);
+        for chunk in frn_table.chunks(4096) {
+            bytes.clear();
+            for &(file_reference, id) in chunk {
+                bytes.extend_from_slice(&file_reference.to_le_bytes());
+                bytes.extend_from_slice(&id.to_le_bytes());
+            }
+            frn_file.write_all(&bytes)?;
+            frn_len += bytes.len() as u64;
+        }
+    }
+    drop(frn_table);
     drop(key_bytes);
     drop(key_at);
     drop(entries);
@@ -1127,7 +1230,10 @@ fn cleanup(dir: &Path) -> io::Result<()> {
         let entry = entry?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if (name.starts_with("base-") || name == "manifest.bin" || name == "prefix.txt")
+        if (name.starts_with("base-")
+            || name == "manifest.bin"
+            || name == "prefix.txt"
+            || name == crate::live::CURSOR_FILE)
             && entry.path().is_file()
         {
             let _ = fs::remove_file(entry.path());
@@ -1319,6 +1425,7 @@ mod tree_tests {
                 truncated: true,
                 ..ScanReport::default()
             },
+            journal: None,
         };
         let mut bytes = Vec::new();
         tree.encode(&mut bytes).unwrap();
@@ -1327,6 +1434,20 @@ mod tree_tests {
         assert_eq!(back.entries, tree.entries);
         assert_eq!(back.report.skipped, 3);
         assert!(back.report.truncated);
+        assert_eq!(back.journal, None);
+
+        // File references and the journal position cross too.
+        let mut real = tree.clone();
+        real.entries.frn = vec![5 | (5 << 48), 0x1234 | (7 << 48)];
+        real.journal = Some(crate::live::JournalCursor {
+            journal_id: 0xfeed,
+            next_usn: 123_456,
+        });
+        let mut bytes = Vec::new();
+        real.encode(&mut bytes).unwrap();
+        let back = Tree::decode(&mut bytes.as_slice()).unwrap();
+        assert_eq!(back.entries, real.entries);
+        assert_eq!(back.journal, real.journal);
 
         // A parent that points forward is refused.
         let mut bad = tree.clone();
@@ -1383,6 +1504,7 @@ mod tree_tests {
             root_display: r"C:\Slices".to_string(),
             entries: Entries::from(entries),
             report: ScanReport::default(),
+            journal: None,
         };
         let report = write_tree(&dir, tree, Instant::now()).expect("write");
         assert_eq!(report.entries, count);

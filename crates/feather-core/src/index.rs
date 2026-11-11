@@ -1,44 +1,76 @@
+use std::cmp::Ordering;
 use std::io;
+use std::sync::Arc;
 
 use crate::entry::{EntrySummary, EntryView};
 use crate::format::{Manifest, CHECK_STRIDE, FRN_SIZE, META_SIZE};
+use crate::live::{JournalCursor, Overlay};
 use crate::mapped::MappedFile;
 
-pub struct VolumeIndex {
-    pub manifest: Manifest,
-    pub prefix: String,
+/// The mapped, immutable files of one index generation. Shared by every
+/// [`VolumeIndex`] snapshot built on it, so a live update never copies or
+/// re-maps them.
+pub(crate) struct Base {
+    pub(crate) manifest: Manifest,
+    pub(crate) prefix: String,
+    /// Where the change journal stood when this generation was read, if
+    /// the volume is tracked through one.
+    pub(crate) journal: Option<JournalCursor>,
     meta: MappedFile,
     search: MappedFile,
     display: MappedFile,
     frn: MappedFile,
     check: MappedFile,
+}
+
+/// One volume: its mapped base index and, optionally, the in-memory
+/// overlay of changes made since the base was written.
+///
+/// Entry ids below [`VolumeIndex::base_count`] address the base; ids from
+/// there on address entries the overlay added. A base entry the overlay
+/// deleted or replaced keeps its id, so rows already shown still render,
+/// but it is no longer listed by [`VolumeIndex::iter_ids`] or found by any
+/// lookup.
+pub struct VolumeIndex {
+    pub manifest: Manifest,
+    pub prefix: String,
+    base: Arc<Base>,
+    overlay: Option<Arc<Overlay>>,
     path_cache: std::sync::Mutex<std::collections::HashMap<u32, String>>,
 }
 
-impl VolumeIndex {
-    pub fn open(dir: &std::path::Path) -> io::Result<Self> {
+/// A read-only view of a base plus an overlay. Every lookup that must see
+/// live changes goes through this, both for searches and while the
+/// overlay itself is being updated.
+#[derive(Clone, Copy)]
+pub(crate) struct View<'a> {
+    pub(crate) base: &'a Base,
+    pub(crate) overlay: Option<&'a Overlay>,
+}
+
+impl Base {
+    fn open(dir: &std::path::Path) -> io::Result<Self> {
         let manifest = crate::format::read_manifest(dir)?;
         let meta = MappedFile::open(&dir.join(manifest.meta_name()))?;
         let search = MappedFile::open(&dir.join(manifest.search_name()))?;
         let display = MappedFile::open(&dir.join(manifest.display_name()))?;
         let frn = MappedFile::open(&dir.join(manifest.frn_name()))?;
         let check = MappedFile::open(&dir.join(manifest.check_name()))?;
-
-        let index = Self {
+        let base = Self {
             manifest,
             prefix: std::fs::read_to_string(dir.join("prefix.txt"))
                 .unwrap_or_else(|_| crate::path::default_prefix().to_string())
                 .trim()
                 .to_string(),
+            journal: crate::live::read_cursor(dir),
             meta,
             search,
             display,
             frn,
             check,
-            path_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
-        index.validate()?;
-        Ok(index)
+        base.validate()?;
+        Ok(base)
     }
 
     fn validate(&self) -> io::Result<()> {
@@ -131,15 +163,11 @@ impl VolumeIndex {
         Ok(())
     }
 
-    pub fn entry_count(&self) -> u32 {
+    pub(crate) fn count(&self) -> u32 {
         self.manifest.entry_count
     }
 
-    pub fn iter_ids(&self) -> std::ops::Range<u32> {
-        1..self.manifest.entry_count
-    }
-
-    pub fn entry(&self, id: u32) -> EntryView<'_> {
+    pub(crate) fn entry(&self, id: u32) -> EntryView<'_> {
         let id = id.min(self.manifest.entry_count.saturating_sub(1));
         let base = id as usize * META_SIZE;
         let meta = self.meta.as_slice();
@@ -192,9 +220,7 @@ impl VolumeIndex {
         }
     }
 
-    /// The fields name filtering needs, in one metadata read. Skips the
-    /// display name, modification time, and file reference number.
-    pub fn entry_summary(&self, id: u32) -> EntrySummary<'_> {
+    pub(crate) fn entry_summary(&self, id: u32) -> EntrySummary<'_> {
         let id = id.min(self.manifest.entry_count.saturating_sub(1));
         let base = id as usize * META_SIZE;
         let meta = self.meta.as_slice();
@@ -218,27 +244,17 @@ impl VolumeIndex {
         }
     }
 
-    pub fn lookup_frn(&self, frn: u64) -> Option<u32> {
-        let count = self.manifest.entry_count as usize;
+    /// Slot `slot` of the FRN table: (reference, entry id), by reference.
+    pub(crate) fn frn_slot(&self, slot: usize) -> (u64, u32) {
         let data = self.frn.as_slice();
-        let mut low = 0usize;
-        let mut high = count;
-        while low < high {
-            let mid = (low + high) / 2;
-            if read_u64(data, mid * FRN_SIZE) < frn {
-                low = mid + 1;
-            } else {
-                high = mid;
-            }
-        }
-        if low < count && read_u64(data, low * FRN_SIZE) == frn {
-            Some(read_u32(data, low * FRN_SIZE + 8))
-        } else {
-            None
-        }
+        (
+            read_u64(data, slot * FRN_SIZE),
+            read_u32(data, slot * FRN_SIZE + 8),
+        )
     }
 
-    pub(crate) fn lookup_directory_frn(&self, frn: u64) -> Option<u32> {
+    /// The first FRN table slot whose reference is not below `frn`.
+    fn frn_lower_bound(&self, frn: u64) -> usize {
         let count = self.manifest.entry_count as usize;
         let data = self.frn.as_slice();
         let mut low = 0usize;
@@ -251,41 +267,42 @@ impl VolumeIndex {
                 high = mid;
             }
         }
+        low
+    }
+
+    pub(crate) fn lookup_frn(&self, frn: u64) -> Option<u32> {
+        let low = self.frn_lower_bound(frn);
+        (low < self.manifest.entry_count as usize && self.frn_slot(low).0 == frn)
+            .then(|| self.frn_slot(low).1)
+    }
+
+    /// Like [`Base::lookup_frn`], preferring a folder when an older index
+    /// holds the same reference more than once. `usable` filters ids out.
+    fn lookup_directory_frn(&self, frn: u64, usable: impl Fn(u32) -> bool) -> Option<u32> {
+        let count = self.manifest.entry_count as usize;
+        let mut slot = self.frn_lower_bound(frn);
         let mut first = None;
-        while low < count && read_u64(data, low * FRN_SIZE) == frn {
-            let id = read_u32(data, low * FRN_SIZE + 8);
-            if self.entry(id).is_dir() {
-                return Some(id);
+        while slot < count {
+            let (found, id) = self.frn_slot(slot);
+            if found != frn {
+                break;
             }
-            first.get_or_insert(id);
-            low += 1;
+            if usable(id) {
+                if self.entry(id).is_dir() {
+                    return Some(id);
+                }
+                first.get_or_insert(id);
+            }
+            slot += 1;
         }
         first
     }
 
-    /// The entry id of a folder given by its full path, or 0 for the root.
-    /// Names are found by binary search over the sorted search names.
-    pub fn find_folder(&self, path: &str) -> Option<u32> {
-        let path = crate::path::normalize_path(path);
-        let prefix = crate::path::normalize_path(&self.prefix);
-        if path == prefix {
-            return Some(0);
-        }
-        let rest = path.strip_prefix(&prefix)?;
-        let rest = rest.strip_prefix(crate::path::SEP).unwrap_or(rest);
-        let mut current = self.entry(0).frn;
-        let mut found = 0;
-        for part in rest.split(crate::path::SEP).filter(|part| !part.is_empty()) {
-            found = self.find_child_folder(current, part)?;
-            current = self.entry(found).frn;
-        }
-        Some(found)
-    }
-
-    fn find_child_folder(&self, parent_frn: u64, name: &str) -> Option<u32> {
+    /// The first id (from 1) whose search name is not below `name`.
+    fn name_lower_bound(&self, name: &str) -> u32 {
         let count = self.manifest.entry_count;
         // Entry 0 is the root; the rest are sorted by search name.
-        let (mut low, mut high) = (1u32, count);
+        let (mut low, mut high) = (1u32, count.max(1));
         while low < high {
             let mid = low + (high - low) / 2;
             if self.entry(mid).name_search < name {
@@ -294,40 +311,147 @@ impl VolumeIndex {
                 high = mid;
             }
         }
-        let mut id = low;
+        low
+    }
+
+    /// Where an entry named (`search`, `display`) would go among ids 1..:
+    /// after every base entry that sorts the same or before it.
+    pub(crate) fn insertion_point(&self, search: &str, display: &[u16]) -> u32 {
+        let count = self.manifest.entry_count;
+        let (mut low, mut high) = (1u32, count.max(1));
+        while low < high {
+            let mid = low + (high - low) / 2;
+            let entry = self.entry(mid);
+            let after = entry
+                .name_search
+                .cmp(search)
+                .then_with(|| entry.name_display.cmp(display))
+                == Ordering::Greater;
+            if after {
+                high = mid;
+            } else {
+                low = mid + 1;
+            }
+        }
+        low
+    }
+}
+
+impl<'a> View<'a> {
+    fn base_count(&self) -> u32 {
+        self.base.count()
+    }
+
+    /// True for an id that no longer names a live entry: a base entry the
+    /// overlay deleted or replaced, or an overlay entry deleted since.
+    pub(crate) fn is_removed(&self, id: u32) -> bool {
+        match self.overlay {
+            None => id >= self.base_count(),
+            Some(overlay) => overlay.is_removed(id),
+        }
+    }
+
+    pub(crate) fn entry(&self, id: u32) -> EntryView<'a> {
+        if id >= self.base_count() {
+            if let Some(view) = self.overlay.and_then(|overlay| overlay.entry(id)) {
+                return view;
+            }
+        }
+        self.base.entry(id)
+    }
+
+    pub(crate) fn entry_summary(&self, id: u32) -> EntrySummary<'a> {
+        if id >= self.base_count() {
+            if let Some(view) = self.overlay.and_then(|overlay| overlay.entry(id)) {
+                return EntrySummary {
+                    name_search: view.name_search,
+                    parent_frn: view.parent_frn,
+                    size: view.size,
+                    flags: view.flags,
+                };
+            }
+        }
+        self.base.entry_summary(id)
+    }
+
+    /// The live entry with this reference.
+    pub(crate) fn lookup_frn(&self, frn: u64) -> Option<u32> {
+        match self.overlay {
+            None => self.base.lookup_frn(frn),
+            Some(overlay) => overlay.live_id(frn).or_else(|| {
+                self.base
+                    .lookup_frn(frn)
+                    .filter(|&id| !overlay.is_removed(id))
+            }),
+        }
+    }
+
+    pub(crate) fn lookup_directory_frn(&self, frn: u64) -> Option<u32> {
+        match self.overlay {
+            None => self.base.lookup_directory_frn(frn, |_| true),
+            Some(overlay) => overlay.live_id(frn).or_else(|| {
+                self.base
+                    .lookup_directory_frn(frn, |id| !overlay.is_removed(id))
+            }),
+        }
+    }
+
+    pub(crate) fn find_child_folder(&self, parent_frn: u64, name: &str) -> Option<u32> {
+        if let Some(overlay) = self.overlay {
+            if let Some(id) = overlay.find_child(parent_frn, name, true) {
+                return Some(id);
+            }
+        }
+        let count = self.base_count();
+        let mut id = self.base.name_lower_bound(name);
         while id < count {
-            let entry = self.entry(id);
+            let entry = self.base.entry(id);
             if entry.name_search != name {
                 break;
             }
-            if entry.parent_frn == parent_frn && entry.is_dir() {
+            if entry.parent_frn == parent_frn && entry.is_dir() && !self.is_removed(id) {
                 return Some(id);
             }
             id += 1;
         }
         // An index whose names are not sorted (older synthetic data).
         (1..count).find(|&id| {
-            let entry = self.entry(id);
-            entry.parent_frn == parent_frn && entry.is_dir() && entry.name_search == name
+            let entry = self.base.entry(id);
+            entry.parent_frn == parent_frn
+                && entry.is_dir()
+                && entry.name_search == name
+                && !self.is_removed(id)
         })
     }
 
-    pub fn resolve_path(&self, id: u32) -> Option<String> {
-        if let Ok(cache) = self.path_cache.lock() {
-            if let Some(path) = cache.get(&id) {
-                return Some(path.clone());
-            }
+    pub(crate) fn find_folder(&self, path: &str) -> Option<u32> {
+        let path = crate::path::normalize_path(path);
+        let prefix = crate::path::normalize_path(&self.base.prefix);
+        if path == prefix {
+            return Some(0);
         }
+        let rest = path.strip_prefix(&prefix)?;
+        let rest = rest.strip_prefix(crate::path::SEP).unwrap_or(rest);
+        let mut current = self.base.entry(0).frn;
+        let mut found = 0;
+        for part in rest.split(crate::path::SEP).filter(|part| !part.is_empty()) {
+            found = self.find_child_folder(current, part)?;
+            current = self.entry(found).frn;
+        }
+        Some(found)
+    }
 
+    pub(crate) fn resolve_path(&self, id: u32) -> Option<String> {
         let mut parts = Vec::new();
         let mut current = id;
         let mut found_root = false;
         for _ in 0..128 {
             let entry = self.entry(current);
-            if !entry.name_display.is_empty() {
+            let root = current == 0 || entry.parent_frn == entry.frn;
+            if !entry.name_display.is_empty() && current != 0 {
                 parts.push(String::from_utf16_lossy(entry.name_display));
             }
-            if entry.id == 0 || entry.parent_frn == entry.frn {
+            if root {
                 found_root = true;
                 break;
             }
@@ -338,7 +462,7 @@ impl VolumeIndex {
         }
 
         parts.reverse();
-        let prefix = self.prefix.trim_end_matches(crate::path::SEP);
+        let prefix = self.base.prefix.trim_end_matches(crate::path::SEP);
         let mut path = if prefix.is_empty() {
             crate::path::SEP.to_string()
         } else {
@@ -350,7 +474,150 @@ impl VolumeIndex {
             }
             path.push_str(part);
         }
+        Some(path)
+    }
 
+    /// Orders two ids the way the index is sorted: by search name, then
+    /// display name; a base entry before an overlay entry that sorts the
+    /// same; then by id.
+    pub(crate) fn compare(&self, a: u32, b: u32) -> Ordering {
+        let (left, right) = (self.entry(a), self.entry(b));
+        left.name_search
+            .cmp(right.name_search)
+            .then_with(|| left.name_display.cmp(right.name_display))
+            .then_with(|| a.cmp(&b))
+    }
+}
+
+impl VolumeIndex {
+    pub fn open(dir: &std::path::Path) -> io::Result<Self> {
+        let base = Arc::new(Base::open(dir)?);
+        Ok(Self::from_base(base, None))
+    }
+
+    fn from_base(base: Arc<Base>, overlay: Option<Arc<Overlay>>) -> Self {
+        Self {
+            manifest: base.manifest.clone(),
+            prefix: base.prefix.clone(),
+            base,
+            overlay,
+            path_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// The same mapped base with another overlay (or none). Cheap: nothing
+    /// is copied but the small manifest and prefix.
+    pub fn with_overlay(&self, overlay: Option<Arc<Overlay>>) -> Self {
+        Self::from_base(Arc::clone(&self.base), overlay)
+    }
+
+    pub(crate) fn view(&self) -> View<'_> {
+        View {
+            base: &self.base,
+            overlay: self.overlay.as_deref(),
+        }
+    }
+
+    pub(crate) fn base(&self) -> &Base {
+        &self.base
+    }
+
+    pub fn overlay(&self) -> Option<&Arc<Overlay>> {
+        self.overlay.as_ref()
+    }
+
+    /// True when live changes are layered over the base.
+    pub fn has_changes(&self) -> bool {
+        self.overlay
+            .as_ref()
+            .is_some_and(|overlay| !overlay.is_empty())
+    }
+
+    /// Where the change journal stood when the base was written.
+    pub fn journal(&self) -> Option<JournalCursor> {
+        self.base.journal
+    }
+
+    /// Entries in the base, the root included. Overlay entries have ids
+    /// from here on.
+    pub fn entry_count(&self) -> u32 {
+        self.base.count()
+    }
+
+    pub fn base_count(&self) -> u32 {
+        self.base.count()
+    }
+
+    /// The base's searchable ids, deleted ones included; check
+    /// [`VolumeIndex::is_removed`] when the volume has changes.
+    pub fn base_ids(&self) -> std::ops::Range<u32> {
+        1..self.base.count()
+    }
+
+    /// Every live entry but the root: the base in name order, then the
+    /// entries the overlay added, in name order.
+    pub fn iter_ids(&self) -> impl Iterator<Item = u32> + '_ {
+        let view = self.view();
+        self.base_ids()
+            .filter(move |&id| view.overlay.is_none() || !view.is_removed(id))
+            .chain(self.overlay_ids().iter().copied())
+    }
+
+    /// The overlay's live entries, sorted by name.
+    pub fn overlay_ids(&self) -> &[u32] {
+        self.overlay
+            .as_deref()
+            .map(Overlay::sorted_ids)
+            .unwrap_or(&[])
+    }
+
+    /// Searchable entries, the root left out.
+    pub fn item_count(&self) -> u64 {
+        let base = u64::from(self.base.count().saturating_sub(1));
+        match self.overlay.as_deref() {
+            None => base,
+            Some(overlay) => {
+                base.saturating_sub(u64::from(overlay.removed_count()))
+                    + overlay.sorted_ids().len() as u64
+            }
+        }
+    }
+
+    pub fn is_removed(&self, id: u32) -> bool {
+        self.view().is_removed(id)
+    }
+
+    pub fn entry(&self, id: u32) -> EntryView<'_> {
+        self.view().entry(id)
+    }
+
+    /// The fields name filtering needs, in one metadata read. Skips the
+    /// display name, modification time, and file reference number.
+    pub fn entry_summary(&self, id: u32) -> EntrySummary<'_> {
+        self.view().entry_summary(id)
+    }
+
+    pub fn lookup_frn(&self, frn: u64) -> Option<u32> {
+        self.view().lookup_frn(frn)
+    }
+
+    pub(crate) fn lookup_directory_frn(&self, frn: u64) -> Option<u32> {
+        self.view().lookup_directory_frn(frn)
+    }
+
+    /// The entry id of a folder given by its full path, or 0 for the root.
+    /// Names are found by binary search over the sorted search names.
+    pub fn find_folder(&self, path: &str) -> Option<u32> {
+        self.view().find_folder(path)
+    }
+
+    pub fn resolve_path(&self, id: u32) -> Option<String> {
+        if let Ok(cache) = self.path_cache.lock() {
+            if let Some(path) = cache.get(&id) {
+                return Some(path.clone());
+            }
+        }
+        let path = self.view().resolve_path(id)?;
         if let Ok(mut cache) = self.path_cache.lock() {
             if cache.len() > 1024 {
                 cache.clear();
@@ -360,12 +627,68 @@ impl VolumeIndex {
         Some(path)
     }
 
+    /// Orders two ids of this volume as the index sorts them by name.
+    pub fn compare_names(&self, a: u32, b: u32) -> Ordering {
+        self.view().compare(a, b)
+    }
+
+    /// Every live entry but the root, in name order, as runs of
+    /// consecutive ids `(first, count)`. Without changes that is one run;
+    /// deleted base entries split runs, and each added entry is a run of
+    /// one placed where its name sorts.
+    pub fn live_runs(&self) -> Vec<(u32, u32)> {
+        let count = self.base.count();
+        let Some(overlay) = self.overlay.as_deref() else {
+            return if count > 1 {
+                vec![(1, count - 1)]
+            } else {
+                Vec::new()
+            };
+        };
+        let mut runs: Vec<(u32, u32)> = Vec::new();
+        let push = |runs: &mut Vec<(u32, u32)>, first: u32, end: u32| {
+            if end > first {
+                runs.push((first, end - first));
+            }
+        };
+        let mut start = 1u32;
+        let mut removed = overlay.removed_ids().peekable();
+        for &added in overlay.sorted_ids() {
+            let entry = self.entry(added);
+            let at = self
+                .base
+                .insertion_point(entry.name_search, entry.name_display);
+            // Base entries before `at`, split around deleted ones.
+            while let Some(&gone) = removed.peek() {
+                if gone >= at {
+                    break;
+                }
+                removed.next();
+                if gone >= start {
+                    push(&mut runs, start, gone);
+                    start = gone + 1;
+                }
+            }
+            push(&mut runs, start, at.max(start));
+            start = at.max(start);
+            runs.push((added, 1));
+        }
+        for gone in removed {
+            if gone >= start {
+                push(&mut runs, start, gone);
+                start = gone + 1;
+            }
+        }
+        push(&mut runs, start, count);
+        runs
+    }
+
     pub fn check_offsets(&self, entry_index: usize) -> Option<(u32, u32)> {
         if !entry_index.is_multiple_of(CHECK_STRIDE) {
             return None;
         }
         let slot = entry_index / CHECK_STRIDE;
-        let data = self.check.as_slice();
+        let data = self.base.check.as_slice();
         if slot * 8 + 8 > data.len() {
             return None;
         }
@@ -373,21 +696,21 @@ impl VolumeIndex {
     }
 }
 
-fn read_u16(data: &[u8], offset: usize) -> u16 {
+pub(crate) fn read_u16(data: &[u8], offset: usize) -> u16 {
     data.get(offset..offset + 2)
         .and_then(|b| b.try_into().ok())
         .map(u16::from_le_bytes)
         .unwrap_or(0)
 }
 
-fn read_u32(data: &[u8], offset: usize) -> u32 {
+pub(crate) fn read_u32(data: &[u8], offset: usize) -> u32 {
     data.get(offset..offset + 4)
         .and_then(|b| b.try_into().ok())
         .map(u32::from_le_bytes)
         .unwrap_or(0)
 }
 
-fn read_u64(data: &[u8], offset: usize) -> u64 {
+pub(crate) fn read_u64(data: &[u8], offset: usize) -> u64 {
     data.get(offset..offset + 8)
         .and_then(|b| b.try_into().ok())
         .map(u64::from_le_bytes)
