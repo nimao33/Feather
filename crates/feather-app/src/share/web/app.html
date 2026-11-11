@@ -34,8 +34,14 @@
     </div>
   </div>
   <div class="tools" id="tools" hidden>
+    <!-- No accept filter and no capture: phones then offer every file app
+         (Files, Drive, file managers), not only the camera and gallery. -->
     <label class="button" for="files">Upload files</label>
     <input id="files" type="file" multiple hidden>
+    <label class="button" for="folder" id="folder-label">Upload folder</label>
+    <input id="folder" type="file" webkitdirectory multiple hidden>
+    <label class="button camera" for="camera">Take photo or video</label>
+    <input id="camera" type="file" accept="image/*,video/*" capture="environment" hidden>
     <button id="mkdir" type="button">New folder</button>
   </div>
   <p class="status" id="status" role="status" aria-live="polite"></p>
@@ -46,6 +52,19 @@
   <ul class="grid" id="grid" hidden></ul>
   <p class="empty" id="empty" hidden></p>
 </main>
+
+<div class="drop" id="drop" aria-hidden="true"><div>Drop files or folders to upload them here</div></div>
+
+<dialog class="dialog" id="conflict" aria-labelledby="conflict-title">
+  <h2 id="conflict-title">Already there</h2>
+  <p id="conflict-text"></p>
+  <label class="check" id="conflict-all-row"><input id="conflict-all" type="checkbox"> Do this for all the rest</label>
+  <div class="dialog-buttons">
+    <button id="conflict-skip" type="button" class="quiet">Skip</button>
+    <button id="conflict-keep" type="button">Keep both</button>
+    <button id="conflict-replace" type="button" class="primary">Replace</button>
+  </div>
+</dialog>
 
 <div class="viewer" id="viewer" hidden role="dialog" aria-modal="true" aria-labelledby="viewer-name">
   <div class="viewer-top">

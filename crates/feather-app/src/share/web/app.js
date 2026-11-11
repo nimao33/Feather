@@ -68,8 +68,12 @@ async function openBytes(aad, sealed) {
 async function failure(response) {
   if (response.status === 401) throw signedOut();
   let message = response.statusText || 'Something went wrong.';
-  try { message = (await response.json()).error || message; } catch (_) { /* not JSON */ }
-  return new Error(message);
+  let data = {};
+  try { data = await response.json(); message = data.error || message; } catch (_) { /* not JSON */ }
+  const error = new Error(message);
+  error.status = response.status;
+  error.data = data;
+  return error;
 }
 
 /** One API call: `op` like '/api/list', `params` an object. Returns the reply's JSON. */
@@ -90,7 +94,12 @@ async function call(op, params = {}, method = 'GET') {
   const code = Number(reply.slice(0, split));
   const data = JSON.parse(reply.slice(split + 1));
   if (code === 401) throw signedOut();
-  if (code >= 400) throw new Error(data.error || 'Something went wrong.');
+  if (code >= 400) {
+    const error = new Error(data.error || 'Something went wrong.');
+    error.status = code;
+    error.data = data;
+    throw error;
+  }
   return data;
 }
 
@@ -151,7 +160,7 @@ async function send(file, params) {
       method: 'PUT', body: file, credentials: 'same-origin', headers: { 'X-Feather-Csrf': state.info.csrf },
     });
     if (!response.ok) throw await failure(response);
-    return;
+    return response.json();
   }
   const meta = await sealBytes(encoder.encode('feather upload'), encoder.encode(query(params)));
   const label = concat(encoder.encode('feather upload'), meta.slice(0, 12));
@@ -168,6 +177,7 @@ async function send(file, params) {
     method: 'PUT', body: new Blob(frames), credentials: 'same-origin', headers: { 'X-Feather-Sealed': hex(meta) },
   });
   if (!response.ok) throw await failure(response);
+  return response.json();
 }
 
 function query(params) {
@@ -1103,29 +1113,147 @@ async function search(text) {
   }
 }
 
-async function upload(files) {
-  for (const file of files) {
-    status('Uploading ' + file.name + '…');
-    const params = { root: state.root, path: state.path, name: file.name, replace: '0' };
+// ----- Uploads ------------------------------------------------------------------
+
+/**
+ * Asks what to do with a name that is already there: Replace, Keep both,
+ * or Skip, and whether to do the same for the rest of this upload.
+ */
+function askConflict(name, isFolder, more) {
+  return new Promise((resolve) => {
+    const box = $('conflict');
+    $('conflict-text').textContent = '“' + name + '” is already in this folder.';
+    $('conflict-all').checked = false;
+    $('conflict-all-row').hidden = !more;
+    $('conflict-replace').hidden = isFolder;
+    const done = (choice) => {
+      box.close();
+      resolve({ choice, all: more && $('conflict-all').checked });
+    };
+    $('conflict-replace').onclick = () => done('replace');
+    $('conflict-keep').onclick = () => done('keep');
+    $('conflict-skip').onclick = () => done('skip');
+    box.oncancel = (event) => { event.preventDefault(); done('skip'); };
+    box.showModal();
+    $('conflict-keep').focus();
+  });
+}
+
+/**
+ * Uploads files into the open folder. Each item is `{ file, sub }`, where
+ * `sub` is the folder inside it the file came from (for whole folders),
+ * which the server makes as needed.
+ */
+async function upload(items) {
+  if (!items.length || state.root === null || state.info.mode !== 'full') return;
+  const root = state.root;
+  const path = state.path;
+  let always = null;
+  let sent = 0;
+  let skipped = 0;
+  for (const [index, item] of items.entries()) {
+    const label = items.length > 1 ? (index + 1) + ' of ' + items.length + ': ' : '';
+    status('Uploading ' + label + item.file.name + '…');
+    const params = { root, path, name: item.file.name, sub: item.sub || '', conflict: always && always !== 'skip' ? always : 'ask' };
     try {
-      await send(file, params);
-    } catch (error) {
-      if (/already there/.test(error.message) && confirm(file.name + ' is already there. Replace it?')) {
-        params.replace = '1';
-        try {
-          await send(file, params);
-        } catch (again) {
-          status(again.message, true);
-          return;
+      try {
+        await send(item.file, params);
+      } catch (error) {
+        if (!(error.status === 409 && error.data && error.data.conflict)) throw error;
+        let choice = always;
+        if (!choice) {
+          const answer = await askConflict(item.file.name, error.data.dir, index + 1 < items.length);
+          choice = answer.choice;
+          if (answer.all) always = choice;
         }
-      } else {
-        status(error.message, true);
-        return;
+        if (choice === 'skip') { skipped += 1; continue; }
+        params.conflict = choice;
+        await send(item.file, params);
       }
+      sent += 1;
+    } catch (error) {
+      status(item.file.name + ': ' + error.message, true);
+      if (state.root === root && state.path === path) refresh();
+      return;
     }
   }
-  status(files.length === 1 ? 'Uploaded.' : 'Uploaded ' + files.length + ' files.');
-  open(state.root, state.path);
+  if (state.root === root && state.path === path && !state.query) await refresh();
+  const what = sent === 1 ? 'Uploaded 1 file.' : 'Uploaded ' + sent + ' files.';
+  status(skipped ? what + ' Skipped ' + skipped + '.' : what);
+}
+
+/** Files chosen in a picker; a folder picker gives each its folder too. */
+function picked(input) {
+  const items = Array.from(input.files || []).map((file) => {
+    const relative = file.webkitRelativePath || '';
+    const sub = relative.includes('/') ? relative.slice(0, relative.lastIndexOf('/')) : '';
+    return { file, sub };
+  });
+  input.value = '';
+  return items;
+}
+
+/** Everything in a dropped folder, with the folders it was in. */
+function readEntry(entry, sub, out) {
+  return new Promise((resolve) => {
+    if (entry.isFile) {
+      entry.file((file) => { out.push({ file, sub }); resolve(); }, () => resolve());
+    } else if (entry.isDirectory) {
+      const reader = entry.createReader();
+      const inner = sub ? sub + '/' + entry.name : entry.name;
+      const batch = () => reader.readEntries(async (entries) => {
+        if (!entries.length) { resolve(); return; }
+        for (const child of entries) await readEntry(child, inner, out);
+        batch();
+      }, () => resolve());
+      batch();
+    } else {
+      resolve();
+    }
+  });
+}
+
+async function dropped(transfer) {
+  const out = [];
+  const entries = Array.from(transfer.items || [])
+    .map((item) => (item.webkitGetAsEntry ? item.webkitGetAsEntry() : null))
+    .filter(Boolean);
+  if (entries.length) {
+    for (const entry of entries) await readEntry(entry, '', out);
+  } else {
+    for (const file of Array.from(transfer.files || [])) out.push({ file, sub: '' });
+  }
+  return out;
+}
+
+/** Desktop: drop files or folders anywhere on the page to upload them. */
+function wireDrop() {
+  let depth = 0;
+  const can = (event) => state.info.mode === 'full' && state.root !== null && !state.query
+    && event.dataTransfer && Array.from(event.dataTransfer.types || []).includes('Files');
+  const show = (on) => $('drop').classList.toggle('show', on);
+  document.addEventListener('dragenter', (event) => {
+    if (!can(event)) return;
+    event.preventDefault();
+    depth += 1;
+    show(true);
+  });
+  document.addEventListener('dragover', (event) => {
+    if (!can(event)) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'copy';
+  });
+  document.addEventListener('dragleave', () => {
+    depth = Math.max(0, depth - 1);
+    if (!depth) show(false);
+  });
+  document.addEventListener('drop', async (event) => {
+    depth = 0;
+    show(false);
+    if (!can(event)) return;
+    event.preventDefault();
+    upload(await dropped(event.dataTransfer));
+  });
 }
 
 async function makeFolder() {
@@ -1162,7 +1290,7 @@ async function deleteItem(root, path, name) {
 }
 
 function refresh() {
-  if (state.query) search(state.query); else open(state.root, state.path);
+  return state.query ? search(state.query) : open(state.root, state.path);
 }
 
 /** Through a tunnel, points people on the same Wi-Fi to the fast address. */
@@ -1207,11 +1335,12 @@ async function start() {
     sessionStorage.removeItem('feather-key');
     location.href = '/login';
   });
-  $('files').addEventListener('change', (event) => {
-    const files = Array.from(event.target.files || []);
-    event.target.value = '';
-    if (files.length) upload(files);
-  });
+  for (const id of ['files', 'folder', 'camera']) {
+    $(id).addEventListener('change', (event) => upload(picked(event.target)));
+  }
+  // Folder pickers aren't on every phone.
+  if (!('webkitdirectory' in document.createElement('input'))) $('folder-label').hidden = true;
+  wireDrop();
   $('mkdir').addEventListener('click', makeFolder);
   $('zip').addEventListener('click', () => saveZip(state.root, state.path, folderLabel(state.root, state.path)));
   offerLocal();

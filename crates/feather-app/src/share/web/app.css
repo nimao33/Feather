@@ -207,6 +207,28 @@ main { max-width: 1100px; margin: 0 auto; padding: 16px 20px 48px; }
 .icon-button { display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 28px; margin-right: 4px; border-radius: 7px; color: var(--text2); vertical-align: middle; }
 .icon-button:hover { background: var(--hover); color: var(--text); }
 
+/* Uploads */
+.tools { flex-wrap: wrap; }
+.tools .camera { display: none; }
+@media (pointer: coarse) { .tools .camera { display: inline-flex; } }
+.tools [hidden] { display: none; }
+.drop { position: fixed; inset: 0; z-index: 20; display: grid; place-items: center; padding: 24px; background: rgba(12, 10, 8, 0.6); opacity: 0; pointer-events: none; transition: opacity 120ms ease-out; }
+.drop.show { opacity: 1; }
+.drop div { padding: 28px 32px; border: 2px dashed var(--accent); border-radius: 16px; background: var(--panel); color: var(--text); font-size: 17px; font-weight: 600; text-align: center; }
+
+/* Small dialogs */
+.dialog { width: min(420px, calc(100vw - 32px)); padding: 20px; border: 1px solid var(--line); border-radius: 14px; background: var(--panel); color: var(--text); }
+.dialog::backdrop { background: rgba(0, 0, 0, 0.5); }
+.dialog h2 { margin: 0 0 8px; font-size: 18px; font-weight: 600; }
+.dialog p { margin: 0 0 14px; color: var(--text2); overflow-wrap: anywhere; }
+.dialog .check { display: flex; align-items: center; gap: 8px; margin: 0 0 16px; font-size: 14px; }
+.dialog .check[hidden] { display: none; }
+.dialog-buttons { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+.dialog-buttons [hidden] { display: none; }
+button.primary { border-color: transparent; background: var(--accent); color: var(--on-accent); font-weight: 600; }
+button.primary:hover { background: var(--accent); filter: brightness(1.08); }
+.dialog input[type="text"] { width: 100%; height: 40px; margin: 0 0 16px; padding: 0 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--ground); }
+
 /* Download a folder */
 .zip { flex: none; color: var(--text2); }
 .zip svg, .tile-action svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }

@@ -410,6 +410,24 @@ pub fn recycle(path: &Path) -> Result<(), String> {
     result.map_err(|error| error.to_string())
 }
 
+/// A name beside `taken` that nothing has yet, like `photo (2).jpg` for
+/// `photo.jpg`, or `None` after many tries.
+pub fn free_name(taken: &Path) -> Option<PathBuf> {
+    let folder = taken.parent()?;
+    let name = taken.file_name()?.to_str()?;
+    // A folder's dots are part of its name; a file keeps its extension.
+    let (stem, extension) = match name.rfind('.') {
+        Some(dot) if dot > 0 && !taken.is_dir() => (&name[..dot], &name[dot..]),
+        _ => (name, ""),
+    };
+    (2..10_000).find_map(|number| {
+        let candidate = format!("{stem} ({number}){extension}");
+        let path = folder.join(&candidate);
+        (check_name(&candidate).is_ok() && std::fs::symlink_metadata(&path).is_err())
+            .then_some(path)
+    })
+}
+
 /// A resolved path the way Windows shows it: without `\\?\`.
 pub fn display_path(path: &Path) -> String {
     let text = path.to_string_lossy();

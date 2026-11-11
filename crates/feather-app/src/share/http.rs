@@ -1834,24 +1834,144 @@ fn zip_plain(
     Ok(!request.http10)
 }
 
+fn denied_reply(denied: Denied) -> (u16, String) {
+    match denied {
+        Denied::BadName => (400, error_json("That name isn't allowed.")),
+        Denied::NotFound => (404, error_json("Not found.")),
+    }
+}
+
+/// What to do when something with the same name is already there.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Conflict {
+    /// Say so (409) and let the visitor choose.
+    Ask,
+    Replace,
+    /// Use a free name like `name (2).txt`.
+    KeepBoth,
+}
+
+impl Conflict {
+    fn of(params: &Params) -> Self {
+        match (params.get("conflict"), params.get("replace")) {
+            (Some("replace"), _) | (None, Some("1")) => Conflict::Replace,
+            (Some("keep"), _) => Conflict::KeepBoth,
+            _ => Conflict::Ask,
+        }
+    }
+}
+
+/// The 409 reply that lets the page ask Replace, Keep both, or Skip.
+fn conflict_json(name: &str, folder: bool) -> String {
+    format!(
+        "{{\"error\":{},\"conflict\":true,\"name\":{},\"dir\":{folder}}}",
+        quote(&format!("{name} is already there.")),
+        quote(name)
+    )
+}
+
+/// Makes the folders of `sub` (like `Trip/Day 1`) inside folder `path` of
+/// shared folder `root`, as an uploaded folder had them. Each name is
+/// checked like any other, and a name taken by something a visitor can't
+/// see, or by a file, is refused. Returns the path the files go in.
+fn make_folders(
+    shared: &Shared,
+    root: usize,
+    path: &str,
+    sub: &str,
+) -> Result<String, (u16, String)> {
+    let mut at = path.trim_matches('/').to_string();
+    for (depth, part) in sub
+        .split(['/', '\\'])
+        .filter(|part| !part.is_empty())
+        .enumerate()
+    {
+        files::check_name(part).map_err(denied_reply)?;
+        if depth >= 32 {
+            return Err((400, error_json("Those folders are nested too deep.")));
+        }
+        let next = if at.is_empty() {
+            part.to_string()
+        } else {
+            format!("{at}/{part}")
+        };
+        match shared.roots.resolve(root, &next) {
+            Ok(folder) if folder.is_dir() => {}
+            Ok(_) => {
+                return Err((
+                    409,
+                    error_json(&format!(
+                        "A file called {part} is in the way of that folder."
+                    )),
+                ))
+            }
+            Err(_) => {
+                let target = shared
+                    .roots
+                    .resolve_new(root, &at, part)
+                    .map_err(denied_reply)?;
+                // Taken by something hidden or left out: not ours to touch.
+                if std::fs::symlink_metadata(&target).is_ok() {
+                    return Err(denied_reply(Denied::NotFound));
+                }
+                std::fs::create_dir(&target).map_err(|error| {
+                    (
+                        400,
+                        error_json(&format!("Couldn't create the folder {part}: {error}")),
+                    )
+                })?;
+            }
+        }
+        at = next;
+    }
+    Ok(at)
+}
+
 /// Where an upload goes, checked before any of it is read.
 fn upload_target(shared: &Shared, params: &Params) -> Result<PathBuf, (u16, String)> {
     let name = params.get("name").unwrap_or("");
-    let replace = params.get("replace") == Some("1");
-    let target = shared
+    files::check_name(name).map_err(denied_reply)?;
+    let root = params.root();
+    // The place must be a folder a visitor may use before anything is made in it.
+    match shared.roots.resolve(root, params.path()) {
+        Ok(folder) if folder.is_dir() => {}
+        Ok(_) => return Err(denied_reply(Denied::NotFound)),
+        Err(denied) => return Err(denied_reply(denied)),
+    }
+    let folder = match params.get("sub").filter(|sub| !sub.is_empty()) {
+        Some(sub) => make_folders(shared, root, params.path(), sub)?,
+        None => params.path().to_string(),
+    };
+    let mut target = shared
         .roots
-        .resolve_new(params.root(), params.path(), name)
-        .map_err(|denied| match denied {
-            Denied::BadName => (400, error_json("That name isn't allowed.")),
-            Denied::NotFound => (404, error_json("Not found.")),
-        })?;
-    if target.is_dir() || (target.exists() && !replace) {
-        return Err((409, error_json("A file with that name is already there.")));
+        .resolve_new(root, &folder, name)
+        .map_err(denied_reply)?;
+    let taken = std::fs::symlink_metadata(&target).is_ok();
+    match Conflict::of(params) {
+        _ if !taken => {}
+        Conflict::KeepBoth => {
+            target =
+                files::free_name(&target).ok_or((409, error_json("No free name was found.")))?;
+        }
+        Conflict::Replace if target.is_file() => {}
+        Conflict::Replace => {
+            return Err((409, error_json("A folder with that name is already there.")));
+        }
+        Conflict::Ask => return Err((409, conflict_json(name, target.is_dir()))),
     }
     if target.parent().is_none() {
         return Err((400, error_json("That folder can't be used.")));
     }
     Ok(target)
+}
+
+/// The reply to an upload: the name it was saved under.
+fn saved_json(target: &Path) -> String {
+    let name = target
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    format!("{{\"name\":{}}}", quote(&name))
 }
 
 /// Writes beside the target, then moves it into place in one step.
@@ -1902,7 +2022,7 @@ fn upload_plain(
     }) {
         Ok(()) => {
             shared.log(client, &format!("upload {}", files::display_path(&target)));
-            json(conn, 201, "{}")?;
+            json(conn, 201, &saved_json(&target))?;
             Ok(true)
         }
         Err(error) => {
@@ -2173,7 +2293,7 @@ fn sealed_upload(
     match result {
         Ok(()) => {
             shared.log(client, &format!("upload {}", files::display_path(&target)));
-            json(conn, 201, "{}")?;
+            json(conn, 201, &saved_json(&target))?;
             Ok(true)
         }
         Err(error) => {

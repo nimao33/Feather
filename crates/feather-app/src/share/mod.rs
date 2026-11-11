@@ -1276,6 +1276,49 @@ mod tests {
             std::fs::read(shared.join("docs").join("b.txt")).unwrap(),
             b"up"
         );
+        // The same name again: the page is asked, then told what to do.
+        let put = |query: &str, body: &[u8]| {
+            https(
+                &tls_config,
+                http_port,
+                &format!(
+                    "PUT /api/upload?{query} HTTP/1.1\r\n{signed}X-Feather-Csrf: {csrf}\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                ),
+                body,
+            )
+        };
+        let (code, _, body) = put("root=0&path=docs&name=b.txt", b"again");
+        assert_eq!(code, 409);
+        assert!(String::from_utf8_lossy(&body).contains("\"conflict\":true"));
+        let (code, _, body) = put("root=0&path=docs&name=b.txt&conflict=keep", b"both");
+        assert_eq!(code, 201);
+        assert!(String::from_utf8_lossy(&body).contains("b (2).txt"));
+        assert_eq!(
+            std::fs::read(shared.join("docs").join("b (2).txt")).unwrap(),
+            b"both"
+        );
+        let (code, _, _) = put("root=0&path=docs&name=b.txt&conflict=replace", b"new");
+        assert_eq!(code, 201);
+        assert_eq!(
+            std::fs::read(shared.join("docs").join("b.txt")).unwrap(),
+            b"new"
+        );
+        // A whole folder: its folders are made, safely.
+        let (code, _, _) = put("root=0&path=docs&name=c.txt&sub=Trip%2FDay+1", b"c");
+        assert_eq!(code, 201);
+        assert_eq!(
+            std::fs::read(shared.join("docs").join("Trip").join("Day 1").join("c.txt")).unwrap(),
+            b"c"
+        );
+        for sub in ["..%2F..", "Trip%2F..%2F..%2Fescape", "a%3Ab", "CON"] {
+            let (code, _, _) = put(&format!("root=0&path=docs&name=d.txt&sub={sub}"), b"d");
+            assert_eq!(code, 400, "{sub}");
+        }
+        assert!(!base.join("escape").exists() && !base.join("d.txt").exists());
+        // A file where a folder should be.
+        let (code, _, _) = put("root=0&path=docs&name=e.txt&sub=a.txt", b"e");
+        assert_eq!(code, 409);
 
         // FTP refuses to sign in without TLS, then works over it.
         let control = TcpStream::connect(("127.0.0.1", ftp_port)).unwrap();
