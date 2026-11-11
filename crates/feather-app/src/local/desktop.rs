@@ -38,15 +38,14 @@ fn launch(program: &Path, args: &[&str]) -> Result<(), String> {
 
 /// Opens Feather's window: an app window of a Chromium-family browser when
 /// one is installed (no tabs or address bar, its own taskbar entry), else
-/// the default browser. `FEATHER_BROWSER` picks one by hand.
+/// the default browser. `FEATHER_BROWSER` picks one by hand: a command
+/// whose `%s` becomes the address (`chromium --app=%s`), or which gets the
+/// address added at the end (`firefox --new-window`).
 pub fn open_browser(url: &str) -> Result<(), String> {
     if let Ok(choice) = std::env::var("FEATHER_BROWSER") {
-        let mut parts = choice.split_whitespace();
-        if let Some(program) = parts.next() {
-            let mut args: Vec<String> = parts.map(str::to_string).collect();
-            args.push(url.to_string());
+        if let Some((program, args)) = browser_command(&choice, url) {
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
-            return launch(Path::new(program), &args);
+            return launch(Path::new(&program), &args);
         }
     }
     if cfg!(windows) {
@@ -83,6 +82,22 @@ pub fn open_browser(url: &str) -> Result<(), String> {
         }
     }
     Err(format!("No browser was found. Open {url} by hand."))
+}
+
+/// `FEATHER_BROWSER` split into the program and its arguments, with the
+/// address in place of `%s` or, without one, at the end.
+fn browser_command(choice: &str, url: &str) -> Option<(String, Vec<String>)> {
+    let mut parts = choice.split_whitespace();
+    let program = parts.next()?.to_string();
+    let mut args: Vec<String> = parts.map(str::to_string).collect();
+    if args.iter().any(|arg| arg.contains("%s")) {
+        for arg in &mut args {
+            *arg = arg.replace("%s", url);
+        }
+    } else {
+        args.push(url.to_string());
+    }
+    Some((program, args))
 }
 
 #[cfg(windows)]
@@ -205,23 +220,40 @@ fn icon_file() -> Option<PathBuf> {
     )
 }
 
-/// The `.desktop` entry, starting this copy of Feather.
-fn desktop_entry(background: bool) -> Result<String, String> {
-    let exe = std::env::current_exe().map_err(|error| error.to_string())?;
-    // Exec quoting per the Desktop Entry spec.
+/// A value of the Desktop Entry `string` type: backslashes escaped.
+fn string_value(text: &str) -> String {
+    text.replace('\\', "\\\\")
+}
+
+/// The `Exec` value starting `program`, quoted per the Desktop Entry spec:
+/// the argument quoting first, then the `string` escaping on top of it,
+/// and `%` doubled so it isn't read as a field code.
+fn exec_line(program: &str, background: bool) -> String {
     let quoted = format!(
         "\"{}\"",
-        exe.to_string_lossy()
+        program
             .replace('\\', "\\\\")
             .replace('"', "\\\"")
             .replace('`', "\\`")
             .replace('$', "\\$")
     );
-    let exec = if background {
-        format!("{quoted} --background")
+    let line = string_value(&quoted).replace('%', "%%");
+    if background {
+        format!("{line} --background")
     } else {
-        quoted
-    };
+        line
+    }
+}
+
+/// The `.desktop` entry, starting this copy of Feather.
+fn desktop_entry(background: bool) -> Result<String, String> {
+    let exe = std::env::current_exe().map_err(|error| error.to_string())?;
+    let exec = exec_line(&exe.to_string_lossy(), background);
+    // The icon by its full path: another icon theme may have a "feather"
+    // of its own (and some launchers don't search the user's icons).
+    let icon = icon_file()
+        .map(|path| string_value(&path.to_string_lossy()))
+        .unwrap_or_else(|| "feather".into());
     Ok(format!(
         "[Desktop Entry]\n\
          Type=Application\n\
@@ -229,7 +261,7 @@ fn desktop_entry(background: bool) -> Result<String, String> {
          GenericName=File Search\n\
          Comment=Find files and folders by name as you type\n\
          Exec={exec}\n\
-         Icon=feather\n\
+         Icon={icon}\n\
          Terminal=false\n\
          Categories=Utility;FileTools;\n\
          Keywords=search;find;files;folders;everything;\n\
@@ -304,5 +336,35 @@ mod tests {
             file_url(Path::new("/home/me/My file.txt")),
             "file:///home/me/My%20file.txt"
         );
+    }
+
+    #[test]
+    fn exec_quoting() {
+        assert_eq!(
+            exec_line("/home/me/.local/bin/feather", false),
+            "\"/home/me/.local/bin/feather\""
+        );
+        assert_eq!(
+            exec_line("/opt/100% $x/feather", true),
+            "\"/opt/100%% \\\\$x/feather\" --background"
+        );
+        assert_eq!(exec_line("/a\\b", false), "\"/a\\\\\\\\b\"");
+    }
+
+    #[test]
+    fn browser_commands() {
+        let url = "http://127.0.0.1:1/?key=k";
+        assert_eq!(
+            browser_command("chromium --app=%s", url),
+            Some(("chromium".into(), vec![format!("--app={url}")]))
+        );
+        assert_eq!(
+            browser_command(" firefox  --new-window ", url),
+            Some((
+                "firefox".into(),
+                vec!["--new-window".into(), url.to_string()]
+            ))
+        );
+        assert_eq!(browser_command("  ", url), None);
     }
 }

@@ -1,0 +1,214 @@
+name: release
+
+# Builds the downloads for a version tag and attaches them to its GitHub
+# release: the Windows .msi, the static Linux tarball, and SHA256SUMS.txt.
+#
+# Pushing a tag such as v1.2.0 runs it. "Run workflow" runs it for a tag
+# that already exists (the code is checked out at that tag; the packaging
+# scripts come from the branch the workflow runs from).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build and release, e.g. v1.0.0"
+        required: true
+        type: string
+      windows:
+        description: "Build and upload the Windows .msi (off keeps the .msi already on the release)"
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+      windows: ${{ steps.version.outputs.windows }}
+    steps:
+      - name: Tag
+        id: tag
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          tag="${INPUT_TAG:-$GITHUB_REF_NAME}"
+          case "$tag" in
+            v[0-9]*) ;;
+            *) echo "::error::'$tag' is not a version tag like v1.2.0"; exit 1 ;;
+          esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ steps.tag.outputs.tag }}
+      # The .msi takes its name from Cargo.toml; the tag must agree.
+      - name: Version
+        id: version
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          WINDOWS: ${{ github.event_name == 'push' || github.event.inputs.windows == 'true' }}
+        run: |
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [ "v$version" != "$TAG" ]; then
+            echo "::error::Cargo.toml says $version but the tag is $TAG"
+            exit 1
+          fi
+          {
+            echo "tag=$TAG"
+            echo "version=$version"
+            echo "windows=$WINDOWS"
+          } >> "$GITHUB_OUTPUT"
+
+  windows:
+    needs: meta
+    if: needs.meta.outputs.windows == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ needs.meta.outputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      # WiX 7 asks once for its Open Source Maintenance Fee EULA;
+      # `wix eula accept wix7` records the acceptance for this runner.
+      - name: WiX
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 7.0.1
+          if ($LASTEXITCODE -ne 0) { throw "installing wix failed" }
+          $tools = Join-Path $env:USERPROFILE ".dotnet/tools"
+          $env:PATH = "$tools;$env:PATH"
+          Add-Content -Path $env:GITHUB_PATH -Value $tools
+          wix --version
+          wix eula accept wix7
+          if ($LASTEXITCODE -ne 0) { throw "accepting the WiX EULA failed" }
+          wix extension add -g WixToolset.UI.wixext/7.0.1
+          if ($LASTEXITCODE -ne 0) { throw "adding the WiX UI extension failed" }
+      - name: Build the .msi
+        shell: pwsh
+        run: ./installer/build-msi.ps1
+      - name: Check the .msi
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          $msi = "target/installer/Feather-$env:VERSION-x64.msi"
+          if (-not (Test-Path $msi)) { throw "$msi is missing" }
+          Get-Item $msi | Format-List Name, Length
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: target/installer/Feather-${{ needs.meta.outputs.version }}-x64.msi
+          if-no-files-found: error
+
+  linux:
+    needs: meta
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ needs.meta.outputs.tag }}
+      # The packaging scripts as of this workflow's commit, so older tags
+      # get the current tarball layout too.
+      - uses: actions/checkout@v4
+        with:
+          path: release-tools
+          sparse-checkout: scripts
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      # The package mirrors sometimes fail to resolve, so retry a few times.
+      - name: Musl tools
+        run: |
+          for attempt in 1 2 3 4 5; do
+            sudo apt-get update && sudo apt-get install -y musl-tools && exit 0
+            echo "apt failed (attempt $attempt), retrying in 20s"; sleep 20
+          done
+          exit 1
+      # One static binary that runs on any distribution.
+      - name: Static release build
+        run: cargo build --release --locked -p feather-app --target x86_64-unknown-linux-musl
+      - name: Check the binary
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          binary=target/x86_64-unknown-linux-musl/release/feather
+          file "$binary"
+          if ! file "$binary" | grep -Eq 'statically linked|static-pie linked'; then
+            echo "::error::$binary is not statically linked"
+            exit 1
+          fi
+          "$binary" --version | tee version.txt
+          grep -q "$VERSION" version.txt
+      - name: Package
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          sh release-tools/scripts/package-linux.sh \
+            target/x86_64-unknown-linux-musl/release/feather "$VERSION" dist
+          tar -tzvf "dist/feather-$VERSION-linux-x86_64.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux
+          path: dist/feather-${{ needs.meta.outputs.version }}-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: [meta, windows, linux]
+    # The .msi job is skipped when the run leaves the .msi alone.
+    if: >-
+      always() &&
+      needs.meta.result == 'success' &&
+      needs.linux.result == 'success' &&
+      (needs.windows.result == 'success' || needs.windows.result == 'skipped')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ needs.meta.outputs.tag }}
+      VERSION: ${{ needs.meta.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Release
+        run: |
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "Release $TAG exists; its assets of the same name are replaced."
+          else
+            gh release create "$TAG" --verify-tag --title "Feather $VERSION" --generate-notes
+          fi
+      # SHA256SUMS.txt covers every download on the release, including
+      # ones this run didn't build (such as an .msi it left alone).
+      - name: Checksums
+        run: |
+          mkdir -p existing
+          gh release download "$TAG" --dir existing --skip-existing || true
+          rm -f existing/SHA256SUMS.txt
+          for file in dist/*; do
+            rm -f "existing/$(basename "$file")"
+          done
+          mkdir -p sums
+          cp dist/* sums/
+          if [ -n "$(ls -A existing)" ]; then
+            cp existing/* sums/
+          fi
+          (cd sums && sha256sum -- * > ../SHA256SUMS.txt)
+          cat SHA256SUMS.txt
+      - name: Upload
+        run: gh release upload "$TAG" dist/* SHA256SUMS.txt --clobber
