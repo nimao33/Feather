@@ -10,6 +10,10 @@ A fast, low-memory file search for Windows (and Linux), written in Rust.
 **[Download Feather for Windows](https://github.com/nimao33/Feather/releases/latest)**: run the
 `.msi`, no admin rights needed.
 
+**[Download Feather for Linux](https://github.com/nimao33/Feather/releases/latest)**:
+`feather-<version>-linux-x86_64.tar.gz`, one static binary for any x86_64
+distribution ([install steps](#linux)).
+
 Type part of a name and Feather lists every matching file and folder on your
 drives as you type. It reads the NTFS file table directly, keeps its index in
 memory-mapped files instead of RAM, and draws its own UI with Direct2D. There
@@ -166,8 +170,29 @@ installed. `.\scripts\build.ps1` finds `vcvars64.bat` for you, and
 
 ### Linux
 
-The window there is a local page in an app window of your browser, so no GUI
-toolkit is needed. It listens on 127.0.0.1 only, behind a random key.
+The window there is a local page in an app window of your browser
+(Chromium, Chrome, Brave, Edge or Vivaldi when one is installed, otherwise
+the default browser), so no GUI toolkit is needed. It listens on 127.0.0.1
+only, behind a random key. `FEATHER_BROWSER` picks the browser by hand, for
+example `FEATHER_BROWSER="firefox --new-window"` or
+`FEATHER_BROWSER="chromium --app=%s"`.
+
+From a release download (no Rust needed), for your user only:
+
+```sh
+tar xf feather-1.0.0-linux-x86_64.tar.gz
+cd feather-1.0.0-linux-x86_64
+./install.sh               # copies feather to ~/.local/bin, adds a menu entry
+./install.sh --autostart   # the same, and starts Feather at sign-in
+```
+
+or by hand: `install -Dm755 feather ~/.local/bin/feather && ~/.local/bin/feather install`.
+`feather install` points the menu entry at the copy it runs from, so run it
+from where the program will stay. `feather uninstall` removes the menu and
+autostart entries again. Each download is listed in the release's
+`SHA256SUMS.txt`.
+
+From source:
 
 ```sh
 sh scripts/install-linux.sh              # build, install to ~/.local/bin, add a menu entry
