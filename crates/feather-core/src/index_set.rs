@@ -222,6 +222,8 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    // Uses drive letters and backslashes: Windows paths.
+    #[cfg(windows)]
     #[test]
     fn discovers_volume_subdirectories_and_filters_the_mask() {
         let root = temp_dir("library");

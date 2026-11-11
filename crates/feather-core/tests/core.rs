@@ -1,7 +1,9 @@
 use std::path::PathBuf;
 
 use feather_core::synthetic::generate;
-use feather_core::{Query, VolumeIndex};
+#[cfg(windows)]
+use feather_core::Query;
+use feather_core::VolumeIndex;
 
 fn test_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("feather-core-{}-{}", name, std::process::id()));
@@ -9,6 +11,8 @@ fn test_dir(name: &str) -> PathBuf {
     dir
 }
 
+// Uses drive letters and backslashes: Windows paths.
+#[cfg(windows)]
 #[test]
 fn roundtrip_and_search() {
     let dir = test_dir("roundtrip");

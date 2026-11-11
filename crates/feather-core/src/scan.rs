@@ -1139,7 +1139,9 @@ fn cleanup(dir: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index_set::{EntryRef, IndexSet};
+    #[cfg(windows)]
+    use crate::index_set::EntryRef;
+    use crate::index_set::IndexSet;
 
     fn temp_dir(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -1153,6 +1155,8 @@ mod tests {
         ))
     }
 
+    // Uses drive letters and backslashes: Windows paths.
+    #[cfg(windows)]
     #[test]
     fn scans_a_tree_and_reopens_it_by_path() {
         let root = temp_dir("tree");
@@ -1272,6 +1276,8 @@ mod tests {
         let _ = fs::remove_dir_all(&out);
     }
 
+    // Uses drive letters and backslashes: Windows paths.
+    #[cfg(windows)]
     #[test]
     fn library_directories_are_named_per_root() {
         assert_eq!(library_dir_name(Path::new("C:\\")), "vol-c");

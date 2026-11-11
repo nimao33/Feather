@@ -1225,6 +1225,8 @@ impl Query {
 mod tests {
     use super::*;
 
+    // Uses drive letters and backslashes: Windows paths.
+    #[cfg(windows)]
     #[test]
     fn scopes_rule_out_or_cover_whole_volumes() {
         let drive = Query::parse(r#"in:"E:\""#);
@@ -1274,6 +1276,8 @@ mod tests {
         assert_eq!(narrowed.max_size, Some(3072));
     }
 
+    // Uses drive letters and backslashes: Windows paths.
+    #[cfg(windows)]
     #[test]
     fn parses_search_scopes() {
         let query = Query::parse(r#"report in:"C:\Users\Me\Documents" !in:C:\Temp"#);
@@ -1286,6 +1290,8 @@ mod tests {
         assert!(!query.is_empty());
     }
 
+    // Uses drive letters and backslashes: Windows paths.
+    #[cfg(windows)]
     #[test]
     fn a_typed_folder_lists_its_contents() {
         let query = Query::parse(r"C:\Users\");
@@ -1304,6 +1310,8 @@ mod tests {
         assert_eq!(drive.browse.as_ref().unwrap().parent.as_deref(), Some("c:"));
     }
 
+    // Uses drive letters and backslashes: Windows paths.
+    #[cfg(windows)]
     #[test]
     fn a_folder_with_words_searches_inside_it() {
         let query = Query::parse(r"C:\Users\ report");
@@ -1454,6 +1462,8 @@ mod tests {
         assert!(!narrows("rep", "rep !old"));
         assert!(!narrows("ext:pdf rep", "rep"));
         assert!(!narrows("abc", "xyz"));
+        // A typed drive path browses a folder; only Windows has those.
+        #[cfg(windows)]
         assert!(!narrows(r"c:\users\re", r"c:\users\r"));
         assert!(!narrows("*.pd", "*.p"));
         assert!(narrows("match:start report", "match:start rep"));
