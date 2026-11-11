@@ -1,6 +1,14 @@
 # Feather
 
+[![Download](https://img.shields.io/github/v/release/nimao33/Feather?label=download&color=f2a33a)](https://github.com/nimao33/Feather/releases/latest)
+[![CI](https://github.com/nimao33/Feather/actions/workflows/ci.yml/badge.svg)](https://github.com/nimao33/Feather/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-0078d4)
+
 A fast, low-memory file search for Windows (and Linux), written in Rust.
+
+**[Download Feather for Windows](https://github.com/nimao33/Feather/releases/latest)**: run the
+`.msi`, no admin rights needed.
 
 Type part of a name and Feather lists every matching file and folder on your
 drives as you type. It reads the NTFS file table directly, keeps its index in
