@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use feather_core::{normalize_path, path_within};
+use feather_core::{is_absolute_path, normalize_path, path_within};
 
 /// Why a path was refused. Visitors only ever see "not found" for these,
 /// so they can't tell a hidden file from a missing one.
@@ -91,8 +91,25 @@ impl Roots {
                 real,
             });
         }
-        let mut blocked: Vec<String> = excluded.iter().map(|path| normalize_path(path)).collect();
-        blocked.extend(feather_folders());
+        let mut blocked: Vec<String> = Vec::new();
+        let feather = feather_folders()
+            .into_iter()
+            .map(|path| path.to_string_lossy().into_owned());
+        for folder in excluded.iter().cloned().chain(feather) {
+            let mut forms = vec![normalize_path(&folder)];
+            // Served paths are resolved, so a folder named through a link
+            // or junction is also blocked where it really is.
+            if is_absolute_path(&folder) {
+                if let Ok(real) = std::fs::canonicalize(&folder) {
+                    forms.push(normalize_path(&display_path(&real)));
+                }
+            }
+            for form in forms {
+                if !blocked.contains(&form) {
+                    blocked.push(form);
+                }
+            }
+        }
         (
             Self {
                 roots,
@@ -192,16 +209,14 @@ impl Roots {
     /// The shared folder and relative path of an indexed path, when it is
     /// shared and visible.
     pub fn locate(&self, path: &str) -> Option<(usize, String)> {
-        let (index, root) = self
+        let (index, _, relative) = self
             .roots
             .iter()
             .enumerate()
-            .filter(|(_, root)| path_within(path, &root.display))
-            .max_by_key(|(_, root)| root.display.len())?;
-        let relative = path
-            .get(root.display.trim_end_matches('\\').len()..)?
-            .trim_start_matches('\\')
-            .replace('\\', "/");
+            .filter_map(|(index, root)| {
+                relative_to(path, &root.display).map(|relative| (index, root, relative))
+            })
+            .max_by_key(|(_, root, _)| root.display.len())?;
         let real = self.resolve(index, &relative).ok()?;
         self.visible(&real).then_some((index, relative))
     }
@@ -309,7 +324,8 @@ pub fn check_name(name: &str) -> Result<(), Denied> {
     Ok(())
 }
 
-/// `real` is `root` or inside it.
+/// `real` is `root` or inside it. Both are resolved paths.
+#[cfg(windows)]
 fn inside(root: &Path, real: &Path) -> bool {
     let root = root.to_string_lossy().to_lowercase();
     let real = real.to_string_lossy().to_lowercase();
@@ -318,6 +334,40 @@ fn inside(root: &Path, real: &Path) -> bool {
         || real
             .strip_prefix(root)
             .is_some_and(|rest| rest.starts_with('\\') || rest.starts_with('/'))
+}
+
+/// `real` is `root` or inside it. Both are resolved paths. Names are case
+/// sensitive here: `/srv/Share` is not inside `/srv/share`, so a link to a
+/// folder that differs only in case stays outside.
+#[cfg(not(windows))]
+fn inside(root: &Path, real: &Path) -> bool {
+    real.starts_with(root)
+}
+
+/// The path below shared folder `root`, with forward slashes, for an
+/// indexed path.
+#[cfg(windows)]
+fn relative_to(path: &str, root: &str) -> Option<String> {
+    if !path_within(path, root) {
+        return None;
+    }
+    Some(
+        path.get(root.trim_end_matches('\\').len()..)?
+            .trim_start_matches('\\')
+            .replace('\\', "/"),
+    )
+}
+
+/// The path below shared folder `root` for an indexed path, compared the
+/// way the file system does: one name at a time and case sensitive.
+#[cfg(not(windows))]
+fn relative_to(path: &str, root: &str) -> Option<String> {
+    let rest = Path::new(path).strip_prefix(root).ok()?.to_str()?;
+    // A backslash is part of a name here, and no visitor path can name it.
+    if rest.contains('\\') {
+        return None;
+    }
+    Some(rest.to_string())
 }
 
 fn same_path(a: &Path, b: &Path) -> bool {
@@ -374,21 +424,53 @@ pub fn display_path(path: &Path) -> String {
 
 /// Feather's settings, certificate, and index folders, never served even
 /// when a shared folder contains them.
-fn feather_folders() -> Vec<String> {
+fn feather_folders() -> Vec<PathBuf> {
     let mut folders = Vec::new();
-    for variable in ["APPDATA", "LOCALAPPDATA"] {
-        if let Some(base) = std::env::var_os(variable) {
-            folders.push(normalize_path(
-                &PathBuf::from(base).join("Feather").to_string_lossy(),
-            ));
+    // Settings and the sharing certificate, password pepper, and keys.
+    if let Some(settings) = crate::settings::file_path() {
+        if let Some(folder) = settings.parent() {
+            folders.push(folder.to_path_buf());
         }
     }
+    folders.extend(data_folders());
     folders
+}
+
+#[cfg(windows)]
+fn data_folders() -> Vec<PathBuf> {
+    ["APPDATA", "LOCALAPPDATA"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .filter(|base| !base.is_empty())
+        .map(|base| PathBuf::from(base).join("Feather"))
+        .collect()
+}
+
+/// The index and tunnel tools (`~/.local/share/feather`, also spelled
+/// `Feather`, which blocking matches regardless of case) and the running
+/// window's port and key (`$XDG_RUNTIME_DIR/feather` or `~/.cache/feather`).
+#[cfg(not(windows))]
+fn data_folders() -> Vec<PathBuf> {
+    let env = |name: &str| {
+        std::env::var_os(name)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    };
+    let mut bases = Vec::new();
+    bases.extend(env("XDG_DATA_HOME"));
+    bases.extend(env("XDG_RUNTIME_DIR"));
+    bases.extend(env("LOCALAPPDATA"));
+    if let Some(home) = env("HOME") {
+        bases.push(home.join(".local").join("share"));
+        bases.push(home.join(".cache"));
+    }
+    bases.into_iter().map(|base| base.join("feather")).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::MAIN_SEPARATOR as SEP;
 
     fn temp(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("feather-share-{name}-{}", std::process::id()));
@@ -451,13 +533,16 @@ mod tests {
         let (items, truncated) = roots.list(&roots.resolve(0, "docs").unwrap(), 100).unwrap();
         assert_eq!(items.len(), 1);
         assert!(!truncated);
-        let display = format!("{}\\docs\\a.txt", roots.roots[0].display);
+        let display = format!("{}{SEP}docs{SEP}a.txt", roots.roots[0].display);
         assert_eq!(roots.locate(&display), Some((0, "docs/a.txt".into())));
         let outside = format!(
-            "{}\\key.txt",
+            "{}{SEP}key.txt",
             display_path(&std::fs::canonicalize(&secret).unwrap())
         );
         assert_eq!(roots.locate(&outside), None);
+        // A sibling whose name starts with the shared folder's is outside.
+        let sibling = format!("{}-not{SEP}a.txt", roots.roots[0].display);
+        assert_eq!(roots.locate(&sibling), None);
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -469,13 +554,69 @@ mod tests {
         let real = display_path(&std::fs::canonicalize(&base).unwrap());
         let (roots, _) = Roots::new(
             &[base.to_string_lossy().to_string()],
-            &[format!("{real}\\private")],
+            &[format!("{real}{SEP}private")],
             true,
             true,
         );
         assert!(roots.resolve(0, "private/p.txt").is_err());
+        assert!(roots.resolve(0, "private").is_err());
         let (items, _) = roots.list(&roots.resolve(0, "").unwrap(), 100).unwrap();
         assert!(items.is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn feathers_own_folders_are_always_left_out() {
+        let (roots, _) = Roots::new(&[], &[], true, true);
+        let settings = crate::settings::file_path().expect("settings path");
+        let folder = normalize_path(&settings.parent().unwrap().to_string_lossy());
+        assert!(roots.blocked.contains(&folder), "{:?}", roots.blocked);
+    }
+
+    /// On a case-sensitive file system `share` and `SHARE` are different
+    /// folders; a link from one to the other must not reach outside.
+    #[cfg(unix)]
+    #[test]
+    fn links_to_a_folder_that_differs_only_in_case_stay_outside() {
+        let base = temp("case");
+        let shared = base.join("share");
+        let other = base.join("SHARE");
+        std::fs::create_dir_all(&shared).unwrap();
+        if std::fs::create_dir(&other).is_err() {
+            // A case-insensitive file system: there is no second folder.
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        std::fs::write(other.join("secret.txt"), b"s").unwrap();
+        std::os::unix::fs::symlink(&other, shared.join("link")).unwrap();
+        std::os::unix::fs::symlink(other.join("secret.txt"), shared.join("file")).unwrap();
+        let (roots, errors) = Roots::new(&[shared.to_string_lossy().to_string()], &[], true, true);
+        assert!(errors.is_empty());
+        assert_eq!(roots.resolve(0, "link/secret.txt"), Err(Denied::NotFound));
+        assert_eq!(roots.resolve(0, "file"), Err(Denied::NotFound));
+        let (items, _) = roots.list(&roots.resolve(0, "").unwrap(), 100).unwrap();
+        assert!(items.is_empty(), "links to outside were listed");
+        let real_other = display_path(&std::fs::canonicalize(&other).unwrap());
+        assert_eq!(roots.locate(&format!("{real_other}/secret.txt")), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A left-out folder named through a link is blocked where it really is.
+    #[cfg(unix)]
+    #[test]
+    fn left_out_folders_named_through_a_link_are_not_served() {
+        let base = temp("blocked-link");
+        std::fs::create_dir_all(base.join("shared").join("private")).unwrap();
+        std::fs::write(base.join("shared").join("private").join("p.txt"), b"p").unwrap();
+        let alias = base.join("alias");
+        std::os::unix::fs::symlink(base.join("shared"), &alias).unwrap();
+        let (roots, _) = Roots::new(
+            &[base.join("shared").to_string_lossy().to_string()],
+            &[alias.join("private").to_string_lossy().to_string()],
+            true,
+            true,
+        );
+        assert!(roots.resolve(0, "private/p.txt").is_err());
         let _ = std::fs::remove_dir_all(&base);
     }
 }

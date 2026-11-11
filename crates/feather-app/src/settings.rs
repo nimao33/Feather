@@ -18,8 +18,9 @@ use crate::text;
 use crate::ui::hotkey;
 
 /// The shortcut parser is Windows-specific (virtual-key codes). On Linux the
-/// settings file keeps the same text form; the X11 backend normalizes it when
-/// it registers the shortcut.
+/// settings file keeps the same text form, so this only puts the names in
+/// their canonical spelling and applies the same rule as Windows: a single
+/// typing key needs Ctrl, Alt, or Win, or it would stop that key from typing.
 #[cfg(not(windows))]
 mod hotkey {
     pub const DEFAULT: &str = "Ctrl + Space";
@@ -57,7 +58,58 @@ mod hotkey {
         if parts.is_empty() {
             return Err("a shortcut needs at least one key".into());
         }
-        Ok(parts.join(" + "))
+        let text = parts.join(" + ");
+        let lower: Vec<String> = parts.iter().map(|part| part.to_ascii_lowercase()).collect();
+        let has_command = lower.iter().any(|part| is_command(part));
+        let others: Vec<&String> = lower
+            .iter()
+            .filter(|part| !is_command(part) && !is_shift(part))
+            .collect();
+        if !has_command && others.len() == 1 && is_typing(others[0]) {
+            return Err(format!(
+                "{text} would stop that key from typing. Add Ctrl, Alt, or Win."
+            ));
+        }
+        Ok(text)
+    }
+
+    fn is_command(part: &str) -> bool {
+        let side = part
+            .strip_prefix("left ")
+            .or_else(|| part.strip_prefix("right "))
+            .unwrap_or(part);
+        matches!(side, "ctrl" | "alt" | "win")
+    }
+
+    fn is_shift(part: &str) -> bool {
+        matches!(part, "shift" | "left shift" | "right shift")
+    }
+
+    /// Keys that type or move the cursor, as on Windows.
+    fn is_typing(part: &str) -> bool {
+        part.chars().count() == 1
+            || part
+                .strip_prefix("num ")
+                .is_some_and(|digit| digit.len() == 1)
+            || matches!(
+                part,
+                "space"
+                    | "tab"
+                    | "enter"
+                    | "backspace"
+                    | "esc"
+                    | "escape"
+                    | "delete"
+                    | "del"
+                    | "home"
+                    | "end"
+                    | "page up"
+                    | "page down"
+                    | "left"
+                    | "right"
+                    | "up"
+                    | "down"
+            )
     }
 }
 
@@ -1304,6 +1356,7 @@ fn bool_value(value: bool) -> &'static str {
     }
 }
 
+#[cfg(windows)]
 fn trim_scope(mut scope: String) -> String {
     scope = scope.trim().to_string();
     while scope.len() > 3 && scope.ends_with('\\') {
@@ -1315,11 +1368,31 @@ fn trim_scope(mut scope: String) -> String {
     scope
 }
 
+#[cfg(not(windows))]
+fn trim_scope(scope: String) -> String {
+    trim_separators(scope.trim()).to_string()
+}
+
+/// Drops trailing separators. Off Windows a backslash is part of a name, so
+/// only `/` counts there, and `/` itself is kept.
+#[cfg(windows)]
+fn trim_separators(value: &str) -> &str {
+    value.trim_end_matches('\\')
+}
+
+#[cfg(not(windows))]
+fn trim_separators(value: &str) -> &str {
+    match value.trim_end_matches('/') {
+        "" if value.starts_with('/') => "/",
+        trimmed => trimmed,
+    }
+}
+
 fn normalize_list(values: Vec<String>) -> Vec<String> {
     let mut result = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for value in values {
-        let value = value.trim().trim_end_matches('\\').to_string();
+        let value = trim_separators(value.trim()).to_string();
         if value.is_empty() {
             continue;
         }
@@ -1358,9 +1431,16 @@ pub fn normalize_tabs(tabs: Vec<(Category, bool)>) -> Vec<(Category, bool)> {
 }
 
 /// `C:` with nothing after it: a whole drive written without its backslash.
+#[cfg(windows)]
 fn is_bare_drive(value: &str) -> bool {
     let bytes = value.as_bytes();
     bytes.len() == 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic()
+}
+
+/// There are no drive letters off Windows: `C:` is a relative name there.
+#[cfg(not(windows))]
+fn is_bare_drive(_value: &str) -> bool {
+    false
 }
 
 /// Writes whole drives as `C:\`.
@@ -2854,6 +2934,19 @@ mod tests {
     use super::dialog::{drive_choices, split_roots};
     use super::*;
 
+    /// A full path on this platform, written the Windows way: `C:\Temp`
+    /// stays as it is on Windows and becomes `/c/Temp` elsewhere.
+    fn native(windows: &str) -> String {
+        if cfg!(windows) {
+            return windows.to_string();
+        }
+        let path = windows.replace('\\', "/");
+        match path.split_once(':') {
+            Some((drive, rest)) => format!("/{}{rest}", drive.to_ascii_lowercase()),
+            None => path,
+        }
+    }
+
     fn temp_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "feather-settings-{}-{}-{}.ini",
@@ -2906,8 +2999,8 @@ mod tests {
             },
             excluded_volumes: vec![r"D:".into(), r"E:\Archive".into()],
             excluded_folders: vec![
-                r"C:\Temp\Scratch".into(),
-                r"C:\Users\Me\Downloads\Big".into(),
+                native(r"C:\Temp\Scratch"),
+                native(r"C:\Users\Me\Downloads\Big"),
             ],
             index_roots: Vec::new(),
             setup_done: false,
@@ -2929,7 +3022,7 @@ mod tests {
             network_access: NetworkAccess::None,
             start_menu_shortcut: true,
             desktop_shortcut: true,
-            scope: Some(r"C:\Users\Me\Documents".into()),
+            scope: Some(native(r"C:\Users\Me\Documents")),
             window: Some(WindowPlacement {
                 x: 40,
                 y: 60,
@@ -2958,7 +3051,7 @@ mod tests {
             ftp_port: 2222,
             share_user: "me".into(),
             share_password: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA".into(),
-            share_folders: vec![r"D:\Photos".into()],
+            share_folders: vec![native(r"D:\Photos")],
             ftp_plain: true,
             tunnel_token: "AQAAAA".into(),
             share_password_saved: "0102".into(),
@@ -2981,6 +3074,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn whole_drives_survive_a_reload() {
         // Older versions wrote `C:`, which then failed to load.
         let loaded = parse("index_roots=C:;D:\\;C:\\Users\\Me\n");
@@ -2992,6 +3086,20 @@ mod tests {
         let again = parse(&loaded.settings.to_text());
         assert!(again.warnings.is_empty(), "{:?}", again.warnings);
         assert_eq!(again.settings.index_roots, loaded.settings.index_roots);
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn the_root_folder_survives_a_reload() {
+        let loaded = parse("index_roots=/;/home/Me/;/home/Me;/srv//\n");
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        assert_eq!(loaded.settings.index_roots, vec!["/", "/home/Me", "/srv"]);
+        let again = parse(&loaded.settings.to_text());
+        assert!(again.warnings.is_empty(), "{:?}", again.warnings);
+        assert_eq!(again.settings.index_roots, loaded.settings.index_roots);
+        // Drive letters mean nothing here.
+        assert!(!parse("index_roots=C:\n").warnings.is_empty());
+        assert!(!parse("share_folders=C:\\Photos\n").warnings.is_empty());
     }
 
     #[test]
@@ -3020,31 +3128,45 @@ mod tests {
             "Ctrl + Shift + Right Shift"
         );
         assert!(!parse("hotkey=k\n").warnings.is_empty());
+        assert!(!parse("hotkey=shift+space\n").warnings.is_empty());
+        assert!(parse("hotkey=ctrl+k\n").warnings.is_empty());
     }
 
     #[test]
     fn search_locations_round_trip_and_are_normalized() {
-        let loaded = parse(
+        let loaded = parse(&format!(
             "\
 remember_scope=1
-scope=C:\\Users\\Me\\Documents\\
-excluded_volumes=d:;D:\\;e:
-excluded_folders=C:\\Temp\\Scratch;C:\\Users\\Me\\Downloads\\Big\\
+scope={}
+excluded_volumes={};{};{}
+excluded_folders={};{}
 show_hidden=0
 show_system=0
 use_shell_context_menu=0
 ",
-        );
+            native(r"C:\Users\Me\Documents\"),
+            native("d:"),
+            native(r"D:\"),
+            native("e:"),
+            native(r"C:\Temp\Scratch"),
+            native(r"C:\Users\Me\Downloads\Big\"),
+        ));
         assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
         assert!(loaded.settings.remember_scope);
         assert_eq!(
-            loaded.settings.scope.as_deref(),
-            Some(r"C:\Users\Me\Documents")
+            loaded.settings.scope,
+            Some(native(r"C:\Users\Me\Documents"))
         );
-        assert_eq!(loaded.settings.excluded_volumes, vec!["d:", "e:"]);
+        assert_eq!(
+            loaded.settings.excluded_volumes,
+            vec![native("d:"), native("e:")]
+        );
         assert_eq!(
             loaded.settings.excluded_folders,
-            vec![r"C:\Temp\Scratch", r"C:\Users\Me\Downloads\Big"]
+            vec![
+                native(r"C:\Temp\Scratch"),
+                native(r"C:\Users\Me\Downloads\Big")
+            ]
         );
         assert!(!loaded.settings.show_hidden);
         assert!(!loaded.settings.show_system);
@@ -3057,11 +3179,23 @@ use_shell_context_menu=0
 
     #[test]
     fn excluded_folder_editor_requires_full_paths() {
+        let input = format!(
+            "{}\r\n\r\n{}\r\n",
+            native(r"C:\Temp"),
+            native(r"D:\Games\Old")
+        );
         assert_eq!(
-            parse_excluded_folders("C:\\Temp\r\n\r\nD:\\Games\\Old\r\n").expect("parse"),
-            vec![r"C:\Temp", r"D:\Games\Old"]
+            parse_excluded_folders(&input).expect("parse"),
+            vec![native(r"C:\Temp"), native(r"D:\Games\Old")]
         );
         assert!(parse_excluded_folders("Temp").is_err());
+        // Only full paths of this platform count.
+        if cfg!(windows) {
+            assert!(parse_excluded_folders("/home/me").is_err());
+        } else {
+            assert!(parse_excluded_folders(r"C:\Temp").is_err());
+            assert!(parse_excluded_folders("C:").is_err());
+        }
     }
 
     #[test]

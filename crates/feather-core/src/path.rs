@@ -106,6 +106,8 @@ pub fn path_has_component(path: &str, name: &str) -> bool {
 mod tests {
     use super::*;
 
+    // Drive letters and backslashes: Windows paths.
+    #[cfg(windows)]
     #[test]
     fn normalization_keeps_drive_roots_short() {
         assert_eq!(normalize_path(r"C:\Users\Me\"), r"c:\users\me");
@@ -114,6 +116,8 @@ mod tests {
         assert_eq!(normalize_path(r"\\server\share\"), r"\\server\share");
     }
 
+    // Drive letters and backslashes: Windows paths.
+    #[cfg(windows)]
     #[test]
     fn scopes_do_not_match_partial_names() {
         assert!(path_within(r"C:\Foo\Bar.txt", r"C:\Foo"));
@@ -124,6 +128,8 @@ mod tests {
         assert!(!path_within(r"C:\Foo", r"D:\Foo"));
     }
 
+    // Drive letters and backslashes: Windows paths.
+    #[cfg(windows)]
     #[test]
     fn absolute_paths_need_a_drive_or_unc_root() {
         assert!(is_absolute_path(r"C:\Users"));
@@ -133,6 +139,8 @@ mod tests {
         assert!(!is_absolute_path(""));
     }
 
+    // Drive letters and backslashes: Windows paths.
+    #[cfg(windows)]
     #[test]
     fn folder_names_match_whole_components_only() {
         assert!(path_has_component(
