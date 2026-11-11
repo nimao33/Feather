@@ -22,6 +22,7 @@ use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
 use rustls::{ServerConnection, StreamOwned};
 
 use super::files::{self, Denied, Item};
+use super::zip::ZipWriter;
 use super::{allowed, auth, thumbs, Shared};
 use crate::settings::{HttpMode, ShareAccess, Tunnel};
 
@@ -47,6 +48,15 @@ const FRAME: usize = 256 * 1024;
 const FRAME_OVERHEAD: u64 = 4 + 12 + 1 + 16;
 /// Replies bigger than this are compressed when the browser accepts gzip.
 const COMPRESS_FROM: usize = 1024;
+
+/// A folder's zip holds at most this many files and folders...
+const ZIP_ENTRIES: usize = 100_000;
+/// ...and goes at most this deep.
+const ZIP_DEPTH: usize = 64;
+/// Why folders aren't zipped end to end: sealed downloads are decrypted in
+/// the page's memory before they are saved, and a folder can be far bigger
+/// than a phone can hold.
+const SEALED_ZIP: &str = "Folders can't be downloaded as a zip while the share is encrypted end to end. Open the folder and download its files one at a time.";
 
 const APP_HTML: &str = include_str!("web/app.html");
 const LOGIN_HTML: &str = include_str!("web/login.html");
@@ -234,6 +244,8 @@ pub(crate) struct Request {
     pub(crate) headers: Vec<(String, String)>,
     pub(crate) length: u64,
     pub(crate) close: bool,
+    /// HTTP/1.0, which has no chunked replies.
+    pub(crate) http10: bool,
 }
 
 impl Request {
@@ -342,6 +354,7 @@ pub(crate) fn parse(head: &[u8]) -> Result<Request, u16> {
         headers,
         length: length.unwrap_or(0),
         close,
+        http10: version == "HTTP/1.0",
     })
 }
 
@@ -750,6 +763,10 @@ fn handle(shared: &Shared, conn: &mut Conn, request: &Request, client: IpAddr) -
                 (Some(key), "/api/sealed-upload") => {
                     sealed_upload(shared, conn, request, client, &token_value, &key)
                 }
+                (Some(_), "/api/zip") => {
+                    json(conn, 403, &error_json(SEALED_ZIP))?;
+                    Ok(true)
+                }
                 // Signed in end to end: nothing travels in the clear.
                 (Some(_), _) => {
                     json(
@@ -984,6 +1001,8 @@ enum Reply {
     File(PathBuf, bool),
     /// A JPEG preview of a file, at most this many pixels across.
     Thumb(PathBuf, u32),
+    /// A folder as a zip: the shared folder's number and the path in it.
+    Zip(usize, String),
     /// Signed out.
     Logout,
 }
@@ -1084,6 +1103,17 @@ fn call(
                 400,
                 error_json("Folders can't be downloaded; open them instead."),
             ),
+            Err(denied) => refuse(denied),
+        },
+        ("GET", "/api/zip") => match shared.roots.resolve(params.root(), params.path()) {
+            Ok(folder) if folder.is_dir() => {
+                shared.log(
+                    client,
+                    &format!("download folder {}", files::display_path(&folder)),
+                );
+                Reply::Zip(params.root(), params.path().to_string())
+            }
+            Ok(_) => Reply::Json(400, error_json("That is a file, not a folder.")),
             Err(denied) => refuse(denied),
         },
         ("POST", "/api/mkdir") if full => {
@@ -1228,6 +1258,9 @@ fn plain_api(
             return download_plain(conn, request, &path, inline);
         }
         Reply::Thumb(path, side) => return thumb_plain(conn, request, &path, side),
+        Reply::Zip(root, relative) => {
+            return zip_plain(shared, conn, request, client, root, &relative)
+        }
     }
     Ok(true)
 }
@@ -1451,6 +1484,305 @@ fn download_plain(
     Ok(true)
 }
 
+/// A reply body in HTTP/1.1 chunks, so a download cut short shows as
+/// failed instead of as a broken zip.
+struct Chunked<'a> {
+    wire: &'a mut Wire,
+    buffer: Vec<u8>,
+    /// HTTP/1.0: plain bytes, ended by closing the connection.
+    raw: bool,
+}
+
+impl Chunked<'_> {
+    const SIZE: usize = 64 * 1024;
+
+    fn emit(&mut self) -> io::Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        if self.raw {
+            self.wire.write_all(&self.buffer)?;
+        } else {
+            self.wire
+                .write_all(format!("{:x}\r\n", self.buffer.len()).as_bytes())?;
+            self.wire.write_all(&self.buffer)?;
+            self.wire.write_all(b"\r\n")?;
+        }
+        self.buffer.clear();
+        Ok(())
+    }
+
+    fn end(mut self) -> io::Result<()> {
+        self.emit()?;
+        if !self.raw {
+            self.wire.write_all(b"0\r\n\r\n")?;
+        }
+        self.wire.flush()
+    }
+}
+
+impl Write for Chunked<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.buffer.len() + bytes.len() > Self::SIZE {
+            self.emit()?;
+        }
+        self.buffer.extend_from_slice(bytes);
+        if self.buffer.len() >= Self::SIZE {
+            self.emit()?;
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// What went into a folder's zip.
+#[derive(Default)]
+pub(crate) struct Packed {
+    pub(crate) files: u64,
+    pub(crate) bytes: u64,
+    /// Paths in the zip that couldn't be read, or were nested too deep.
+    pub(crate) skipped: Vec<String>,
+    /// The entry limit was reached.
+    pub(crate) truncated: bool,
+}
+
+/// A name that is safe as one part of a path inside a zip.
+fn zip_part(name: &str) -> String {
+    let clean: String = name
+        .chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '/' | '\\' | ':') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    match clean.trim() {
+        "" | "." | ".." => "folder".into(),
+        _ => clean,
+    }
+}
+
+fn modified_secs(metadata: &std::fs::Metadata) -> u64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|time| time.as_secs())
+        .unwrap_or(0)
+}
+
+/// The zip's name for folder `relative` of shared folder `root`.
+fn zip_top(shared: &Shared, root: usize, relative: &str) -> String {
+    let name = relative
+        .rsplit(['/', '\\'])
+        .find(|part| !part.is_empty())
+        .or_else(|| shared.roots.roots.get(root).map(|root| root.name.as_str()))
+        .unwrap_or("Shared");
+    zip_part(name)
+}
+
+fn shared_dir(roots: &files::Roots, root: usize, relative: &str) -> Result<PathBuf, Denied> {
+    roots.resolve(root, relative).and_then(|real| {
+        if real.is_dir() {
+            Ok(real)
+        } else {
+            Err(Denied::NotFound)
+        }
+    })
+}
+
+/// Writes folder `relative` of shared folder `root`, and everything in it a
+/// visitor may see, into `zip` under `top/`. Every file and folder goes
+/// through `Roots::resolve`, the same check as a single download: names,
+/// hidden and system items, left-out folders, and links or junctions that
+/// lead outside the shared folder are all left out, silently, as a listing
+/// leaves them out. Each folder is read once, so a link back up can't loop.
+/// Files that can't be read are left out and named in a note at the end.
+pub(crate) fn pack_folder<W: Write>(
+    roots: &files::Roots,
+    root: usize,
+    relative: &str,
+    top: &str,
+    zip: &mut ZipWriter<W>,
+    stop: &dyn Fn() -> bool,
+) -> io::Result<Packed> {
+    let mut packed = Packed::default();
+    let mut seen = std::collections::HashSet::new();
+    let relative = relative.trim_matches(['/', '\\']).to_string();
+    // Folders still to read: path in the share, path in the zip, depth.
+    let mut pending = vec![(relative, top.to_string(), 0usize)];
+    while let Some((folder, inside, depth)) = pending.pop() {
+        if stop() {
+            return Ok(packed);
+        }
+        let Ok(real) = shared_dir(roots, root, &folder) else {
+            continue;
+        };
+        if !seen.insert(real.clone()) {
+            continue;
+        }
+        if zip.len() >= ZIP_ENTRIES {
+            packed.truncated = true;
+            break;
+        }
+        let modified = std::fs::metadata(&real)
+            .map(|metadata| modified_secs(&metadata))
+            .unwrap_or(0);
+        zip.add_dir(&inside, modified)?;
+        let Ok(listing) = std::fs::read_dir(&real) else {
+            packed.skipped.push(format!("{inside}/"));
+            continue;
+        };
+        let mut names: Vec<String> = listing
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+            .filter(|name| files::check_name(name).is_ok())
+            .collect();
+        names.sort_by_key(|name| name.to_lowercase());
+        let mut folders = Vec::new();
+        for name in names {
+            let path = if folder.is_empty() {
+                name.clone()
+            } else {
+                format!("{folder}/{name}")
+            };
+            let in_zip = format!("{inside}/{}", zip_part(&name));
+            // Anything a visitor couldn't open alone isn't packed, or named.
+            let Ok(real) = roots.resolve(root, &path) else {
+                continue;
+            };
+            let Ok(metadata) = std::fs::metadata(&real) else {
+                continue;
+            };
+            if metadata.is_dir() {
+                if depth + 1 >= ZIP_DEPTH {
+                    packed.skipped.push(format!("{in_zip}/"));
+                } else {
+                    folders.push((path, in_zip, depth + 1));
+                }
+                continue;
+            }
+            if zip.len() >= ZIP_ENTRIES {
+                packed.truncated = true;
+                break;
+            }
+            if stop() {
+                return Ok(packed);
+            }
+            let Ok(mut file) = std::fs::File::open(&real) else {
+                packed.skipped.push(in_zip);
+                continue;
+            };
+            let before = zip.written();
+            let whole =
+                zip.add_file(&in_zip, modified_secs(&metadata), metadata.len(), &mut file)?;
+            packed.files += 1;
+            packed.bytes += zip.written() - before;
+            if !whole {
+                packed.skipped.push(format!("{in_zip} (incomplete)"));
+            }
+        }
+        if packed.truncated {
+            break;
+        }
+        // The stack takes the last first, so push in reverse name order.
+        pending.extend(folders.into_iter().rev());
+    }
+    if !packed.skipped.is_empty() || packed.truncated {
+        let note = skipped_note(&packed);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|time| time.as_secs())
+            .unwrap_or(0);
+        zip.add_file(
+            &format!("{top}/Feather - not included.txt"),
+            now,
+            note.len() as u64,
+            &mut note.as_bytes(),
+        )?;
+    }
+    Ok(packed)
+}
+
+fn skipped_note(packed: &Packed) -> String {
+    let mut note =
+        String::from("Feather couldn't put everything from this folder in the zip.\r\n\r\n");
+    if packed.truncated {
+        note.push_str(&format!(
+            "The zip stopped at {ZIP_ENTRIES} files and folders. Download the folders \
+             inside one at a time for the rest.\r\n\r\n"
+        ));
+    }
+    if !packed.skipped.is_empty() {
+        note.push_str("These couldn't be read, or were nested too deep:\r\n");
+        for path in packed.skipped.iter().take(1000) {
+            note.push_str(path);
+            note.push_str("\r\n");
+        }
+        if packed.skipped.len() > 1000 {
+            note.push_str(&format!("...and {} more\r\n", packed.skipped.len() - 1000));
+        }
+    }
+    note
+}
+
+/// A folder as a zip, streamed: nothing is gathered first, in memory or on
+/// disk, so the download starts at once and can be any size.
+fn zip_plain(
+    shared: &Shared,
+    conn: &mut Conn,
+    request: &Request,
+    client: IpAddr,
+    root: usize,
+    relative: &str,
+) -> io::Result<bool> {
+    let top = zip_top(shared, root, relative);
+    let disposition: String = disposition(&format!("{top}.zip"), false)
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect();
+    let mut text = format!("HTTP/1.1 200 OK\r\n{SECURITY_HEADERS}");
+    text.push_str("Content-Type: application/zip\r\nCache-Control: no-store\r\n");
+    text.push_str(&format!("Content-Disposition: {disposition}\r\n"));
+    text.push_str(if request.http10 {
+        "Connection: close\r\n\r\n"
+    } else {
+        "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\nKeep-Alive: timeout=15\r\n\r\n"
+    });
+    conn.wire.write_all(text.as_bytes())?;
+    let mut body = Chunked {
+        wire: &mut conn.wire,
+        buffer: Vec::with_capacity(Chunked::SIZE),
+        raw: request.http10,
+    };
+    let mut zip = ZipWriter::new(&mut body);
+    let stop = || shared.stopping();
+    let Ok(packed) = pack_folder(&shared.roots, root, relative, &top, &mut zip, &stop) else {
+        // The visitor left; the download shows as failed.
+        return Ok(false);
+    };
+    if shared.stopping() || zip.finish().is_err() || body.end().is_err() {
+        return Ok(false);
+    }
+    let mut summary = format!(
+        "zip of {top} done: {} files, {} bytes",
+        packed.files, packed.bytes
+    );
+    if !packed.skipped.is_empty() {
+        summary.push_str(&format!(", {} left out", packed.skipped.len()));
+    }
+    if packed.truncated {
+        summary.push_str(", stopped at the entry limit");
+    }
+    shared.log(client, &summary);
+    Ok(!request.http10)
+}
+
 /// Where an upload goes, checked before any of it is read.
 fn upload_target(shared: &Shared, params: &Params) -> Result<PathBuf, (u16, String)> {
     let name = params.get("name").unwrap_or("");
@@ -1620,7 +1952,9 @@ fn sealed_call(
             shared.sessions.remove(token_value);
             (200, "{}".into())
         }
-        Reply::File(..) | Reply::Thumb(..) => (400, error_json("Use the download call.")),
+        Reply::File(..) | Reply::Thumb(..) | Reply::Zip(..) => {
+            (400, error_json("Use the download call."))
+        }
     };
     let mut aad = b"feather reply".to_vec();
     aad.extend_from_slice(&nonce);
@@ -1686,6 +2020,10 @@ fn sealed_download(
         },
         Reply::Json(status, body) => {
             json(conn, status, &body)?;
+            return Ok(true);
+        }
+        Reply::Zip(..) => {
+            json(conn, 403, &error_json(SEALED_ZIP))?;
             return Ok(true);
         }
         Reply::Logout => return Ok(false),
