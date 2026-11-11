@@ -20,7 +20,10 @@
            Scope="perUser"
            Language="1033">
     <SummaryInformation Description="Feather: fast, low-memory file search" />
+    <!-- A build of the same version replaces the installed one too, so
+         reinstalling never leaves two Feathers in Apps & features. -->
     <MajorUpgrade DowngradeErrorMessage="A newer version of Feather is already installed."
+                  AllowSameVersionUpgrades="yes"
                   Schedule="afterInstallInitialize" />
     <MediaTemplate EmbedCab="yes" />
 
