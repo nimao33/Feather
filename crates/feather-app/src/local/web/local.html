@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Feather</title>
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/local.css">
+<script src="/local.js" defer></script>
+</head>
+<body>
+<aside class="side">
+  <div class="brand"><img src="/icon.svg" alt="" width="22" height="22"><span>Feather</span></div>
+  <nav id="tabs" aria-label="Kinds"></nav>
+  <div class="foot">
+    <button id="open-settings" type="button" class="nav">
+      <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3.5 7h13M3.5 13h13" /><rect x="11" y="4.5" width="4" height="5" rx="2" /><rect x="5" y="10.5" width="4" height="5" rx="2" /></svg>
+      <span>Settings</span>
+    </button>
+    <p class="index" id="index"></p>
+  </div>
+</aside>
+<main>
+  <header class="search">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5" /><path d="M15.5 15.5 21 21" /></svg>
+    <input id="query" type="search" placeholder="Search files and folders" aria-label="Search files and folders" autocomplete="off" spellcheck="false" autofocus>
+    <span class="count" id="count"></span>
+  </header>
+  <div class="head" role="row"><span>Name</span><span class="size">Size</span><span class="when">Modified</span></div>
+  <div class="list" id="list" role="listbox" aria-label="Results" tabindex="-1"></div>
+  <p class="empty" id="empty" hidden></p>
+</main>
+<div class="menu" id="menu" role="menu" hidden>
+  <button type="button" data-do="open" role="menuitem">Open</button>
+  <button type="button" data-do="reveal" role="menuitem">Show in folder</button>
+  <button type="button" data-do="copy" role="menuitem">Copy path</button>
+</div>
+<dialog id="settings" aria-labelledby="settings-title">
+  <form method="dialog" id="settings-form">
+    <h1 id="settings-title">Settings</h1>
+    <section>
+      <h2>Places to search</h2>
+      <p class="hint">One folder per line. Your home folder covers your own files; <code>/</code> is the whole system.</p>
+      <textarea id="roots" rows="4" spellcheck="false"></textarea>
+      <h2>Folders to leave out</h2>
+      <textarea id="excluded" rows="2" spellcheck="false"></textarea>
+    </section>
+    <section>
+      <h2>Index</h2>
+      <label class="row">Update the index
+        <select id="auto_update">
+          <option value="live">Every 15 minutes</option>
+          <option value="hourly">Every hour</option>
+          <option value="off">Only when I ask</option>
+        </select>
+      </label>
+      <label class="row"><span>Show hidden items</span><input type="checkbox" id="show_hidden"></label>
+      <label class="row"><span>Show system items</span><input type="checkbox" id="show_system"></label>
+      <button type="button" id="reindex">Reindex now</button>
+    </section>
+    <section>
+      <h2>Look</h2>
+      <label class="row">Theme
+        <select id="theme"><option value="system">Match the system</option><option value="light">Light</option><option value="dark">Dark</option></select>
+      </label>
+      <label class="row">File sizes in
+        <select id="sizes"><option value="auto">Auto</option><option value="kb">KB</option><option value="mb">MB</option><option value="gb">GB</option></select>
+      </label>
+    </section>
+    <section>
+      <h2>Desktop</h2>
+      <label class="row"><span>Show Feather in the applications menu</span><input type="checkbox" id="menu"></label>
+      <label class="row"><span>Start Feather when I sign in</span><input type="checkbox" id="autostart"></label>
+      <p class="hint">For a shortcut key, bind <code>feather</code> in your desktop's keyboard settings or your window manager's config.</p>
+    </section>
+    <p class="error" id="settings-error" role="alert"></p>
+    <div class="buttons">
+      <button type="button" id="quit" class="quiet">Quit Feather</button>
+      <button type="button" id="cancel">Cancel</button>
+      <button type="button" id="save" class="primary">Save</button>
+    </div>
+  </form>
+</dialog>
+</body>
+</html>

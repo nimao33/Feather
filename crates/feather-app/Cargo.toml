@@ -1,0 +1,81 @@
+[package]
+name = "feather-app"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "feather"
+path = "src/main.rs"
+
+[dependencies]
+feather-core = { path = "../feather-core" }
+png = "0.18.1"
+# Sharing: TLS for the web and FTP servers, their certificate, and the
+# password hash. ring is the only crypto backend, so no C toolchain beyond
+# the usual is needed.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
+ring = "0.17"
+argon2 = "0.5"
+# gzip for web replies; both are already in the build through png.
+miniz_oxide = "0.8"
+crc32fast = "1.5"
+# A QR code of the sharing address, for phones.
+qrcodegen = "1.8"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Imaging",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_UI_Controls",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+] }
+windows-numerics = "0.3.1"
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_FileSystem",
+    "Win32_Storage_Xps",
+    "Win32_Security",
+    "Win32_Security_Cryptography",
+    "Win32_System_Console",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_System_Time",
+    "Win32_UI_Controls",
+    "Win32_UI_Controls_Dialogs",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3.0.12"
+[target.'cfg(target_os = "linux")'.dependencies]
+tiny-skia = "0.12.0"
+cosmic-text = "0.19.0"
+x11rb = { version = "0.14.0", features = ["allow-unsafe-code"] }

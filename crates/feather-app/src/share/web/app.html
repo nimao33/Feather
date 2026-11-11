@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow">
+<title>Feather</title>
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/app.css">
+<script src="/app.js" defer></script>
+</head>
+<body class="app" data-e2e="{{e2e}}">
+<header class="top">
+  <div class="brand"><img src="/icon.svg" alt="" width="24" height="24"><span>Feather</span></div>
+  <form id="search" class="search" hidden role="search">
+    <input id="query" type="search" placeholder="Search shared files" aria-label="Search shared files" maxlength="300" autocomplete="off" spellcheck="false">
+  </form>
+  <div class="who"><span id="user"></span><button id="logout" type="button" class="quiet">Sign out</button></div>
+</header>
+<main>
+  <div class="local" id="local" hidden></div>
+  <div class="bar">
+    <nav class="trail" id="trail" aria-label="Folder"></nav>
+    <div class="views" role="group" aria-label="Show as">
+      <button id="as-list" type="button" aria-label="List" title="List" aria-pressed="true">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 3.5h12M2 8h12M2 12.5h12"/></svg>
+      </button>
+      <button id="as-grid" type="button" aria-label="Thumbnails" title="Thumbnails" aria-pressed="false">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2" y="2" width="5" height="5" rx="1"/><rect x="9" y="2" width="5" height="5" rx="1"/><rect x="2" y="9" width="5" height="5" rx="1"/><rect x="9" y="9" width="5" height="5" rx="1"/></svg>
+      </button>
+    </div>
+  </div>
+  <div class="tools" id="tools" hidden>
+    <label class="button" for="files">Upload files</label>
+    <input id="files" type="file" multiple hidden>
+    <button id="mkdir" type="button">New folder</button>
+  </div>
+  <p class="status" id="status" role="status" aria-live="polite"></p>
+  <table class="list" id="list">
+    <thead><tr><th class="name">Name</th><th class="size">Size</th><th class="when">Modified</th><th class="actions"><span class="sr">Actions</span></th></tr></thead>
+    <tbody id="items"></tbody>
+  </table>
+  <ul class="grid" id="grid" hidden></ul>
+  <p class="empty" id="empty" hidden></p>
+</main>
+
+<div class="viewer" id="viewer" hidden role="dialog" aria-modal="true" aria-labelledby="viewer-name">
+  <div class="viewer-top">
+    <div class="viewer-title">
+      <span id="viewer-name"></span>
+      <span class="viewer-count" id="viewer-count"></span>
+    </div>
+    <a class="viewer-button" id="viewer-save" href="#" aria-label="Download" title="Download">
+      <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 3v10m-4-4 4 4 4-4M4 16h12"/></svg>
+    </a>
+    <button class="viewer-button" id="viewer-close" type="button" aria-label="Close" title="Close (Esc)">
+      <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 5 10 10M15 5 5 15"/></svg>
+    </button>
+  </div>
+  <div class="viewer-stage" id="viewer-stage"></div>
+  <button class="viewer-nav prev" id="viewer-prev" type="button" aria-label="Previous" title="Previous (←)">
+    <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m12.5 4-6 6 6 6"/></svg>
+  </button>
+  <button class="viewer-nav next" id="viewer-next" type="button" aria-label="Next" title="Next (→)">
+    <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m7.5 4 6 6-6 6"/></svg>
+  </button>
+  <div class="viewer-strip" id="viewer-strip" aria-label="All pictures and videos here"></div>
+</div>
+</body>
+</html>

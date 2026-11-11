@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="Feather" Manufacturer="Feather" Version="1.0.0" UpgradeCode="11ca2731-01e7-4edf-b504-b8a5943598fc" InstallerVersion="200" Compressed="yes">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Feather is already installed." />
+    <!-- Media element omitted: WiX v4 7.0.1 bug ignores File elements in cabinet.
+         File injection required post-build (use Inno Setup or WiX v3 for working installer). -->
+  </Package>
+
+  <Fragment>
+    <Feature Id="MainFeature" Title="Feather" Level="1" Display="expand">
+      <Feature Id="FeatherApp" Title="Feather Application" Level="1">
+        <ComponentGroupRef Id="FeatherFiles" />
+      </Feature>
+      <Feature Id="StartMenuFeature" Title="Start Menu Shortcut" Level="1">
+        <ComponentRef Id="StartMenuShortcut" />
+      </Feature>
+      <Feature Id="DesktopFeature" Title="Desktop Shortcut" Level="1">
+        <ComponentRef Id="DesktopShortcut" />
+      </Feature>
+    </Feature>
+  </Fragment>
+
+  <Fragment>
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Feather" />
+    </StandardDirectory>
+  </Fragment>
+
+  <Fragment>
+    <ComponentGroup Id="FeatherFiles" Directory="INSTALLFOLDER">
+      <Component Id="FeatherExe" Guid="f93c1faf-9645-4543-8d89-2a243426e508" Directory="INSTALLFOLDER">
+        <File Id="FeatherExe" Source="feather.exe" KeyPath="yes" Name="feather.exe" />
+      </Component>
+      <Component Id="StartMenuShortcut" Guid="75b10bd0-5817-4472-a416-3c5b3571e5c1">
+        <Shortcut Id="StartMenuShortcut" Directory="ProgramMenuFolder" Name="Feather" Target="[INSTALLFOLDER]feather.exe" WorkingDirectory="INSTALLFOLDER" />
+      </Component>
+      <Component Id="DesktopShortcut" Guid="a2023cad-57d2-4fe1-b684-7f38afbbb53b" Directory="DesktopFolder">
+        <Shortcut Id="DesktopShortcut" Name="Feather" Target="[INSTALLFOLDER]feather.exe" WorkingDirectory="INSTALLFOLDER" />
+        <RemoveFolder Id="CleanupDesktop" On="uninstall" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+
+  <Fragment>
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+    <UIRef Id="WixUI_FeatureTree" />
+    <UIRef Id="WixUI_ErrorProgressText" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Launch Feather" />
+  </Fragment>
+
+  <Fragment>
+    <InstallUISequence>
+      <Show Dialog="WelcomeDlg" Before="ProgressDlg" />
+      <Show Dialog="LicenseAgreementDlg" After="WelcomeDlg" />
+      <Show Dialog="InstallDirDlg" After="LicenseAgreementDlg" />
+      <Show Dialog="VerifyReadyDlg" After="InstallDirDlg" />
+    </InstallUISequence>
+
+    <InstallExecuteSequence>
+      <Custom Action="LaunchApplication" After="InstallFinalize" Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1" />
+    </InstallExecuteSequence>
+  </Fragment>
+
+  <Fragment>
+    <CustomAction Id="LaunchApplication" Property="WixShellExecTarget" Value="[INSTALLFOLDER]feather.exe" Execute="immediate" />
+    <UI>
+      <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="LaunchApplication" Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1" />
+    </UI>
+  </Fragment>
+</Wix>

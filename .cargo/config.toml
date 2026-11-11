@@ -1,0 +1,4 @@
+# Link the C runtime statically so the app has no redistributable runtime
+# dependency and no .NET or WebView layer.
+[build]
+rustflags = ["-C", "target-feature=+crt-static"]

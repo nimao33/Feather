@@ -1,0 +1,18 @@
+/target
+/screenshots
+**/*.rs.bk
+*.pdb
+*.ilk
+*.exp
+*.lib
+.DS_Store
+
+# Local data and scratch files, never published
+/%LOCALAPPDATA%/
+/ui-screenshots/
+/install.log
+/New Text Document.txt
+*.log
+/installer/feather.exe
+/installer/decompiled*
+/installer/test*

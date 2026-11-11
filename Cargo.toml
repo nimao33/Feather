@@ -1,0 +1,31 @@
+[workspace]
+members = [
+    "crates/feather-core",
+    "crates/feather-app",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.88"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+
+# Crypto is slow unoptimized; debug builds and tests optimize it anyway so
+# signing in takes milliseconds there too.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
+
+[profile.dev.package.ring]
+opt-level = 3
+
+[profile.dev.package.rustls]
+opt-level = 3

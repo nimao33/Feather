@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Feather</title>
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/app.css">
+<script src="/login.js" defer></script>
+</head>
+<body class="login" data-e2e="{{e2e}}">
+<main class="card">
+  <div class="brand"><img src="/icon.svg" alt="" width="28" height="28"><span>Feather</span></div>
+  <h1>Sign in</h1>
+  <p class="hint">Use the user name and password set in Feather's Settings, under Sharing.</p>
+  {{note}}
+  <form method="post" action="/login" autocomplete="on">
+    <label for="user">User name</label>
+    <input id="user" name="user" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" required maxlength="128" autofocus>
+    <label for="password">Password</label>
+    <div class="secret">
+      <input id="password" name="password" type="password" autocomplete="current-password" required maxlength="1024">
+      <button id="reveal" class="eye" type="button" aria-label="Show password" aria-pressed="false" hidden>
+        <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>
+      </button>
+    </div>
+    <button type="submit">Sign in</button>
+  </form>
+</main>
+</body>
+</html>
