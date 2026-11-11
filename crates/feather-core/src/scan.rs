@@ -13,7 +13,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::format::{write_manifest, Manifest, CHECK_STRIDE, FRN_SIZE, META_SIZE};
+use crate::format::{
+    write_manifest, Manifest, CHECK_STRIDE, COUNT_SIZE, FEATURE_FOLDER_TOTALS, FRN_SIZE, META_SIZE,
+};
 use crate::path::{is_absolute_path, normalize_path, path_within};
 
 const MAX_DEPTH: usize = 512;
@@ -751,6 +753,7 @@ struct Encoded {
     display: Vec<u8>,
     frn: Vec<u8>,
     check: Vec<u8>,
+    count: Vec<u8>,
     dirs: u32,
     files: u32,
 }
@@ -758,6 +761,8 @@ struct Encoded {
 /// Sorts entries by their searchable name and writes the index files.
 /// Entry 0 must be the root; parents are remapped after the sort so the
 /// tree stays valid. Lowercasing, sorting, and encoding run on all cores.
+/// Folder sizes are replaced by the total of everything below them, and
+/// each folder's item count goes to the `.count` table.
 pub(crate) fn write_entries(
     out: &Path,
     root_display: &str,
@@ -774,6 +779,20 @@ pub(crate) fn write_entries(
     entries.shrink_to_fit();
     let count = entries.len();
     let threads = workers();
+
+    // Folder totals, while the parent links still index this list. The
+    // counts take 4 bytes an entry until the files are written.
+    let phase_start = Instant::now();
+    let items = {
+        let Entries {
+            parent,
+            flags,
+            size,
+            ..
+        } = &mut entries;
+        crate::totals::fold_folder_totals(parent, flags, size)
+    };
+    phase("folder totals", phase_start);
 
     // Lowercased names, packed end to end: one allocation for all of them
     // instead of one per name. `key_at[i]..key_at[i + 1]` is entry i's.
@@ -866,8 +885,9 @@ pub(crate) fn write_entries(
     let mut display_file = open("display")?;
     let mut frn_file = open("frn")?;
     let mut check_file = open("check")?;
+    let mut count_file = open("count")?;
     let (mut meta_len, mut search_len, mut display_len) = (0u64, 0u64, 0u64);
-    let (mut frn_len, mut check_len) = (0u64, 0u64);
+    let (mut frn_len, mut check_len, mut count_len) = (0u64, 0u64, 0u64);
     let slice = (CHECK_STRIDE * 1024).max(CHECK_STRIDE);
     let mut first = 0usize;
     while first < count {
@@ -877,11 +897,13 @@ pub(crate) fn write_entries(
                 .into_iter()
                 .map(|range| {
                     let range = range.start + first..range.end + first;
-                    let (order, entries, remap, key) = (&order, &entries, &remap, &key);
+                    let (order, entries, remap, key, items) =
+                        (&order, &entries, &remap, &key, &items);
                     scope.spawn(move || {
                         let mut part = Encoded {
                             meta: Vec::with_capacity(range.len() * META_SIZE),
                             frn: Vec::with_capacity(range.len() * FRN_SIZE),
+                            count: Vec::with_capacity(range.len() * COUNT_SIZE),
                             ..Encoded::default()
                         };
                         for new_id in range {
@@ -925,6 +947,7 @@ pub(crate) fn write_entries(
                             meta.extend_from_slice(&0u16.to_le_bytes());
                             part.frn.extend_from_slice(&file_reference.to_le_bytes());
                             part.frn.extend_from_slice(&(new_id as u32).to_le_bytes());
+                            part.count.extend_from_slice(&items[old_id].to_le_bytes());
                         }
                         part
                     })
@@ -967,27 +990,38 @@ pub(crate) fn write_entries(
             display_file.write_all(&part.display)?;
             frn_file.write_all(&part.frn)?;
             check_file.write_all(&part.check)?;
+            count_file.write_all(&part.count)?;
             meta_len += part.meta.len() as u64;
             search_len += part.search.len() as u64;
             display_len += part.display.len() as u64;
             frn_len += part.frn.len() as u64;
             check_len += part.check.len() as u64;
+            count_len += part.count.len() as u64;
         }
         first = last;
     }
     drop(key_bytes);
     drop(key_at);
     drop(entries);
+    drop(items);
     for file in [
         &mut meta_file,
         &mut search_file,
         &mut display_file,
         &mut frn_file,
         &mut check_file,
+        &mut count_file,
     ] {
         file.flush()?;
     }
-    drop((meta_file, search_file, display_file, frn_file, check_file));
+    drop((
+        meta_file,
+        search_file,
+        display_file,
+        frn_file,
+        check_file,
+        count_file,
+    ));
     let entry_count = count as u32;
     report.entries = entry_count;
     phase("encode and write", phase_start);
@@ -1002,8 +1036,9 @@ pub(crate) fn write_entries(
         frn_len,
         check_len,
         seq: 0,
+        features: FEATURE_FOLDER_TOTALS,
     };
-    if !manifest.validate_lengths() {
+    if !manifest.validate_lengths() || count_len != u64::from(entry_count) * COUNT_SIZE as u64 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "built index shape is invalid",
@@ -1012,7 +1047,7 @@ pub(crate) fn write_entries(
     fs::write(out.join("prefix.txt"), root_display.as_bytes())?;
     write_manifest(out, &manifest)?;
 
-    report.bytes = meta_len + search_len + display_len + frn_len + check_len;
+    report.bytes = meta_len + search_len + display_len + frn_len + check_len + count_len;
     phase("write", phase_start);
     let phase_start = Instant::now();
 
@@ -1291,6 +1326,19 @@ mod tests {
 #[cfg(test)]
 mod tree_tests {
     use super::*;
+    use crate::index_set::IndexSet;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "feather-tree-{}-{}-{}",
+            name,
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ))
+    }
 
     #[test]
     fn trees_survive_the_pipe_format() {
@@ -1374,10 +1422,18 @@ mod tree_tests {
                 is_dir,
             });
         }
-        let expected: Vec<(String, u32, u64, u64)> = entries
+        let mut expected: Vec<(String, u32, u64, u64)> = entries
             .iter()
             .map(|entry| (entry.name.clone(), entry.parent, entry.size, entry.mtime))
             .collect();
+        // Folders are written with the total of everything below them.
+        let parents: Vec<u32> = entries.iter().map(|entry| entry.parent).collect();
+        let flags: Vec<u16> = entries.iter().map(|entry| u16::from(entry.is_dir)).collect();
+        let mut totals: Vec<u64> = entries.iter().map(|entry| entry.size).collect();
+        let items = crate::totals::fold_folder_totals(&parents, &flags, &mut totals);
+        for (row, total) in expected.iter_mut().zip(&totals) {
+            row.2 = *total;
+        }
         let dir = std::env::temp_dir().join(format!("feather-slices-{}", std::process::id()));
         let tree = Tree {
             root_display: r"C:\Slices".to_string(),
@@ -1398,16 +1454,133 @@ mod tree_tests {
             let entry = volume.entry(id);
             assert!(entry.name_search >= previous.as_str(), "not sorted at {id}");
             previous = entry.name_search.to_string();
-            let old = (entry.size / 3) as usize;
+            let old = (entry.mtime / 7) as usize;
             let (name, parent, size, mtime) = &expected[old];
             assert!(!seen[old]);
             seen[old] = true;
             assert_eq!(String::from_utf16_lossy(entry.name_display), *name);
             assert_eq!(entry.name_search, name.to_lowercase());
             assert_eq!((entry.size, entry.mtime), (*size, *mtime));
+            let expected_items = entry.is_dir().then_some(items[old]);
+            assert_eq!(volume.folder_items(id), expected_items);
             let parent_entry = volume.entry(volume.lookup_frn(entry.parent_frn).expect("parent"));
-            assert_eq!(parent_entry.size / 3, u64::from(*parent));
+            assert_eq!(parent_entry.mtime / 7, u64::from(*parent));
         }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A small tree written through the index writer, children listed
+    /// before their folders so the any-order path runs too.
+    fn small_tree(children_first: bool) -> Tree {
+        // (name, parent name, size, is_dir)
+        let rows = [
+            ("", "", 0, true),
+            ("Photos", "", 0, true),
+            ("2024", "Photos", 0, true),
+            ("beach.jpg", "2024", 4_000, false),
+            ("hill.jpg", "2024", 6_000, false),
+            ("cover.png", "Photos", 500, false),
+            ("Empty", "", 0, true),
+            ("notes.txt", "", 12, false),
+        ];
+        let mut order: Vec<usize> = (0..rows.len()).collect();
+        if children_first {
+            order[1..].reverse();
+        }
+        let position = |name: &str| {
+            order
+                .iter()
+                .position(|&row| rows[row].0 == name)
+                .expect("row") as u32
+        };
+        let mut entries = Entries::with_capacity(rows.len());
+        for &row in &order {
+            let (name, parent, size, is_dir) = rows[row];
+            entries.push(name, position(parent), size, 0, u16::from(is_dir));
+        }
+        Tree {
+            root_display: r"C:\Totals".to_string(),
+            entries,
+            report: ScanReport::default(),
+        }
+    }
+
+    fn find(volume: &crate::index::VolumeIndex, name: &str) -> u32 {
+        (0..volume.entry_count())
+            .find(|&id| volume.entry(id).name_search == name)
+            .expect("entry")
+    }
+
+    #[test]
+    fn folders_carry_the_total_of_everything_below_them() {
+        for children_first in [false, true] {
+            let dir = temp_dir(&format!("totals-{children_first}"));
+            write_tree(&dir, small_tree(children_first), Instant::now()).expect("write");
+            let volume = crate::index::VolumeIndex::open(&dir).expect("open");
+            assert!(volume.has_folder_totals());
+            let photos = find(&volume, "photos");
+            let year = find(&volume, "2024");
+            let empty = find(&volume, "empty");
+            let notes = find(&volume, "notes.txt");
+            assert_eq!(volume.entry(photos).size, 10_500);
+            assert_eq!(volume.folder_items(photos), Some(4));
+            assert_eq!(volume.entry(year).size, 10_000);
+            assert_eq!(volume.folder_items(year), Some(2));
+            assert_eq!(volume.entry(empty).size, 0);
+            assert_eq!(volume.folder_items(empty), Some(0));
+            assert_eq!(volume.entry(0).size, 10_512);
+            assert_eq!(volume.folder_items(0), Some(7));
+            // Files keep their own size and have no item count.
+            assert_eq!(volume.entry(notes).size, 12);
+            assert_eq!(volume.folder_items(notes), None);
+
+            // `size:` filters see folder totals.
+            let query = crate::Query::parse("size:>10kb");
+            let big: Vec<&str> = (1..volume.entry_count())
+                .map(|id| volume.entry(id))
+                .filter(|entry| query.matches_name(entry.name_search, entry.size, entry.flags))
+                .map(|entry| entry.name_search)
+                .collect();
+            assert_eq!(big, vec!["photos"]);
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn indexes_without_folder_totals_still_open() {
+        let dir = temp_dir("old-format");
+        write_tree(&dir, small_tree(false), Instant::now()).expect("write");
+        // Turn it into what an older Feather wrote: no feature bit, no
+        // count table, and folders with size 0.
+        let manifest = crate::format::read_manifest(&dir).expect("manifest");
+        fs::remove_file(dir.join(manifest.count_name())).expect("remove counts");
+        let meta_path = dir.join(manifest.meta_name());
+        let mut meta = fs::read(&meta_path).expect("meta");
+        for record in meta.chunks_mut(META_SIZE) {
+            if record[44] & 1 != 0 {
+                record[16..24].copy_from_slice(&0u64.to_le_bytes());
+            }
+        }
+        fs::write(&meta_path, meta).expect("write meta");
+        let old = Manifest {
+            features: 0,
+            ..manifest
+        };
+        write_manifest(&dir, &old).expect("manifest");
+
+        let volume = crate::index::VolumeIndex::open(&dir).expect("open old index");
+        assert!(!volume.has_folder_totals());
+        let photos = find(&volume, "photos");
+        assert_eq!(volume.entry(photos).size, 0);
+        assert_eq!(volume.folder_items(photos), None);
+        let set = IndexSet::open(&dir).expect("set");
+        let reference = crate::EntryRef::new(0, photos);
+        assert_eq!(set.folder_totals(reference), None);
+        assert!(!set.has_folder_totals(reference));
+
+        // The feature bit without its table is a broken index.
+        write_manifest(&dir, &manifest).expect("manifest");
+        assert!(crate::index::VolumeIndex::open(&dir).is_err());
         let _ = fs::remove_dir_all(&dir);
     }
 }

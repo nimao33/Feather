@@ -3,7 +3,10 @@ use std::io::{self, BufWriter, Write};
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::format::{write_manifest, Manifest, CHECK_STRIDE, FORMAT_VERSION, FRN_SIZE, META_SIZE};
+use crate::format::{
+    write_manifest, Manifest, CHECK_STRIDE, COUNT_SIZE, FEATURE_FOLDER_TOTALS, FORMAT_VERSION,
+    FRN_SIZE, META_SIZE,
+};
 
 #[derive(Clone, Debug)]
 pub struct SyntheticReport {
@@ -37,6 +40,7 @@ pub fn generate(dir: &Path, entries: u32, prefix: &str) -> io::Result<SyntheticR
     let mut display = Vec::new();
     let mut frn = Vec::with_capacity(entries as usize * FRN_SIZE);
     let mut check = Vec::new();
+    let mut counts = Vec::with_capacity(entries as usize * COUNT_SIZE);
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -44,16 +48,33 @@ pub fn generate(dir: &Path, entries: u32, prefix: &str) -> io::Result<SyntheticR
         .as_secs();
     let now_filetime = (now + 11_644_473_600) * 10_000_000;
     let extensions = ["pdf", "docx", "txt", "png", "rs", "log", "bin", "md"];
+    let file_size = |index: u32| match index % 10 {
+        0 => 0,
+        1..=6 => (index as u64).wrapping_mul(131) % 2_000_000,
+        7..=8 => (index as u64).wrapping_mul(104_729) % 200_000_000,
+        _ => (index as u64).wrapping_mul(7_919) % 8_000_000_000,
+    };
+    // Folder totals: file `index` lives in folder `index % dirs`.
+    let mut dir_bytes = vec![0u64; dirs as usize];
+    let mut dir_items = vec![0u32; dirs as usize];
+    for index in 0..files {
+        let folder = (index % dirs) as usize;
+        dir_bytes[folder] += file_size(index);
+        dir_items[folder] += 1;
+    }
+    let all_bytes: u64 = dir_bytes.iter().sum();
 
     for id in 0..entries {
         let (name, parent_frn, size, mtime, flags) = if id == 0 {
-            (String::new(), 1u64, 0u64, now_filetime, 1u16)
+            counts.extend_from_slice(&item_count.to_le_bytes());
+            (String::new(), 1u64, all_bytes, now_filetime, 1u16)
         } else if id <= dirs {
             let index = id - 1;
+            counts.extend_from_slice(&dir_items[index as usize].to_le_bytes());
             (
                 format!("dir{:04}", index),
                 1u64,
-                0u64,
+                dir_bytes[index as usize],
                 now_filetime.saturating_sub((index as u64 % 3650) * 86_400 * 10_000_000),
                 1u16,
             )
@@ -61,12 +82,8 @@ pub fn generate(dir: &Path, entries: u32, prefix: &str) -> io::Result<SyntheticR
             let index = id - dirs - 1;
             let extension = extensions[(index as usize) % extensions.len()];
             let parent = 2u64 + (index % dirs) as u64;
-            let size = match index % 10 {
-                0 => 0,
-                1..=6 => (index as u64).wrapping_mul(131) % 2_000_000,
-                7..=8 => (index as u64).wrapping_mul(104_729) % 200_000_000,
-                _ => (index as u64).wrapping_mul(7_919) % 8_000_000_000,
-            };
+            let size = file_size(index);
+            counts.extend_from_slice(&0u32.to_le_bytes());
             let mut flags = 0u16;
             if index % 1000 == 0 {
                 flags |= 2;
@@ -128,6 +145,7 @@ pub fn generate(dir: &Path, entries: u32, prefix: &str) -> io::Result<SyntheticR
         frn_len: frn.len() as u64,
         check_len: check.len() as u64,
         seq: 0,
+        features: FEATURE_FOLDER_TOTALS,
     };
     if manifest.entry_count == 0
         || manifest.meta_len != manifest.entry_count as u64 * META_SIZE as u64
@@ -149,6 +167,7 @@ pub fn generate(dir: &Path, entries: u32, prefix: &str) -> io::Result<SyntheticR
     )?;
     write_file(&dir.join(format!("base-{:016}.frn", generation)), &frn)?;
     write_file(&dir.join(format!("base-{:016}.check", generation)), &check)?;
+    write_file(&dir.join(manifest.count_name()), &counts)?;
     fs::write(dir.join("prefix.txt"), prefix.as_bytes())?;
     write_manifest(dir, &manifest)?;
 

@@ -11,6 +11,7 @@ pub mod path;
 pub mod query;
 pub mod scan;
 pub mod synthetic;
+pub mod totals;
 
 pub use entry::{EntrySummary, EntryView};
 pub use index::VolumeIndex;

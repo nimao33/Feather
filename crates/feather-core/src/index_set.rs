@@ -156,6 +156,20 @@ impl IndexSet {
         self.volumes[entry.volume()].resolve_path(entry.id())
     }
 
+    /// A folder's total size and the number of items below it, when its
+    /// volume's index has folder totals. `None` for files and for folders
+    /// in indexes built before totals existed.
+    pub fn folder_totals(&self, entry: EntryRef) -> Option<(u64, u32)> {
+        let volume = &self.volumes[entry.volume()];
+        let items = volume.folder_items(entry.id())?;
+        Some((volume.entry(entry.id()).size, items))
+    }
+
+    /// Whether the volume holding `entry` stores folder totals.
+    pub fn has_folder_totals(&self, entry: EntryRef) -> bool {
+        self.volumes[entry.volume()].has_folder_totals()
+    }
+
     pub fn item_count(&self) -> u64 {
         self.volumes
             .iter()

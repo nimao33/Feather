@@ -30,6 +30,7 @@ the display root used to resolve a path.
 | --- | --- | --- |
 | 0 | 8 | magic `FTHRIDX1` |
 | 8 | 4 | format version |
+| 12 | 4 | feature bits (see below) |
 | 16 | 8 | generation |
 | 24 | 4 | entry count |
 | 32 | 8 | meta byte length |
@@ -39,6 +40,11 @@ the display root used to resolve a path.
 | 64 | 8 | checkpoint byte length |
 | 72 | 8 | slot sequence |
 | 80 | 4 | CRC32 of bytes 0..80 |
+
+Feature bits: bit 0 (`FEATURE_FOLDER_TOTALS`) means folder sizes are totals
+and the `.count` table exists. The word sits in bytes that format version 1
+always wrote as zero, so indexes from before folder totals open with no
+features, and older readers, which ignore the word, still open new indexes.
 
 The newest valid slot wins. A slot is written in place, flushed, and only then
 used. A crash during a manifest write leaves the other slot intact.
@@ -52,6 +58,7 @@ used. A crash during a manifest write leaves the other slot intact.
 | `base-<gen>.display` | Original UTF-16LE names, each followed by a NUL code unit. |
 | `base-<gen>.frn` | 12-byte records: file reference number (u64), entry ID (u32), sorted by FRN then ID. |
 | `base-<gen>.check` | Every 256th entry: search offset (u32), display offset (u32). |
+| `base-<gen>.count` | With folder totals only: u32 per entry, in meta order. A folder's number of files and folders anywhere below it; 0 for files. |
 | `prefix.txt` | Display prefix for path reconstruction, for example `C:\FeatherBench`. |
 
 The meta record is:
@@ -60,7 +67,7 @@ The meta record is:
 | --- | --- | --- |
 | 0 | 8 | file reference number |
 | 8 | 8 | parent file reference number |
-| 16 | 8 | logical size |
+| 16 | 8 | logical size; for a folder, the total below it (see Folder totals) |
 | 24 | 8 | modified FILETIME, UTC |
 | 32 | 4 | display name offset |
 | 36 | 4 | search name offset |
@@ -79,9 +86,31 @@ directory therefore costs one fixed record plus its two name copies. The index
 does not keep a 1M-entry heap structure at query time; the reader maps these
 files read-only.
 
+## Folder totals
+
+With feature bit 0 set, a folder's `size` is the sum of the logical sizes of
+every file anywhere below it, and its `.count` entry is the number of files
+and folders anywhere below it (not counting itself). The root entry holds the
+totals of the whole index. Both are computed by the writer from the parent
+links, never by reading folders again (`feather_core::totals::
+fold_folder_totals`), so they are as fresh as the index: a rebuild updates
+them. Hard links are counted once per name, as they are listed. The live
+update overlay keeps them right by adding each change to every ancestor.
+
+Because the total lives in `size`, everything that reads sizes sees it:
+sorting by size orders folders by their totals, and `size:` filters match
+folders by their totals too (`size:>1gb` finds folders holding more than
+1 GB; `type:file size:>1gb` keeps to files). This is how Everything treats
+folder sizes.
+
+Indexes written before folder totals have no feature bit and folders of size
+0. They open as before: the app shows no size for their folders, and they
+gain totals on their next rebuild.
+
 ## Validation
 
-On open, the reader checks magic, version, slot CRC, all table lengths, and
+On open, the reader checks magic, version, slot CRC, all table lengths
+(including the `.count` table when the feature bit says it exists), and
 every name offset and length. It validates the FRN table independently: sorted
 by `(FRN, id)`, every id in range, every FRN matching its entry record, and
 every entry id appearing exactly once. The meta table is in name order, so its
