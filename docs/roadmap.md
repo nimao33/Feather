@@ -1,69 +1,44 @@
 # Roadmap
 
-This repository follows `../build-plan-feather.md`.
+## Done (1.0.0)
 
-## Done in this slice
+- Memory-mapped index with a versioned, validated on-disk format; NTFS
+  `$MFT` reader through a small elevated helper; folder walk for everything
+  else; per-drive libraries with generation swaps.
+- Search: words, phrases, negation, wildcards, `ext:`, `type:`, `size:`,
+  `match:`, folder paths (`docs\report`), `in:` scopes; parallel scans,
+  narrowing of previous results while typing, highlighted matches.
+- Windows UI drawn with Direct2D: sidebar categories and places, details
+  pane, Explorer context menu, Filters, Settings, Help, themes (Mica,
+  Acrylic, solid, custom colors and background), color picker with screen
+  pick, global shortcut, tray, start at sign-in, first-run guide.
+- Sharing over HTTPS and FTPS with sign-in, LAN QR code, Cloudflare/ngrok
+  tunnels, photo and video viewing.
+- Linux window (a local page in a browser app window), CLI, per-user .msi
+  installer with upgrades, CI on Windows and Linux.
 
-- Step 0 scaffold: Cargo workspace, static CRT, Common Controls v6 manifest,
-  release profile, scripts, CI.
-- Step 1: index format, mmap reader, double-slot manifest, synthetic 1M-capable
-  generator, query parser, wildcard matcher, filter subset, 1M benchmark
-  command, memory proof, corrupt-index tests.
-- Step 2 partial: native Win32 shell, virtual ListView, search worker with
-  cancellation and generation tags, four-part status bar, toolbar, sortable
-  columns with header arrows, folder-only Path column, double-click open,
-  `Esc` and `Ctrl+F` accelerators, screenshots, UI scenarios, state model,
-  tests.
-- Step 2 dialogs: shared modal framework, Filters window with kind/extension/
-  size validation, Settings window with per-user INI persistence, Help window,
-  filter summaries in the status bar and toolbar, configurable result cap,
-  debounce delay, double-click target, empty-query behavior, window placement,
-  and always-on-top. Nine screenshot scenarios and parser/model tests.
-- Step 2 filters and scope: one-click `Category` presets (Everything, Files,
-  Folders, Documents, Images, Video, Audio, Archives, Executables, Code,
-  Custom), a filter bar with a Type list and an In-location list, a modern
-  `IFileOpenDialog` folder picker, `in:` query scopes with negation, remembered
-  scope, volume include/exclude lists, and excluded-folder subtrees. Two more
-  screenshot scenarios.
-- Step 2 shell integration: Windows Explorer `IContextMenu` on right-click with
-  the expanded verb set, `IContextMenu2`/`IContextMenu3` message forwarding, and
-  a native fallback menu.
-- Real-index groundwork: a portable `std::fs` scan builder with reparse/skip/
-  error accounting, a multi-volume `IndexSet` and `EntryRef`, and path helpers
-  for normalization and containment.
-- CLI: `search` with text/JSON and folder scope, `index scan` (single-volume or
-  multi-root library), `index synthetic`, `index status`, and `config
-  list/get/set/path`.
+## In progress
+
+- **Live updates** from the NTFS change journal (USN): changes appear within
+  about a second and whole-drive rebuilds become rare, removing the brief
+  memory spike each rebuild causes.
+- **Date filters**: `dm:today`, `dm:lastweek`, `dm:2026-11`, ranges, and a
+  Modified control in Filters.
+- **Folder downloads** from the shared page as a streamed .zip.
+- **Linux release** tarball built by a release workflow next to the .msi.
 
 ## Next
 
-1. Step 2 polish: icons, selection preservation, loading/empty banners, DPI
-   scaling, hotkey, tray, and start at login.
-2. Step 3: external sort, NTFS file IDs in the index, VHDX test. (The raw
-   `$MFT` reader landed: `feather-core/src/mft.rs`.)
-3. Step 4: SYSTEM service, installer, status file, real UI handoff.
-4. Step 5 and later: USN deltas, USB, packaging.
+- **No UAC prompt**: read drives through a service installed by the .msi
+  instead of an elevated helper started at each launch.
+- Removable drives: index USB drives when they appear, drop them when they
+  go.
+- Code-signed installer, and a winget package.
+- File watcher on Linux instead of timer rebuilds.
 
-## Immediate known gaps
+## Known gaps
 
-- Fast indexing reads `$MFT` and needs admin rights: one UAC prompt per
-  session starts the admin helper. A SYSTEM service would remove the prompt.
-- Updates are whole rebuilds triggered by a folder watcher (about 3 seconds
-  for a 2.5-million-file drive), not USN-journal deltas, so a new file shows
-  up within about a minute rather than instantly, and size or date changes
-  alone do not trigger an update.
-- Settings do not include start at login or an index-location picker yet.
-- The screenshot harness shows a visible window. On a locked or session-0
-  desktop it will produce a blank or fail; it is a developer/desktop tool.
-- The empty-query list is capped at the configured result limit (50,000 by
-  default) instead of mapping all entries virtually.
-- Date filters are parsed but not applied. The Filters window has no date
-  pickers.
-- No icons yet; the columns are text only.
-- The UI opens at 1,100x700 by default and restores a saved placement when
-  Remember window is enabled. There is no DPI scaling yet.
-- Keyboard accelerators and dialog commands have no automated window-level
-  test; the screenshot scenarios render the windows, but the handlers are
-  exercised manually.
-- The shell context menu is verified manually with a desktop screenshot; it has
-  no automated test.
+- On Linux the index refreshes on a timer and has no NTFS fast path.
+- The installer is not code signed, so SmartScreen warns on first run.
+- The UI test harness needs an interactive desktop; it occasionally fails
+  with "window has no client area" and passes on a rerun.
