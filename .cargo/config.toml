@@ -1,4 +1,6 @@
-# Link the C runtime statically so the app has no redistributable runtime
-# dependency and no .NET or WebView layer.
-[build]
+# Link the C runtime statically so the Windows app has no redistributable
+# runtime dependency and no .NET or WebView layer. Windows (MSVC) only: on
+# Linux a static C runtime would also apply to proc-macro crates, which can't
+# be built that way; the static Linux build uses the musl target instead.
+[target.'cfg(all(windows, target_env = "msvc"))']
 rustflags = ["-C", "target-feature=+crt-static"]
