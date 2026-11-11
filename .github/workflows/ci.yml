@@ -17,7 +17,7 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
-        run: cargo test --workspace --all-targets
+        run: cargo test --workspace --all-targets --no-fail-fast
       - name: Release build
         run: cargo build --release --workspace
 
@@ -32,7 +32,7 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
-        run: cargo test --workspace --all-targets
+        run: cargo test --workspace --all-targets --no-fail-fast
       # Only the static build needs musl; the package mirrors sometimes
       # fail to resolve, so retry a few times.
       - name: Musl tools

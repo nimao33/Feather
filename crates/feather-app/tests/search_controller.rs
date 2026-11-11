@@ -160,6 +160,8 @@ fn the_result_cap_limits_rows_and_reports_the_cap() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// Volumes named by drive letter: Windows paths.
+#[cfg(windows)]
 #[test]
 fn volume_mask_and_excluded_paths_are_applied() {
     let root = test_dir("scope");
