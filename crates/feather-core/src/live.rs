@@ -875,22 +875,38 @@ impl Overlay {
                 self.empty_folder(entry.frn, (entry.size, base.items(id)));
             }
         }
-        let dead: Vec<u32> = self
-            .order
-            .iter()
-            .copied()
+        // Every live added entry, not just `order`: `order` is rebuilt only
+        // at the end of `apply`, so entries added earlier in the same batch
+        // would otherwise survive a folder removed in that batch.
+        let base_count = self.base_count;
+        let live_ids: Vec<u32> = (0..self.added.len() as u32)
+            .filter(|&i| self.added[i as usize].live)
+            .map(|i| base_count + i)
+            .collect();
+        let dead: Vec<u32> = live_ids
+            .into_iter()
             .filter(|&id| {
                 let parent = self.added[(id - self.base_count) as usize].parent_frn;
                 !connected(self, parent)
             })
             .collect();
+        // A base folder moved into the overlay keeps its base children, so
+        // removing it (or a folder it was moved under) must also check the
+        // base for entries left without a parent.
+        let mut need_base = false;
         for id in dead {
             let added = &self.added[(id - self.base_count) as usize];
             if added.is_dir() {
                 let (frn, stored) = (added.frn, (added.size, added.items));
                 self.empty_folder(frn, stored);
+                if let Some(base_id) = base.lookup_frn(frn) {
+                    need_base |= self.base_has_children(base, base_id);
+                }
             }
             self.kill(id);
+        }
+        if need_base && !with_base {
+            self.prune_orphans(base, true);
         }
     }
 
@@ -1792,6 +1808,57 @@ mod tests {
         assert!(live.lookup_frn(SUB).unwrap() >= live.base_count());
         assert_eq!(totals(&live, SUB), (1040, 2));
         assert_eq!(totals(&live, PHOTOS), (1070, 4));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Every listed entry still has a path, and none is named `gone`.
+    fn assert_no_ghosts(live: &VolumeIndex, gone: &[&str]) {
+        for id in live.iter_ids() {
+            let name = live.entry(id).name_search.to_string();
+            assert!(live.resolve_path(id).is_some(), "{name} has no path");
+            assert!(!gone.contains(&name.as_str()), "{name} should be gone");
+        }
+    }
+
+    #[test]
+    fn a_folder_removed_in_the_batch_that_adds_to_it_leaves_nothing() {
+        let dir = temp_dir("ghost-same-batch");
+        let base = volume(&dir);
+        let mut overlay = Overlay::new(&base, CURSOR);
+        // A new file in photos, then photos goes to the recycle bin, both
+        // within one read of the journal.
+        overlay.apply(
+            &base,
+            &[
+                file(900, PHOTOS, "notes.txt", 1),
+                // Recycling is a move into the Recycle Bin, a folder outside
+                // the index.
+                folder(PHOTOS, 0xdead_0000, "$R1A2B3C", false),
+            ],
+            &rules(),
+        );
+        let live = with(&base, &overlay);
+        assert_no_ghosts(&live, &["notes.txt", "cat.jpg", "deep.png"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_moved_folder_goes_with_the_folder_it_was_moved_into() {
+        let dir = temp_dir("ghost-moved");
+        let base = volume(&dir);
+        let mut overlay = Overlay::new(&base, CURSOR);
+        overlay.apply(
+            &base,
+            &[
+                folder(901, ROOT, "new folder", true),
+                folder(PHOTOS, 901, "photos", false),
+            ],
+            &rules(),
+        );
+        overlay.apply(&base, &[Change::Remove(901)], &rules());
+        let live = with(&base, &overlay);
+        assert_no_ghosts(&live, &["cat.jpg", "deep.png", "photos", "new folder"]);
+        assert_eq!(totals(&live, ROOT).1 as usize, live.iter_ids().count());
         let _ = fs::remove_dir_all(&dir);
     }
 
