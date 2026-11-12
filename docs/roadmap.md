@@ -21,13 +21,12 @@
 - **Live updates** from the NTFS change journal (USN) for whole drives:
   changes appear within about a second, folder totals included, and the
   changes are folded into a new index when idle instead of rebuilding.
+- Shared page: folder .zip downloads, file actions (rename, move, copy,
+  delete to the Recycle Bin), folder sizes, sorting, gestures in the viewer,
+  installable on phones.
+- Linux release tarball built next to the .msi by a release workflow.
 - Linux window (a local page in a browser app window), CLI, per-user .msi
   installer with upgrades, CI on Windows and Linux.
-
-## In progress
-
-- **Folder downloads** from the shared page as a streamed .zip.
-- **Linux release** tarball built by a release workflow next to the .msi.
 
 ## Next
 
