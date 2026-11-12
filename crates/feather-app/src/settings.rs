@@ -476,6 +476,8 @@ pub struct Settings {
     pub remember_scope: bool,
     pub remember_window: bool,
     pub always_on_top: bool,
+    /// Asks GitHub once a day whether a newer Feather is out.
+    pub check_for_updates: bool,
     pub show_hidden: bool,
     pub show_system: bool,
     pub use_shell_context_menu: bool,
@@ -570,6 +572,7 @@ impl Default for Settings {
             remember_scope: false,
             remember_window: true,
             always_on_top: false,
+            check_for_updates: true,
             show_hidden: true,
             show_system: true,
             use_shell_context_menu: true,
@@ -690,6 +693,11 @@ impl Settings {
         let _ = writeln!(text, "remember_scope={}", bool_value(self.remember_scope));
         let _ = writeln!(text, "remember_window={}", bool_value(self.remember_window));
         let _ = writeln!(text, "always_on_top={}", bool_value(self.always_on_top));
+        let _ = writeln!(
+            text,
+            "check_for_updates={}",
+            bool_value(self.check_for_updates)
+        );
         let _ = writeln!(text, "show_hidden={}", bool_value(self.show_hidden));
         let _ = writeln!(text, "show_system={}", bool_value(self.show_system));
         let _ = writeln!(
@@ -990,6 +998,10 @@ pub fn parse(text: &str) -> LoadedSettings {
                 Some(flag) => settings.always_on_top = flag,
                 None => warnings.push(invalid()),
             },
+            "check_for_updates" => match parse_bool(value) {
+                Some(flag) => settings.check_for_updates = flag,
+                None => warnings.push(invalid()),
+            },
             "show_hidden" => match parse_bool(value) {
                 Some(flag) => settings.show_hidden = flag,
                 None => warnings.push(invalid()),
@@ -1271,6 +1283,7 @@ pub const SETTING_KEYS: &[&str] = &[
     "remember_scope",
     "remember_window",
     "always_on_top",
+    "check_for_updates",
     "show_hidden",
     "show_system",
     "use_shell_context_menu",
@@ -1652,6 +1665,8 @@ mod dialog {
     const REMEMBER_SCOPE: Id = "remember_scope";
     const REMEMBER_WINDOW: Id = "remember_window";
     const ALWAYS_ON_TOP: Id = "always_on_top";
+    const CHECK_UPDATES: Id = "check_for_updates";
+    const UPDATE_NOW: Id = "update_now";
     const SHELL_MENU: Id = "shell_menu";
     const HOTKEY: Id = "hotkey";
     const CLOSE_TO_TRAY: Id = "close_to_tray";
@@ -1856,6 +1871,7 @@ mod dialog {
         form.set_on(REMEMBER_SCOPE, settings.remember_scope);
         form.set_on(REMEMBER_WINDOW, settings.remember_window);
         form.set_on(ALWAYS_ON_TOP, settings.always_on_top);
+        form.set_on(CHECK_UPDATES, settings.check_for_updates);
         form.set_on(SHELL_MENU, settings.use_shell_context_menu);
         let shortcut = if settings.hotkey.eq_ignore_ascii_case(hotkey::OFF) {
             ""
@@ -2145,6 +2161,30 @@ mod dialog {
             Some("Right-clicking a result shows commands from other apps too."),
             false,
         );
+        form.heading("Updates");
+        form.switch(
+            CHECK_UPDATES,
+            "Check for updates",
+            Some(
+                "Once a day Feather asks GitHub for its newest version. \
+                 Nothing is downloaded until you choose to.",
+            ),
+            true,
+        );
+        match crate::update::found() {
+            Some(release) => form.action(
+                UPDATE_NOW,
+                &format!("Feather {} is out", release.version),
+                Some(&format!("You have {}.", env!("CARGO_PKG_VERSION"))),
+                "Download",
+            ),
+            None => form.action(
+                UPDATE_NOW,
+                &format!("Feather {}", env!("CARGO_PKG_VERSION")),
+                None,
+                "Check now",
+            ),
+        }
 
         form.page("Sharing", PageIcon::Sharing);
         // What sharing is doing comes first; the settings follow. Rows carry
@@ -2357,6 +2397,8 @@ mod dialog {
         /// The status lines last shown.
         shown_status: Vec<String>,
         shown_reach: usize,
+        /// A check started from Check now, until its answer is shown.
+        update_check: Option<std::sync::mpsc::Receiver<Result<crate::update::Release, String>>>,
     }
 
     impl SettingsDialog {
@@ -2546,6 +2588,7 @@ mod dialog {
             settings.remember_scope = form.is_on(REMEMBER_SCOPE);
             settings.remember_window = form.is_on(REMEMBER_WINDOW);
             settings.always_on_top = form.is_on(ALWAYS_ON_TOP);
+            settings.check_for_updates = form.is_on(CHECK_UPDATES);
             settings.use_shell_context_menu = form.is_on(SHELL_MENU);
             settings.close_to_tray = form.is_on(CLOSE_TO_TRAY);
             settings.pause_in_fullscreen = form.is_on(PAUSE_IN_FULLSCREEN);
@@ -2706,6 +2749,25 @@ mod dialog {
                     form.set_detail(TUNNEL_SETUP, &note);
                     return;
                 }
+                UPDATE_NOW => {
+                    if let Some(release) = crate::update::found() {
+                        if let Err(error) = crate::ui::context_menu::open_url(&release.download) {
+                            form.set_detail(UPDATE_NOW, &error);
+                        }
+                    } else if self.update_check.is_none() {
+                        let (send, receive) = std::sync::mpsc::channel();
+                        let started = std::thread::Builder::new()
+                            .name("feather-update-check".into())
+                            .spawn(move || {
+                                let _ = send.send(crate::update::check());
+                            });
+                        if started.is_ok() {
+                            self.update_check = Some(receive);
+                            form.set_detail(UPDATE_NOW, "Checking…");
+                        }
+                    }
+                    return;
+                }
                 SHARE_WEB | SHARE_LAN => {
                     let address = if id == SHARE_WEB {
                         &self.web
@@ -2777,6 +2839,26 @@ mod dialog {
         /// address appears as soon as it is known.
         fn on_tick(&mut self, form: &mut Form) -> bool {
             let mut changed = false;
+            let answer = self
+                .update_check
+                .as_ref()
+                .and_then(|check| check.try_recv().ok());
+            if let Some(answer) = answer {
+                self.update_check = None;
+                changed = true;
+                match answer {
+                    Ok(release) if crate::update::is_newer(&release.version) => {
+                        form.set_label(UPDATE_NOW, &format!("Feather {} is out", release.version));
+                        form.set_detail(
+                            UPDATE_NOW,
+                            &format!("You have {}.", env!("CARGO_PKG_VERSION")),
+                        );
+                        form.set_caption(UPDATE_NOW, "Download");
+                    }
+                    Ok(_) => form.set_detail(UPDATE_NOW, "You have the newest version."),
+                    Err(error) => form.set_detail(UPDATE_NOW, &error),
+                }
+            }
             if let Some((id, since)) = self.copied {
                 if since.elapsed() >= std::time::Duration::from_millis(1400) {
                     form.set_copied(id, false);
@@ -2947,6 +3029,7 @@ mod dialog {
             sharing_status: live.sharing_status,
             shown_status: live.sharing.clone(),
             shown_reach: usize::MAX,
+            update_check: None,
         };
         FormWindow::open(parent, "Settings", 860, 680, look, form, Box::new(dialog))
     }
@@ -3139,6 +3222,7 @@ mod tests {
             remember_scope: true,
             remember_window: false,
             always_on_top: true,
+            check_for_updates: false,
             show_hidden: false,
             show_system: false,
             use_shell_context_menu: false,

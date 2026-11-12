@@ -21,5 +21,5 @@ if errorlevel 1 (
 )
 
 echo.
-echo Installer built at %PROJECT_ROOT%\target\installer\Feather-1.0.0.exe
+echo Installer built at %PROJECT_ROOT%\target\installer\Feather-1.1.0.exe
 echo Inno Setup installer includes feather.exe correctly.

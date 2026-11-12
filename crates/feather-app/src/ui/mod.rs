@@ -128,6 +128,8 @@ const WM_REINDEX: u32 = windows_sys::Win32::UI::WindowsAndMessaging::WM_APP + 0x
 const WM_APPLY_SHARING: u32 = windows_sys::Win32::UI::WindowsAndMessaging::WM_APP + 0x46;
 /// Settings asks for sharing's status lines (lparam points at the answer).
 const WM_SHARING_STATUS: u32 = windows_sys::Win32::UI::WindowsAndMessaging::WM_APP + 0x47;
+/// A newer Feather was found (`crate::update::found`).
+const WM_UPDATE_FOUND: u32 = windows_sys::Win32::UI::WindowsAndMessaging::WM_APP + 0x49;
 
 /// An in-progress mouse drag.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -204,6 +206,8 @@ pub struct Ui {
     hotkey_paused: bool,
     /// Whether the tray icon is showing.
     tray_on: bool,
+    /// The tray icon was added only to announce an update.
+    update_icon: bool,
     /// Set when the shortcut brought the window up; Escape then hides it.
     summoned: bool,
     /// Set by Quit, so closing really exits instead of hiding to the tray.
@@ -383,6 +387,7 @@ impl Ui {
             hotkey_on: false,
             hotkey_paused: false,
             tray_on: false,
+            update_icon: false,
             summoned: false,
             quitting: false,
             entered: 0,
@@ -2832,7 +2837,64 @@ impl Ui {
                 Some(tray::MENU_QUIT) => self.quit(),
                 _ => {}
             },
+            tray::TrayEvent::NoteClicked => {
+                if let Some(release) = crate::update::found() {
+                    let _ = context_menu::open_url(&release.download);
+                }
+                self.drop_update_icon();
+            }
+            tray::TrayEvent::NoteGone => self.drop_update_icon(),
             tray::TrayEvent::Other => {}
+        }
+    }
+
+    /// Asks GitHub for a newer Feather in the background, at most once a
+    /// day, when the person wants that.
+    fn check_for_update(&self) {
+        if !self.persist || !self.settings.check_for_updates || !crate::update::due() {
+            return;
+        }
+        let hwnd = self.hwnd as isize;
+        let _ = std::thread::Builder::new()
+            .name("feather-update-check".into())
+            .spawn(move || {
+                // Not while Windows is still starting everything else.
+                std::thread::sleep(Duration::from_secs(20));
+                if crate::update::check().is_ok() && crate::update::found().is_some() {
+                    unsafe {
+                        windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
+                            hwnd as HWND,
+                            WM_UPDATE_FOUND,
+                            0,
+                            0,
+                        );
+                    }
+                }
+            });
+    }
+
+    /// Shows a notification about a newer Feather; clicking it opens the
+    /// download.
+    fn announce_update(&mut self) {
+        let Some(release) = crate::update::found() else {
+            return;
+        };
+        if !self.tray_on && !self.update_icon {
+            self.update_icon = tray::add(self.hwnd);
+        }
+        tray::notify(
+            self.hwnd,
+            &format!("Feather {} is out", release.version),
+            "Click to download it. Install it over this one; your settings stay.",
+        );
+    }
+
+    fn drop_update_icon(&mut self) {
+        if self.update_icon {
+            self.update_icon = false;
+            if !self.tray_on {
+                tray::remove(self.hwnd);
+            }
         }
     }
 
@@ -4162,6 +4224,10 @@ unsafe extern "system" fn wndproc(
                 ui.update_sharing();
                 return 0;
             }
+            WM_UPDATE_FOUND => {
+                ui.announce_update();
+                return 0;
+            }
             WM_SHARING_STATUS => {
                 if lparam != 0 {
                     let answer = &mut *(lparam as *mut (Vec<String>, Option<String>));
@@ -4318,9 +4384,10 @@ unsafe extern "system" fn wndproc(
             }
             WM_DESTROY => {
                 ui.unregister_hotkey();
-                if ui.tray_on {
+                if ui.tray_on || ui.update_icon {
                     tray::remove(hwnd);
                     ui.tray_on = false;
+                    ui.update_icon = false;
                 }
                 KillTimer(hwnd, TIMER_RESULTS);
                 KillTimer(hwnd, TIMER_DEBOUNCE);
@@ -4529,6 +4596,7 @@ pub fn run_ui(index: Arc<IndexSet>, library: PathBuf, background: bool) -> i32 {
         if let Some(ui) = ui_ref(hwnd) {
             ui.register_hotkey();
             ui.update_tray();
+            ui.check_for_update();
             ui.library = Some(library);
             ui.update_sharing();
             if !ui.settings.setup_done {

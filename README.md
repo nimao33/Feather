@@ -205,8 +205,8 @@ example `FEATHER_BROWSER="firefox --new-window"` or
 From a release download (no Rust needed), for your user only:
 
 ```sh
-tar xf feather-1.0.0-linux-x86_64.tar.gz
-cd feather-1.0.0-linux-x86_64
+tar xf feather-1.1.0-linux-x86_64.tar.gz
+cd feather-1.1.0-linux-x86_64
 ./install.sh               # copies feather to ~/.local/bin, adds a menu entry
 ./install.sh --autostart   # the same, and starts Feather at sign-in
 ```

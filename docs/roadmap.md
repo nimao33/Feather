@@ -1,6 +1,6 @@
 # Roadmap
 
-## Done (1.0.0)
+## Done (1.1.0)
 
 - Memory-mapped index with a versioned, validated on-disk format; NTFS
   `$MFT` reader through a small elevated helper; folder walk for everything
@@ -25,6 +25,8 @@
   delete to the Recycle Bin), folder sizes, sorting, gestures in the viewer,
   installable on phones.
 - Linux release tarball built next to the .msi by a release workflow.
+- Update check: once a day (optional), a notification offers the new
+  installer; Settings → Window has Check now.
 - Linux window (a local page in a browser app window), CLI, per-user .msi
   installer with upgrades, CI on Windows and Linux.
 

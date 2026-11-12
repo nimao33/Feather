@@ -667,6 +667,22 @@ impl Form {
         self.push(id, label, detail, Kind::Action { caption });
     }
 
+    /// Changes the label of row `id`.
+    pub fn set_label(&mut self, id: Id, label: &str) {
+        if let Some(widget) = self.widget_mut(id) {
+            widget.label = label.to_string();
+        }
+    }
+
+    /// Changes the button caption of action row `id`.
+    pub fn set_caption(&mut self, id: Id, caption: &str) {
+        if let Some(Kind::Action { caption: shown }) =
+            self.widget_mut(id).map(|widget| &mut widget.kind)
+        {
+            *shown = caption.to_string();
+        }
+    }
+
     pub fn set_detail(&mut self, id: Id, detail: &str) {
         if let Some(widget) = self.widget_mut(id) {
             widget.detail = Some(detail.to_string());

@@ -3,8 +3,9 @@
 use windows_sys::Win32::Foundation::{HWND, POINT};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE,
-    NIM_SETVERSION, NOTIFYICONDATAW, NOTIFYICON_VERSION_4,
+    Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_LARGE_ICON,
+    NIIF_USER, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NOTIFYICONDATAW,
+    NOTIFYICON_VERSION_4,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, GetSystemMetrics, LoadIconW,
@@ -24,6 +25,9 @@ const APP_ICON: u16 = 1;
 
 const NIN_SELECT: u32 = WM_USER;
 const NIN_KEYSELECT: u32 = WM_USER + 1;
+const NIN_BALLOONHIDE: u32 = WM_USER + 3;
+const NIN_BALLOONTIMEOUT: u32 = WM_USER + 4;
+const NIN_BALLOONUSERCLICK: u32 = WM_USER + 5;
 
 pub const MENU_OPEN: u32 = 1;
 pub const MENU_SETTINGS: u32 = 2;
@@ -34,7 +38,31 @@ pub const MENU_QUIT: u32 = 3;
 pub enum TrayEvent {
     Open,
     Menu,
+    /// The notification was clicked.
+    NoteClicked,
+    /// The notification went away unclicked.
+    NoteGone,
     Other,
+}
+
+/// Shows a Windows notification from the icon, which must be added.
+pub fn notify(hwnd: HWND, title: &str, text: &str) -> bool {
+    let mut data = data(hwnd);
+    data.uFlags = NIF_INFO;
+    data.dwInfoFlags = NIIF_USER | NIIF_LARGE_ICON;
+    data.hBalloonIcon = app_icon(32);
+    for (slot, unit) in data
+        .szInfoTitle
+        .iter_mut()
+        .take(63)
+        .zip(title.encode_utf16())
+    {
+        *slot = unit;
+    }
+    for (slot, unit) in data.szInfo.iter_mut().take(255).zip(text.encode_utf16()) {
+        *slot = unit;
+    }
+    unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) != 0 }
 }
 
 /// The app icon at `size` pixels, or the generic one if it is missing.
@@ -104,6 +132,8 @@ pub fn event(lparam: isize) -> TrayEvent {
     match (lparam as u32) & 0xffff {
         NIN_SELECT | NIN_KEYSELECT => TrayEvent::Open,
         WM_CONTEXTMENU => TrayEvent::Menu,
+        NIN_BALLOONUSERCLICK => TrayEvent::NoteClicked,
+        NIN_BALLOONHIDE | NIN_BALLOONTIMEOUT => TrayEvent::NoteGone,
         _ => TrayEvent::Other,
     }
 }

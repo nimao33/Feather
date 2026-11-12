@@ -9,3 +9,5 @@ pub mod share;
 pub mod text;
 #[cfg(windows)]
 pub mod ui;
+#[cfg(windows)]
+pub mod update;

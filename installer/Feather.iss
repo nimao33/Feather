@@ -1,5 +1,5 @@
 #define MyAppName "Feather"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.1.0"
 #define MyAppPublisher "Feather"
 #define MyAppURL "https://github.com/feather/feather"
 #define MyAppExeName "feather.exe"
@@ -17,7 +17,7 @@ DisableDirPage=yes
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 OutputDir=..\target\installer
-OutputBaseFilename=Feather-1.0.0
+OutputBaseFilename=Feather-1.1.0
 SetupIconFile=..\crates\feather-app\resources\feather.ico
 Compression=lzma
 SolidCompression=yes
