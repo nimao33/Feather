@@ -1674,7 +1674,8 @@ mod dialog {
     const TUNNEL_SETUP: Id = "tunnel_setup";
     const TUNNEL_DOMAIN: Id = "tunnel_domain";
     const FIREWALL: Id = "firewall";
-    const SHARE_QR: Id = "share_qr";
+    const SHARE_WEB: Id = "share_web";
+    const SHARE_LAN: Id = "share_lan";
     const TUNNEL_SECTION: Id = "tunnel_section";
     const PORTS_SECTION: Id = "ports_section";
     const DESKTOP: Id = "desktop_shortcut";
@@ -2148,12 +2149,20 @@ mod dialog {
         form.page("Sharing", PageIcon::Sharing);
         // What sharing is doing comes first; the settings follow. Rows carry
         // labels only, and their help shows on hover.
-        form.action(SHARE_STATUS, "Status", None, "Copy address");
-        form.qr(SHARE_QR, "Open on your phone", "Show QR code", "");
-        form.tip(
-            SHARE_QR,
-            "Scan it with the phone's camera. The phone warns about Feather's own \
-             certificate the first time: choose Advanced, then continue.",
+        form.status(SHARE_STATUS, "Sharing is off", GRAY);
+        form.address(
+            SHARE_WEB,
+            "Internet",
+            '\u{e774}',
+            "Works from anywhere. The link changes each time the tunnel starts, \
+             unless you set a fixed ngrok address under Internet tunnel.",
+        );
+        form.address(
+            SHARE_LAN,
+            "This network",
+            '\u{e701}',
+            "Phones and PCs on the same Wi-Fi. The first time, the browser warns \
+             about Feather's own certificate: choose Advanced, then continue.",
         );
 
         form.heading("Who can connect");
@@ -2338,11 +2347,16 @@ mod dialog {
         /// The background picture chosen so far.
         picture: String,
         /// The sharing address the Copy button copies.
-        address: Option<String>,
+        /// The addresses shown, for their copy buttons.
+        web: Option<String>,
+        lan: Option<String>,
+        /// The address row whose copy button shows a check, and since when.
+        copied: Option<(Id, std::time::Instant)>,
         apply_sharing: Option<ApplySharing>,
         sharing_status: Option<SharingStatus>,
         /// The status lines last shown.
         shown_status: Vec<String>,
+        shown_reach: usize,
     }
 
     impl SettingsDialog {
@@ -2692,21 +2706,18 @@ mod dialog {
                     form.set_detail(TUNNEL_SETUP, &note);
                     return;
                 }
-                SHARE_STATUS => {
-                    match &self.address {
-                        Some(address) => {
-                            let copied =
-                                crate::ui::context_menu::copy_text(std::ptr::null_mut(), address);
-                            let note = match copied {
-                                Ok(()) => format!("Copied {address}"),
-                                Err(error) => format!("Couldn't copy: {error}"),
-                            };
-                            form.set_detail(SHARE_STATUS, &note);
+                SHARE_WEB | SHARE_LAN => {
+                    let address = if id == SHARE_WEB {
+                        &self.web
+                    } else {
+                        &self.lan
+                    };
+                    if let Some(address) = address {
+                        if crate::ui::context_menu::copy_text(std::ptr::null_mut(), address).is_ok()
+                        {
+                            form.set_copied(id, true);
+                            self.copied = Some((id, std::time::Instant::now()));
                         }
-                        None => form.set_detail(
-                            SHARE_STATUS,
-                            "There's no address yet. Save with sharing on first.",
-                        ),
                     }
                     return;
                 }
@@ -2765,17 +2776,29 @@ mod dialog {
         /// Keeps Status current while Settings is open, so a tunnel's
         /// address appears as soon as it is known.
         fn on_tick(&mut self, form: &mut Form) -> bool {
-            let Some(status) = &mut self.sharing_status else {
-                return false;
-            };
-            let (lines, address) = status();
-            if lines == self.shown_status {
-                return false;
+            let mut changed = false;
+            if let Some((id, since)) = self.copied {
+                if since.elapsed() >= std::time::Duration::from_millis(1400) {
+                    form.set_copied(id, false);
+                    self.copied = None;
+                    changed = true;
+                }
             }
-            form.set_detail(SHARE_STATUS, &lines.join("\n"));
-            form.set_qr(SHARE_QR, address.as_deref().unwrap_or(""));
+            let Some(status) = &mut self.sharing_status else {
+                return changed;
+            };
+            let (lines, _) = status();
+            let reach = form.selected(SHARE_ACCESS);
+            if lines == self.shown_status && reach == self.shown_reach {
+                return changed;
+            }
+            let password =
+                !self.initial.share_password.is_empty() || !form.text(SHARE_PASSWORD).is_empty();
+            let (web, lan) = show_sharing(form, &lines, password);
             self.shown_status = lines;
-            self.address = address;
+            self.shown_reach = reach;
+            self.web = web;
+            self.lan = lan;
             true
         }
 
@@ -2802,18 +2825,114 @@ mod dialog {
         }
     }
 
+    const GRAY: u32 = 0x8a8178;
+    const GREEN: u32 = 0x7cc47f;
+    const AMBER: u32 = 0xf2a33a;
+
+    /// The internet and local network addresses among sharing's lines
+    /// ("Open <address>"), and the other lines that report a problem.
+    fn sharing_parts(lines: &[String]) -> (Option<String>, Option<String>, Vec<String>) {
+        let mut web = None;
+        let mut lan = None;
+        let mut problems = Vec::new();
+        for line in lines {
+            match line.strip_prefix("Open ") {
+                Some(address) if address.contains("localhost") || address.contains("127.0.0.1") => {
+                }
+                Some(address) if is_private(address) => {
+                    lan.get_or_insert_with(|| address.to_string());
+                }
+                Some(address) => {
+                    web.get_or_insert_with(|| address.to_string());
+                }
+                None if line.starts_with("Browsers warn") => {}
+                None if line.starts_with("There's no password") => {}
+                None => problems.push(line.clone()),
+            }
+        }
+        (web, lan, problems)
+    }
+
+    fn is_private(address: &str) -> bool {
+        let host = address
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .split([':', '/'])
+            .next()
+            .unwrap_or("");
+        let parts: Vec<u8> = host
+            .split('.')
+            .filter_map(|part| part.parse().ok())
+            .collect();
+        match parts.as_slice() {
+            [10, ..] | [192, 168, ..] => true,
+            [172, second, ..] => (16..=31).contains(second),
+            [169, 254, ..] => true,
+            _ => false,
+        }
+    }
+
+    /// Fills the status line and the address rows for what sharing is
+    /// doing and what is chosen.
+    fn show_sharing(
+        form: &mut Form,
+        lines: &[String],
+        password: bool,
+    ) -> (Option<String>, Option<String>) {
+        let (web, lan, problems) = sharing_parts(lines);
+        let reach = form.selected(SHARE_ACCESS);
+        let on = !lines.is_empty();
+        let lock = if password {
+            "People sign in with a password."
+        } else {
+            "No password: anyone with a link gets in."
+        };
+        let (title, detail, dot) = if !on {
+            (
+                "Sharing is off",
+                "Choose what people can do below, then save.".to_string(),
+                GRAY,
+            )
+        } else if reach == 0 {
+            (
+                "Only this PC",
+                "Choose Local network or Internet to open it on other devices.".to_string(),
+                GRAY,
+            )
+        } else if reach == 2 && web.is_none() {
+            (
+                "Getting an internet link…",
+                "This takes a few seconds.".to_string(),
+                AMBER,
+            )
+        } else if reach == 2 {
+            ("Sharing on the internet", lock.to_string(), GREEN)
+        } else {
+            ("Sharing on your network", lock.to_string(), GREEN)
+        };
+        let detail = match problems.first() {
+            Some(problem) => format!("{detail} {problem}"),
+            None => detail,
+        };
+        form.set_status(SHARE_STATUS, title, &detail, dot);
+        form.set_hidden(SHARE_WEB, !(on && reach == 2));
+        form.set_hidden(SHARE_LAN, !(on && reach >= 1));
+        form.set_address(SHARE_WEB, web.as_deref().unwrap_or(""), "Getting a link…");
+        form.set_address(
+            SHARE_LAN,
+            lan.as_deref().unwrap_or(""),
+            "No network address. Is Wi-Fi or Ethernet connected?",
+        );
+        (web, lan)
+    }
+
     fn open(parent: HWND, initial: Settings, look: Look, live: Live) -> Result<FormWindow, String> {
         let drives = drive_choices(&initial.index_roots);
         let mut form = build(&initial, &drives, live.items);
         form.set_detail(PICTURE, &picture_detail(&initial.background_image));
         let initial_picture = initial.background_image.clone();
-        let status = if live.sharing.is_empty() {
-            "Off. Add a folder and choose what people can do below.".to_string()
-        } else {
-            live.sharing.join("\n")
-        };
-        form.set_detail(SHARE_STATUS, &status);
-        form.set_qr(SHARE_QR, live.address.as_deref().unwrap_or(""));
+        let password = !initial.share_password.is_empty();
+        let (web, lan) = show_sharing(&mut form, &live.sharing, password);
         let dialog = SettingsDialog {
             initial,
             drives,
@@ -2821,10 +2940,13 @@ mod dialog {
             preview: live.preview,
             reindex: live.reindex,
             picture: initial_picture,
-            address: live.address,
+            web,
+            lan,
+            copied: None,
             apply_sharing: live.apply_sharing,
             sharing_status: live.sharing_status,
             shown_status: live.sharing.clone(),
+            shown_reach: usize::MAX,
         };
         FormWindow::open(parent, "Settings", 860, 680, look, form, Box::new(dialog))
     }
@@ -2921,7 +3043,7 @@ mod dialog {
         window.set_page(PAGE_SHARING);
         window.open_color(TUNNEL_SECTION);
         if qr {
-            window.open_color(SHARE_QR);
+            window.open_color(SHARE_LAN);
         } else {
             window.show_tip(SHARE_ACCESS);
         }

@@ -4998,7 +4998,11 @@ pub fn run_scenarios(index: Arc<IndexSet>, screenshots: &Path) -> Result<(), Str
         ("37-settings-sharing-qr", true, 0.0),
     ] {
         let path = screenshots.join(format!("{name}.png"));
-        settings::capture_sharing_open(hwnd, Settings::default(), look, &path, qr, scroll)?;
+        let network = Settings {
+            share_access: crate::settings::ShareAccess::Network,
+            ..Settings::default()
+        };
+        settings::capture_sharing_open(hwnd, network, look, &path, qr, scroll)?;
         report.push_str(&format!("{name}: screenshot={}\n", path.display()));
     }
     let path = screenshots.join("34-settings-color-picker.png");
@@ -5020,6 +5024,7 @@ pub fn run_scenarios(index: Arc<IndexSet>, screenshots: &Path) -> Result<(), Str
         let mut sample = Settings {
             results_percent: 35,
             custom_theme: true,
+            share_access: crate::settings::ShareAccess::Network,
             ..Settings::default()
         };
         sample.sidebar_tabs[1].1 = false;

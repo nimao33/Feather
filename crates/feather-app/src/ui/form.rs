@@ -231,6 +231,17 @@ enum Kind {
         modules: Vec<bool>,
         caption: String,
         open: bool,
+        /// An address row: this icon before the label, the address in a
+        /// box, and icon buttons (info, copy, QR) instead of a caption.
+        icon: Option<char>,
+        /// Shown in the box and the QR popup while there is no address.
+        waiting: String,
+        /// The copy button shows a check for a moment.
+        copied: bool,
+    },
+    /// A one-line state with a colored dot before it.
+    Status {
+        dot: u32,
     },
     /// A row that shows or hides the `count` rows after it.
     Expander {
@@ -275,6 +286,8 @@ struct Widget {
     when: Option<(Id, usize)>,
     /// Help shown when the pointer rests on the label.
     tip: Option<String>,
+    /// Left out, from code: an address row with nothing to show.
+    hidden: bool,
 }
 
 struct FooterButton {
@@ -321,7 +334,70 @@ impl Form {
             kind,
             when: None,
             tip: None,
+            hidden: false,
         });
+    }
+
+    /// Leaves row `id` out, or brings it back.
+    pub fn set_hidden(&mut self, id: Id, hidden: bool) {
+        if let Some(widget) = self.widget_mut(id) {
+            widget.hidden = hidden;
+        }
+    }
+
+    /// An address people can open: icon, label, the address, and info,
+    /// copy and QR buttons. Copy calls [`FormDialog::on_action`]; the QR
+    /// button opens a popup with the code. `tip` shows on the info button.
+    pub fn address(&mut self, id: Id, label: &str, icon: char, tip: &str) {
+        self.push(
+            id,
+            label,
+            None,
+            Kind::Qr {
+                text: String::new(),
+                size: 0,
+                modules: Vec::new(),
+                caption: String::new(),
+                open: false,
+                icon: Some(icon),
+                waiting: String::new(),
+                copied: false,
+            },
+        );
+        self.tip(id, tip);
+    }
+
+    /// The address shown in row `id`, or `waiting` while there is none.
+    pub fn set_address(&mut self, id: Id, url: &str, waiting: &str) {
+        if let Some(Kind::Qr { waiting: shown, .. }) =
+            self.widget_mut(id).map(|widget| &mut widget.kind)
+        {
+            *shown = waiting.to_string();
+        }
+        self.set_qr(id, url);
+    }
+
+    /// Shows a check on row `id`'s copy button, or the copy icon again.
+    pub fn set_copied(&mut self, id: Id, copied: bool) {
+        if let Some(Kind::Qr { copied: shown, .. }) =
+            self.widget_mut(id).map(|widget| &mut widget.kind)
+        {
+            *shown = copied;
+        }
+    }
+
+    /// A state line with a colored dot, the label in bold and the detail
+    /// under it.
+    pub fn status(&mut self, id: Id, label: &str, dot: u32) {
+        self.push(id, label, None, Kind::Status { dot });
+    }
+
+    pub fn set_status(&mut self, id: Id, label: &str, detail: &str, dot: u32) {
+        if let Some(widget) = self.widget_mut(id) {
+            widget.label = label.to_string();
+            widget.detail = (!detail.is_empty()).then(|| detail.to_string());
+            widget.kind = Kind::Status { dot };
+        }
     }
 
     /// Shows `id` only while the segmented control `control` has `option`
@@ -362,23 +438,6 @@ impl Form {
         {
             field.set_secret(true);
         }
-    }
-
-    /// A row with a button that shows a QR code of `text` in a popup.
-    pub fn qr(&mut self, id: Id, label: &str, caption: &str, text: &str) {
-        self.push(
-            id,
-            label,
-            None,
-            Kind::Qr {
-                text: String::new(),
-                size: 0,
-                modules: Vec::new(),
-                caption: caption.to_string(),
-                open: false,
-            },
-        );
-        self.set_qr(id, text);
     }
 
     pub fn set_qr(&mut self, id: Id, value: &str) {
@@ -1048,6 +1107,7 @@ fn arrange(form: &Form, gfx: &Gfx, width: f32, height: f32, scroll: f32) -> Arra
     for (index, widget) in form.widgets.iter().enumerate() {
         let mut out = WidgetBox::default();
         let hidden = (paged && widget.page != form.page)
+            || widget.hidden
             || index < folded_until
             || widget
                 .when
@@ -1202,6 +1262,47 @@ fn arrange(form: &Form, gfx: &Gfx, width: f32, height: f32, scroll: f32) -> Arra
                     Rect::new(x1 - control_w, control_t + 18.0, x1, control_t + SLIDER_H),
                     Part::Slider(index),
                 ));
+            }
+            Kind::Status { .. } => {
+                let (label, detail, block) = label_block(gfx, widget, x0 + 18.0, 0.0, inner - 18.0);
+                height = block + ROW_Y * 2.0;
+                let top = y + ROW_Y;
+                out.label = shift(label, top);
+                out.detail = detail.map(|rect| shift(rect, top));
+            }
+            Kind::Qr {
+                open,
+                icon: Some(_),
+                ..
+            } => {
+                // icon · label · [address box] · info · copy · QR
+                let size = BUTTON_H;
+                let gap = 6.0;
+                let qr = Rect::new(x1 - size, 0.0, x1, size);
+                let copy = Rect::new(qr.l - gap - size, 0.0, qr.l - gap, size);
+                let info = Rect::new(copy.l - gap - size, 0.0, copy.l - gap, size);
+                height = size + ROW_Y * 2.0;
+                let top = y + ROW_Y;
+                let at = |rect: Rect| shift(rect, top);
+                let label_w = 112.0;
+                out.label = Rect::new(x0 + 26.0, top, x0 + 26.0 + label_w, top + size);
+                out.items = vec![
+                    Rect::new(x0, top, x0 + 20.0, top + size),
+                    Rect::new(
+                        x0 + 26.0 + label_w + 8.0,
+                        top + 2.0,
+                        info.l - 10.0,
+                        top + size - 2.0,
+                    ),
+                    at(info),
+                    at(copy),
+                ];
+                out.control = at(qr);
+                parts.push((at(copy), Part::Action(index)));
+                parts.push((at(qr), Part::Color(index)));
+                if *open {
+                    popup_anchor = Some((index, out.control));
+                }
             }
             Kind::Qr { caption, open, .. } => {
                 let button_w = button_width(gfx, caption);
@@ -1365,7 +1466,11 @@ fn arrange(form: &Form, gfx: &Gfx, width: f32, height: f32, scroll: f32) -> Arra
             }
         }
         y = row_top + height;
-        if widget.tip.is_some() && !out.label.is_empty() {
+        if let (Some(_), Kind::Qr { icon: Some(_), .. }) = (&widget.tip, &widget.kind) {
+            if let Some(&info) = out.items.get(2) {
+                tips.push((info, index));
+            }
+        } else if widget.tip.is_some() && !out.label.is_empty() {
             let label = out.label;
             let text_w = gfx.measure_width(&widget.label, Font::Body).ceil();
             tips.push((
@@ -1429,7 +1534,13 @@ fn arrange(form: &Form, gfx: &Gfx, width: f32, height: f32, scroll: f32) -> Arra
                 panel.b - 12.0,
             );
             if let Some(widget_box) = boxes.get_mut(index) {
-                widget_box.items = vec![code, caption];
+                // After an address row's own items: the popup's are the
+                // last two.
+                if matches!(form.widgets[index].kind, Kind::Qr { icon: Some(_), .. }) {
+                    widget_box.items.extend([code, caption]);
+                } else {
+                    widget_box.items = vec![code, caption];
+                }
             }
             parts.insert(0, (panel, Part::Popup));
             return panel;
@@ -3454,7 +3565,12 @@ impl View<'_> {
                     Kind::Color {
                         rgb, model, values, ..
                     } => self.paint_picker(p, index, *rgb, *model, *values, b),
-                    Kind::Qr { size, modules, .. } => self.paint_qr(p, *size, modules, b),
+                    Kind::Qr {
+                        size,
+                        modules,
+                        waiting,
+                        ..
+                    } => self.paint_qr(p, *size, modules, waiting, b),
                     _ => {}
                 }
                 // Again over the content, so the border runs all the way
@@ -4043,18 +4159,45 @@ impl View<'_> {
 
     /// The QR popup's code, dark on white whatever the theme so cameras
     /// read it, and the line under it.
-    fn paint_qr(&self, p: &Painter, size: usize, modules: &[bool], b: &WidgetBox) {
-        let (Some(&code), Some(&caption)) = (b.items.first(), b.items.get(1)) else {
+    fn paint_qr(&self, p: &Painter, size: usize, modules: &[bool], waiting: &str, b: &WidgetBox) {
+        let n = b.items.len();
+        let (Some(&code), Some(&caption)) = (
+            n.checked_sub(2).and_then(|at| b.items.get(at)),
+            b.items.last(),
+        ) else {
             return;
         };
         let rect = self.at(code);
         let caption = self.at(caption);
         if size == 0 {
-            p.fill_round(rect, 10.0, self.pal.text.fade(0.05));
+            // Not a blank white square: an outlined place with what to
+            // expect, like the internet link still being set up.
+            p.stroke_round(rect.inset(1.0, 1.0), 10.0, self.pal.text2.fade(0.5), 1.5);
+            let text = if waiting.is_empty() {
+                "No address yet. Turn sharing on and save first."
+            } else {
+                waiting
+            };
             p.text(
-                "No address yet. Save with sharing on first.",
+                "\u{ed14}",
+                Font::Icon,
+                Rect::new(
+                    rect.l,
+                    rect.t + rect.height() / 2.0 - 40.0,
+                    rect.r,
+                    rect.t + rect.height() / 2.0 - 12.0,
+                ),
+                self.pal.text2,
+            );
+            p.text(
+                text,
                 Font::SmallWrap,
-                rect.inset(20.0, 0.0),
+                Rect::new(
+                    rect.l + 20.0,
+                    rect.t + rect.height() / 2.0,
+                    rect.r - 20.0,
+                    rect.b - 16.0,
+                ),
                 self.pal.text2,
             );
             return;
@@ -4393,6 +4536,67 @@ impl View<'_> {
                 if self.focused(part) {
                     self.ring(p, self.at(b.control), 8.0);
                 }
+            }
+            Kind::Status { dot } => {
+                let label = self.at(b.label);
+                let mid = label.t + 10.0;
+                p.fill_round(
+                    Rect::new(label.l - 16.0, mid - 4.0, label.l - 8.0, mid + 4.0),
+                    4.0,
+                    Color::hex(*dot),
+                );
+                p.text(&widget.label, Font::BodyBold, label, pal.text);
+                if let (Some(detail), Some(rect)) = (&widget.detail, b.detail) {
+                    p.text(detail, Font::SmallWrap, self.at(rect), pal.text2);
+                }
+            }
+            Kind::Qr {
+                icon: Some(icon),
+                text,
+                waiting,
+                copied,
+                ..
+            } => {
+                let (Some(&mark), Some(&field), Some(&info), Some(&copy)) = (
+                    b.items.first(),
+                    b.items.get(1),
+                    b.items.get(2),
+                    b.items.get(3),
+                ) else {
+                    return;
+                };
+                p.text(&icon.to_string(), Font::Icon, self.at(mark), pal.text2);
+                p.text(&widget.label, Font::Body, self.at(b.label), pal.text);
+                let field = self.at(field);
+                p.fill_round(field, 8.0, pal.text.fade(0.05));
+                let (shown, ink) = if text.is_empty() {
+                    (waiting.as_str(), pal.text2)
+                } else {
+                    (text.strip_prefix("https://").unwrap_or(text), pal.text)
+                };
+                p.text(shown, Font::Small, field.inset(10.0, 0.0), ink);
+                // Icon buttons: info (hover only), copy, QR.
+                let square = |part: Option<Part>, rect: Rect, glyph: &str| {
+                    let rect = self.at(rect);
+                    let level = part.map_or(0.0, |part| self.level(part));
+                    if level > 0.0 {
+                        p.fill_round(rect, 8.0, pal.hover.alpha(pal.hover.a * level));
+                    }
+                    p.stroke_round(rect, 8.0, pal.line, 1.0);
+                    p.text(glyph, Font::Icon, rect, pal.text);
+                    if part.is_some_and(|part| self.focused(part)) {
+                        self.ring(p, rect, 8.0);
+                    }
+                };
+                if widget.tip.is_some() {
+                    square(None, info, "\u{e946}");
+                }
+                square(
+                    Some(Part::Action(index)),
+                    copy,
+                    if *copied { "\u{e73e}" } else { "\u{e8c8}" },
+                );
+                square(Some(Part::Color(index)), b.control, "\u{ed14}");
             }
             Kind::Qr { caption, .. } => {
                 self.paint_label(p, widget, b);
