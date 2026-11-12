@@ -1337,6 +1337,20 @@ mod tests {
     }
 
     #[test]
+    fn size_filters_match_folders_by_their_totals() {
+        // A folder's size field holds the total below it, so it is matched
+        // like a file of that size (as Everything does); type:file keeps a
+        // size filter to files.
+        let big = Query::parse("size:>1gb");
+        assert!(big.matches_name("photos", 5 << 30, 1));
+        assert!(!big.matches_name("empty", 0, 1));
+        assert!(big.matches_name("movie.mkv", 2 << 30, 0));
+        let files = Query::parse("type:file size:>1gb");
+        assert!(!files.matches_name("photos", 5 << 30, 1));
+        assert!(files.matches_name("movie.mkv", 2 << 30, 0));
+    }
+
+    #[test]
     fn combines_multiple_size_tokens() {
         let query = Query::parse("size:>=1kb size:<=2kb");
         assert_eq!(query.min_size, Some(1024));

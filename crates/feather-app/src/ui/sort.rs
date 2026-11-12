@@ -69,6 +69,21 @@ mod tests {
     }
 
     #[test]
+    fn folders_sort_by_their_totals_among_files() {
+        // A folder's size is the total below it, so it sorts like a file
+        // of that size.
+        let mut rows = [
+            entry("small.txt", false, 10, 0),
+            entry("photos", true, 5_000_000, 0),
+            entry("movie.mkv", false, 2_000_000, 0),
+            entry("empty", true, 0, 0),
+        ];
+        rows.sort_by(|a, b| compare_entries(b, a, COLUMN_SIZE));
+        let names: Vec<&str> = rows.iter().map(|row| row.name_search).collect();
+        assert_eq!(names, ["photos", "movie.mkv", "small.txt", "empty"]);
+    }
+
+    #[test]
     fn compares_types_then_names() {
         let a = entry("beta.pdf", false, 0, 0);
         let b = entry("alpha.txt", false, 0, 0);

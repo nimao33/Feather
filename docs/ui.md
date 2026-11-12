@@ -27,6 +27,7 @@ animations.
 | `ui/model.rs` | Testable GUI state: rows, generation, counts, warnings, searching/done/started flags. No Win32. |
 | `ui/picker.rs` | Modern `IFileOpenDialog` folder picker with `FOS_PICKFOLDERS`. |
 | `ui/context_menu.rs` | Explorer `IContextMenu`/`IContextMenu2`/`IContextMenu3` host, the native fallback menu, and clipboard, open, and reveal helpers. |
+| `ui/fileops.rs` | Rename, Recycle Bin and permanent delete, and paste through `IFileOperation`; files on the clipboard as `CF_HDROP` + `Preferred DropEffect`; new-name checks. |
 | `ui/sort.rs` | Pure column comparators, unit-tested without a window. |
 | `ui/text.rs` | Pure path, size, and type formatting, unit-tested without a window. |
 | `ui/screenshot.rs` | The PNG writer. |
@@ -276,7 +277,11 @@ never) sets the least time between automatic rebuilds in `Ui::maybe_refresh`;
 and fold buttons slide down into the space the status text leaves.
 
 Appearance has "Show file sizes in" (`size_format`: Auto, KB, MB, GB), used by
-`text::size_in` for the Size column and the details pane. The toolbar's panel
+`text::size_in` for the Size column and the details pane. Folders show the
+total size of everything below them there, and the details pane adds
+"Contains: 1,204 items"; both come from the index (see "Folder totals" in
+`index-format.md`). Folders from an index written before folder totals show
+no size or count until that index is rebuilt. The toolbar's panel
 button (`Button::Details`) slides the details pane out and back
 (`Chrome::details_w`, saved as `details_pane`).
 
@@ -491,7 +496,8 @@ Clicking a header sends `LVN_COLUMNCLICK`. The first click sorts ascending;
 clicking the same header again toggles descending.
 
 - Name, size, modified, and type compare index records directly through
-  `ui/sort.rs`.
+  `ui/sort.rs`. A folder's size is its total, so sorting by Size puts big
+  folders among big files.
 - Path resolves each loaded row to its containing folder and sorts a transient
   key vector. The table shows the folder in the Path column and the file name
   in the Name column, like Everything.
@@ -510,8 +516,13 @@ clicking the same header again toggles descending.
 | the global shortcut (`Ctrl+Space` by default) | from any app, show Feather with the search text selected; pressed while Feather is in front, hide it |
 | `Ctrl+F` | select the search text |
 | `Left`/`Right`/`Home`/`End`, with `Shift` or `Ctrl` | move the caret, extend the selection, jump by word |
-| `Ctrl+A`/`C`/`X`/`V`, `Ctrl+Backspace` | edit the search text; `Ctrl+C` with no text selected copies the selected result's path |
-| `Up`/`Down`/`PageUp`/`PageDown`, `Ctrl+Home`/`Ctrl+End` | move the result selection |
+| `Ctrl+A`/`C`/`X`/`V`, `Ctrl+Backspace` | edit the search text while it has the keys (see below) |
+| `Up`/`Down`/`PageUp`/`PageDown`, `Ctrl+Home`/`Ctrl+End` | move the result selection, and give the results the keys |
+| `F2` | rename the selected result in place: the name without its extension is selected, `Enter` (or clicking elsewhere) renames, `Esc` keeps the old name |
+| `Delete` (results have the keys) | move the selected result to the Recycle Bin, asking first only if Explorer's delete confirmation is on |
+| `Shift+Delete` (results have the keys) | delete the selected result permanently, after a Yes/No question |
+| `Ctrl+C` / `Ctrl+X` (results have the keys, or no search text selected) | put the selected result on the clipboard as a file (`CF_HDROP` + `Preferred DropEffect`, plus the path as text), so pasting in Explorer copies or moves it |
+| `Ctrl+V` (results have the keys, files on the clipboard) | paste the files into the selected folder, or the selected file's folder, through `IFileOperation` with Windows' progress and conflict dialogs |
 | `Enter` or double-click a row | open the item, or show a file in its folder when Settings says so |
 | `Ctrl+Enter` | show the selected item in its folder |
 | right-click a row, `Shift+F10`, or the menu key | the Windows context menu |
@@ -520,6 +531,14 @@ clicking the same header again toggles descending.
 | arrow keys, `Space` in a dialog | change a choice, flip a switch or check box |
 | `Enter` in a dialog | run the primary button, including validation |
 | `Esc` in a dialog | cancel without applying |
+
+The results "have the keys" after a click on a result or a move through the
+list with the arrow keys; typing, `Left`/`Right`/`Home`/`End`/`Backspace`,
+clicking the search box, or `Esc` give them back to the search text, and the
+search caret hides while the results have them. Rename, delete, and paste go
+through the shell (`ui/fileops.rs`), so Explorer's undo, Recycle Bin, and
+elevation prompts apply; afterwards the affected index roots are read again
+at once instead of waiting for the change watcher.
 
 The accelerators live in a single `CreateAcceleratorTableW` table. Both message
 loops call `TranslateAcceleratorW` before `TranslateMessage`. Dialogs use their
@@ -542,6 +561,7 @@ window.
 | `03-no-results` | `zzzzzz-no-such-file` | zero rows |
 | `04-sorted` | `ext:pdf`, Size descending | rows exist, leading sizes are descending |
 | `05-path` | `type:folder`, Path ascending | rows exist, leading folders are ascending |
+| `38-folder-sizes` | `type:folder`, Size descending, first row selected | folders carry totals in descending order, the Size cell is filled, the details pane has an item count |
 | `06-filters` | dialog | Filters window renders |
 | `07-filtered` | `file`, filter Files + `pdf` | every leading row ends in `.pdf`; the typed `file` is drawn brighter than the rest of each name |
 | `08-settings` | dialog | Settings window renders |

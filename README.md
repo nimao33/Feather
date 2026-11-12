@@ -149,7 +149,7 @@ More detail and the method are in [docs/benchmarks.md](docs/benchmarks.md).
 | `C:\Users\` | list a folder, like an address bar |
 | `ext:pdf;docx` | either extension |
 | `type:folder` / `type:file` | folders or files only |
-| `size:>10mb`, `size:1kb..2kb` | by size |
+| `size:>10mb`, `size:1kb..2kb` | by size; folders match by the total size of everything in them |
 | `match:starts report`, `match:ends .pdf` | where words must appear in the name |
 | `dm:today`, `dm:yesterday`, `dm:thisweek`, `dm:lastmonth`, `dm:thisyear` | modified in that period (`this`/`last` + `week`, `month`, `year`) |
 | `dm:last7days`, `dm:30days`, `dm:24hours`, `dm:2weeks` | modified recently; days count today as the first |

@@ -10,6 +10,13 @@ pub const SLOT_SIZE: usize = 4096;
 pub const META_SIZE: usize = 48;
 pub const FRN_SIZE: usize = 12;
 pub const CHECK_STRIDE: usize = 256;
+/// Bytes per entry in the `.count` table.
+pub const COUNT_SIZE: usize = 4;
+
+/// Manifest feature bit: folder `size` fields hold the total of everything
+/// below them, and a `.count` table holds each folder's item count. Older
+/// indexes leave the feature word zero; older readers ignore it.
+pub const FEATURE_FOLDER_TOTALS: u32 = 1;
 
 #[derive(Clone, Debug)]
 pub struct Manifest {
@@ -21,6 +28,9 @@ pub struct Manifest {
     pub frn_len: u64,
     pub check_len: u64,
     pub seq: u64,
+    /// `FEATURE_*` bits. Stored in the slot's spare bytes 12..16, so format
+    /// version 1 readers that predate it still open the index.
+    pub features: u32,
 }
 
 impl Manifest {
@@ -44,6 +54,14 @@ impl Manifest {
         format!("base-{:016}.check", self.generation)
     }
 
+    pub fn count_name(&self) -> String {
+        format!("base-{:016}.count", self.generation)
+    }
+
+    pub fn has_folder_totals(&self) -> bool {
+        self.features & FEATURE_FOLDER_TOTALS != 0
+    }
+
     pub fn check_count(&self) -> usize {
         (self.entry_count as usize).div_ceil(CHECK_STRIDE)
     }
@@ -60,6 +78,7 @@ fn encode_slot(manifest: &Manifest, seq: u64) -> [u8; SLOT_SIZE] {
     let mut slot = [0u8; SLOT_SIZE];
     slot[0..8].copy_from_slice(&MAGIC);
     slot[8..12].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+    slot[12..16].copy_from_slice(&manifest.features.to_le_bytes());
     slot[16..24].copy_from_slice(&manifest.generation.to_le_bytes());
     slot[24..28].copy_from_slice(&manifest.entry_count.to_le_bytes());
     slot[32..40].copy_from_slice(&manifest.meta_len.to_le_bytes());
@@ -94,6 +113,7 @@ fn decode_slot(slot: &[u8]) -> Option<Manifest> {
         frn_len: u64::from_le_bytes(slot[56..64].try_into().ok()?),
         check_len: u64::from_le_bytes(slot[64..72].try_into().ok()?),
         seq: u64::from_le_bytes(slot[72..80].try_into().ok()?),
+        features: u32::from_le_bytes(slot[12..16].try_into().ok()?),
     })
 }
 

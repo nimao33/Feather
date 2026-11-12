@@ -42,6 +42,7 @@ fn scenarios_write_screenshots() {
         "09-help.png",
         "10-quick-filter.png",
         "11-scope.png",
+        "38-folder-sizes.png",
     ] {
         let path = screenshots.join(name);
         let metadata = std::fs::metadata(&path).expect("screenshot missing");
@@ -60,5 +61,6 @@ fn scenarios_write_screenshots() {
     assert!(report.contains("09-help: screenshot="));
     assert!(report.contains("10-quick-filter: rows="));
     assert!(report.contains("11-scope: rows="));
+    assert!(report.contains("38-folder-sizes: rows="));
     println!("screenshots: {}", screenshots.display());
 }

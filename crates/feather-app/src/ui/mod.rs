@@ -3,6 +3,7 @@ mod canvas;
 pub mod color_space;
 pub(crate) mod context_menu;
 mod eyedropper;
+mod fileops;
 pub(crate) mod form;
 mod frames;
 mod gfx;
@@ -55,7 +56,8 @@ use windows_sys::Win32::System::Time::FileTimeToSystemTime;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, IsWindowEnabled, ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE,
     TME_NONCLIENT, TRACKMOUSEEVENT, VK_APPS, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END,
-    VK_ESCAPE, VK_F10, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_UP,
+    VK_ESCAPE, VK_F10, VK_F2, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT,
+    VK_TAB, VK_UP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateAcceleratorTableW, CreateWindowExW, DefWindowProcW, DestroyAcceleratorTable,
@@ -86,7 +88,7 @@ use icons::IconCache;
 use indexer::{IndexEvent, Indexer};
 use layout::{Button, Layout, NavEntry, NavItem, NAV_H, ROW_H};
 use model::UiModel;
-use paint::{DetailsView, Frame, Hit, RowView, SearchView};
+use paint::{DetailsView, Frame, Hit, RenameView, RowView, SearchView};
 use textfield::TextField;
 use theme::Palette;
 
@@ -233,6 +235,27 @@ pub struct Ui {
     last_build: Option<Instant>,
     build_took: Duration,
     build_started: Instant,
+    /// Keys act on the selected result (Delete, Ctrl+C, Ctrl+V) instead of
+    /// the search text: set by clicking a result or moving through the list
+    /// with the arrow keys, cleared by typing or clicking the search box.
+    list_focus: bool,
+    /// The name being typed over a result to rename it (F2).
+    rename: Option<Rename>,
+    /// Places Feather changed itself (rename, delete, paste), read again
+    /// shortly after `refresh_at`.
+    refresh_roots: Vec<String>,
+    refresh_at: Option<Instant>,
+    /// A path to select once the next index is in, such as a renamed item.
+    reselect: Option<String>,
+}
+
+/// Renaming a result in place.
+struct Rename {
+    row: usize,
+    entry: EntryRef,
+    path: String,
+    field: TextField,
+    scroll: f32,
 }
 
 /// A freshly built index and its first search, waiting to be shown.
@@ -354,6 +377,11 @@ impl Ui {
             last_build: None,
             build_took: Duration::from_secs(3),
             build_started: Instant::now(),
+            list_focus: false,
+            rename: None,
+            refresh_roots: Vec::new(),
+            refresh_at: None,
+            reselect: None,
         };
         ui.refresh_theme(false);
         ui.rebuild_nav();
@@ -771,6 +799,30 @@ impl Ui {
         if self.indexer.is_some() || self.swap.is_some() || self.library.is_none() {
             return;
         }
+        // Feather changed files itself: read those places again right away
+        // rather than waiting for the watcher to settle.
+        if let Some(at) = self.refresh_at {
+            if at.elapsed() < Duration::from_millis(800) {
+                return;
+            }
+            self.refresh_at = None;
+            let mut roots = std::mem::take(&mut self.refresh_roots);
+            if let Some(watcher) = &self.watcher {
+                let all = indexer::outermost_roots(&self.settings.index_roots);
+                for index in watcher.changes.take_dirty() {
+                    if let Some(root) = all.get(index) {
+                        if !roots.contains(root) {
+                            roots.push(root.clone());
+                        }
+                    }
+                }
+            }
+            self.changes_since = None;
+            if !roots.is_empty() {
+                self.start_indexing_of(&roots);
+            }
+            return;
+        }
         let Some(watcher) = &self.watcher else {
             return;
         };
@@ -905,7 +957,10 @@ impl Ui {
             index: set,
             controller,
             model,
-            keep: self.selected.and_then(|row| self.path_of(row)),
+            keep: self
+                .reselect
+                .take()
+                .or_else(|| self.selected.and_then(|row| self.path_of(row))),
             scroll: self.scroll,
         });
         if failures.is_empty() {
@@ -1002,6 +1057,7 @@ impl Ui {
         self.controller = swap.controller;
         self.model = swap.model;
         self.epoch += 1;
+        self.rename = None;
         if self.sort_column != sort::COLUMN_NAME || !self.sort_ascending {
             self.apply_sort();
         }
@@ -1304,6 +1360,7 @@ impl Ui {
             KillTimer(self.hwnd, TIMER_DEBOUNCE);
         }
         self.epoch += 1;
+        self.rename = None;
         if self.narrow_search(text) {
             self.invalidate();
             return;
@@ -1520,7 +1577,12 @@ impl Ui {
             TIMER_CARET => {
                 if self.focused {
                     self.caret_on = !self.caret_on;
-                    self.invalidate_search();
+                    if self.rename.is_some() {
+                        // The caret blinks in the rename box over the list.
+                        self.invalidate();
+                    } else {
+                        self.invalidate_search();
+                    }
                 }
             }
             TIMER_RESULTS => {
@@ -1636,7 +1698,8 @@ impl Ui {
                     .unwrap_or_default(),
             ),
             2 => {
-                if entry.is_dir() {
+                // Folders show their total once the index has one.
+                if entry.is_dir() && !self.index.has_folder_totals(entry_ref) {
                     Some(String::new())
                 } else {
                     Some(size_in(entry.size, self.settings.size_format))
@@ -1741,16 +1804,354 @@ impl Ui {
         }
     }
 
+    // ----- File management ----------------------------------------------------
+
+    /// The selected result's path and whether it is a folder.
+    fn selected_item(&self) -> Option<(String, bool)> {
+        let row = self.selected?;
+        let entry_ref = self.model.ids.get(row)?;
+        let path = self.index.resolve_path(entry_ref)?;
+        Some((path, self.index.entry(entry_ref).is_dir()))
+    }
+
+    /// Reads the places holding `paths` again soon, so the results show
+    /// what Feather just changed. (Live updates will make this unneeded.)
+    fn refresh_soon(&mut self, paths: &[String]) {
+        let roots = indexer::outermost_roots(&self.settings.index_roots);
+        for path in paths {
+            for root in &roots {
+                if feather_core::path_within(path, root) && !self.refresh_roots.contains(root) {
+                    self.refresh_roots.push(root.clone());
+                }
+            }
+        }
+        if !self.refresh_roots.is_empty() {
+            self.refresh_at = Some(Instant::now());
+        }
+    }
+
+    /// Copy (or cut) the selected result to the clipboard as a file.
+    fn copy_selected(&mut self, cut: bool) {
+        let Some((path, _)) = self.selected_item() else {
+            return;
+        };
+        let name = path.rsplit('\\').next().unwrap_or(&path).to_string();
+        match fileops::set_clipboard_files(self.hwnd, std::slice::from_ref(&path), cut) {
+            Ok(()) if cut => self.set_notice(format!(
+                "Cut \u{201c}{name}\u{201d}. Paste it into a folder here or in Explorer."
+            )),
+            Ok(()) => self.set_notice(format!("Copied \u{201c}{name}\u{201d}")),
+            Err(error) => self.set_notice(format!("Could not copy: {error}")),
+        }
+    }
+
+    /// Pastes files from the clipboard into the selected folder, or into
+    /// the folder of the selected file. Windows shows the progress and asks
+    /// about conflicts.
+    fn paste_files(&mut self, files: fileops::ClipboardFiles) {
+        let Some((path, is_dir)) = self.selected_item() else {
+            self.set_notice("Select a folder to paste into.".into());
+            return;
+        };
+        let folder = fileops::paste_folder(&path, is_dir);
+        let result = fileops::Shell::new(self.hwnd).paste(&files.paths, &folder, files.cut);
+        match result {
+            Ok(fileops::Outcome::Done) => {
+                if files.cut {
+                    fileops::clear_clipboard(self.hwnd);
+                }
+                let count = files.paths.len();
+                let what = if count == 1 {
+                    "1 item".to_string()
+                } else {
+                    format!("{count} items")
+                };
+                let verb = if files.cut { "Moved" } else { "Pasted" };
+                self.set_notice(format!("{verb} {what} into {folder}"));
+                let mut changed = files.paths.clone();
+                changed.push(folder);
+                self.refresh_soon(&changed);
+            }
+            Ok(fileops::Outcome::Aborted) => {
+                let mut changed = files.paths.clone();
+                changed.push(folder);
+                self.refresh_soon(&changed);
+            }
+            Err(error) => self.set_notice(format!("Could not paste: {error}")),
+        }
+    }
+
+    /// Delete moves the selected result to the Recycle Bin; Shift+Delete
+    /// deletes it for good after asking.
+    fn delete_selected(&mut self, permanently: bool) {
+        let Some((path, _)) = self.selected_item() else {
+            return;
+        };
+        let paths = vec![path.clone()];
+        let shell = fileops::Shell::new(self.hwnd);
+        let result = if permanently {
+            if !fileops::confirm_permanent_delete(self.hwnd, &paths) {
+                return;
+            }
+            shell.delete_permanently(&paths)
+        } else {
+            shell.recycle(&paths)
+        };
+        let name = path.rsplit('\\').next().unwrap_or(&path).to_string();
+        match result {
+            Ok(fileops::Outcome::Done) => {
+                self.set_notice(if permanently {
+                    format!("Deleted \u{201c}{name}\u{201d}")
+                } else {
+                    format!("Moved \u{201c}{name}\u{201d} to the Recycle Bin")
+                });
+                self.refresh_soon(&paths);
+            }
+            Ok(fileops::Outcome::Aborted) => {}
+            Err(error) => self.set_notice(format!("Could not delete {name}: {error}")),
+        }
+    }
+
+    /// F2: type a new name over the result's name, with the part before
+    /// the extension selected.
+    fn begin_rename(&mut self, row: usize) {
+        let Some(entry_ref) = self.model.ids.get(row) else {
+            return;
+        };
+        let Some(path) = self.index.resolve_path(entry_ref) else {
+            return;
+        };
+        let entry = self.index.entry(entry_ref);
+        let mut field = TextField::default();
+        field.set_text(&String::from_utf16_lossy(entry.name_display));
+        field.move_to(0, false);
+        field.move_to(
+            fileops::rename_selection(entry.name_display, entry.is_dir()),
+            true,
+        );
+        self.select_row(row);
+        self.list_focus = true;
+        self.rename = Some(Rename {
+            row,
+            entry: entry_ref,
+            path,
+            field,
+            scroll: 0.0,
+        });
+        self.caret_on = true;
+        self.invalidate();
+    }
+
+    /// Renames the item to what was typed. A bad name keeps the box open
+    /// and says why; Windows asks if the name is taken.
+    fn commit_rename(&mut self) {
+        let Some(rename) = self.rename.take() else {
+            return;
+        };
+        self.invalidate();
+        let old_name = rename
+            .path
+            .rsplit('\\')
+            .next()
+            .unwrap_or(&rename.path)
+            .to_string();
+        let typed = rename.field.text();
+        if typed == old_name {
+            return;
+        }
+        let name = match fileops::validate_new_name(&typed) {
+            Ok(name) => name,
+            Err(message) => {
+                self.set_notice(message);
+                self.rename = Some(rename);
+                return;
+            }
+        };
+        if name == old_name {
+            return;
+        }
+        let result = fileops::Shell::new(self.hwnd).rename(&rename.path, &name);
+        match result {
+            Ok(fileops::Outcome::Done) => {
+                let new_path = format!("{}\\{name}", parent_path(&rename.path));
+                self.set_notice(format!("Renamed to \u{201c}{name}\u{201d}"));
+                self.reselect = Some(new_path.clone());
+                self.refresh_soon(&[rename.path, new_path]);
+            }
+            Ok(fileops::Outcome::Aborted) => {}
+            Err(error) => self.set_notice(format!("Could not rename {old_name}: {error}")),
+        }
+    }
+
+    fn on_rename_key(&mut self, key: u16, shift: bool, control: bool) -> bool {
+        match key {
+            VK_RETURN | VK_TAB => {
+                self.commit_rename();
+                return true;
+            }
+            VK_ESCAPE => {
+                self.rename = None;
+                self.invalidate();
+                return true;
+            }
+            // Moving to another result keeps the new name, then moves.
+            VK_UP | VK_DOWN | VK_PRIOR | VK_NEXT => {
+                self.commit_rename();
+                if self.rename.is_none() {
+                    return self.on_key(key);
+                }
+                return true;
+            }
+            _ => {}
+        }
+        let clipboard_text = if control && key == b'V' as u16 {
+            context_menu::paste_text(self.hwnd)
+        } else {
+            None
+        };
+        let hwnd = self.hwnd;
+        let Some(rename) = &mut self.rename else {
+            return false;
+        };
+        let field = &mut rename.field;
+        match key {
+            VK_LEFT => field.move_left(shift, control),
+            VK_RIGHT => field.move_right(shift, control),
+            VK_HOME => field.home(shift),
+            VK_END => field.end(shift),
+            VK_BACK => {
+                field.backspace(control);
+            }
+            VK_DELETE => {
+                field.delete(control);
+            }
+            _ if control && key == b'A' as u16 => field.select_all(),
+            _ if control && key == b'C' as u16 => {
+                if field.has_selection() {
+                    let _ = context_menu::copy_text(hwnd, &field.selected_text());
+                }
+            }
+            _ if control && key == b'X' as u16 => {
+                if field.has_selection() {
+                    let _ = context_menu::copy_text(hwnd, &field.selected_text());
+                    field.delete_selection();
+                }
+            }
+            _ if control && key == b'V' as u16 => {
+                if let Some(text) = clipboard_text {
+                    let clean: String = text
+                        .chars()
+                        .filter(|&c| !fileops::is_forbidden_char(c))
+                        .collect();
+                    field.insert(&clean);
+                }
+            }
+            // Other keys do nothing while a name is being typed.
+            _ => {}
+        }
+        self.caret_on = true;
+        self.invalidate();
+        true
+    }
+
+    /// The box the new name is typed in, on screen.
+    fn rename_rect(&self) -> Option<Rect> {
+        let rename = self.rename.as_ref()?;
+        let list = self.layout.list;
+        let top = list.t + (rename.row as f64 * f64::from(ROW_H) - self.scroll) as f32;
+        Some(Rect::new(
+            list.l + 52.0,
+            top + 3.0,
+            self.layout.name_col.r,
+            top + 29.0,
+        ))
+    }
+
+    fn rename_layout(&self) -> Option<windows::Win32::Graphics::DirectWrite::IDWriteTextLayout> {
+        let rename = self.rename.as_ref()?;
+        self.gfx
+            .layout(rename.field.wide(), Font::BodyBold, 100_000.0, 20.0)
+    }
+
+    fn rename_hit(&self, x: f32, y: f32) -> bool {
+        self.rename_rect().is_some_and(|rect| rect.contains(x, y))
+    }
+
+    fn on_rename_click(&mut self, x: f32, y: f32, shift: bool) {
+        let (Some(rect), Some(layout)) = (self.rename_rect(), self.rename_layout()) else {
+            return;
+        };
+        let Some(rename) = &mut self.rename else {
+            return;
+        };
+        let position =
+            paint::position_at(&layout, x - rect.l - 6.0 + rename.scroll, y - rect.t - 3.0);
+        rename.field.move_to(position, shift);
+        self.caret_on = true;
+        self.invalidate();
+    }
+
+    /// The rename box for this frame, scrolled to keep the caret in view.
+    /// Gone if the results changed under it.
+    fn rename_view(&mut self) -> Option<RenameView> {
+        let rename = self.rename.as_ref()?;
+        if self.model.ids.get(rename.row) != Some(rename.entry) {
+            self.rename = None;
+            return None;
+        }
+        let rect = self.rename_rect()?;
+        let layout = self.rename_layout();
+        let rename = self.rename.as_mut()?;
+        let (caret_x, end_x, selection) = match &layout {
+            Some(text) => {
+                let (start, end) = rename.field.selection();
+                (
+                    paint::caret_offset(text, rename.field.caret()),
+                    paint::caret_offset(text, rename.field.wide().len()),
+                    paint::selection_spans(text, start, end),
+                )
+            }
+            None => (0.0, 0.0, Vec::new()),
+        };
+        let width = rect.width() - 14.0;
+        if caret_x - rename.scroll > width {
+            rename.scroll = caret_x - width;
+        }
+        if caret_x < rename.scroll {
+            rename.scroll = caret_x;
+        }
+        rename.scroll = rename.scroll.min((end_x - width).max(0.0)).max(0.0);
+        Some(RenameView {
+            rect,
+            layout,
+            scroll: rename.scroll,
+            caret_x,
+            show_caret: self.caret_on,
+            selection,
+        })
+    }
+
     // ----- Commands -----------------------------------------------------------
 
     fn on_command(&mut self, wparam: WPARAM) -> bool {
         match win::loword(wparam) as usize {
             ID_FOCUS_SEARCH => {
+                // Ctrl+F gives the keys back to the search text; a name
+                // being typed is dropped, as Escape would.
+                self.rename = None;
+                self.list_focus = false;
                 self.field.select_all();
                 self.focus_search();
                 true
             }
+            ID_CLEAR_SEARCH if self.rename.is_some() => {
+                // Escape while renaming keeps the old name.
+                self.rename = None;
+                self.invalidate();
+                true
+            }
             ID_CLEAR_SEARCH => {
+                self.list_focus = false;
                 if self.field.is_empty() && self.summoned {
                     self.dismiss();
                 } else {
@@ -2293,8 +2694,18 @@ impl Ui {
         let hit = self.hit_at(x, y);
         self.pressed = hit;
         let shift = key_down(VK_SHIFT);
+        // Clicking anywhere but the name being typed keeps the new name,
+        // as in Explorer.
+        if self.rename.is_some() {
+            if self.rename_hit(x, y) {
+                self.on_rename_click(x, y, shift);
+                return;
+            }
+            self.commit_rename();
+        }
         match hit {
             Hit::Search => {
+                self.list_focus = false;
                 let position = self.search_position_at(x, y);
                 self.field.move_to(position, shift);
                 self.drag = Drag::Text;
@@ -2304,6 +2715,7 @@ impl Ui {
                 }
             }
             Hit::Row(row) => {
+                self.list_focus = true;
                 self.select_row(row);
             }
             Hit::ScrollThumb => {
@@ -2410,6 +2822,21 @@ impl Ui {
     fn on_key(&mut self, key: u16) -> bool {
         let shift = key_down(VK_SHIFT);
         let control = key_down(VK_CONTROL);
+        if self.rename.is_some() {
+            return self.on_rename_key(key, shift, control);
+        }
+        // Keys that move the caret or edit text belong to the search box,
+        // and keys that move through the results give the list the focus.
+        if matches!(key, VK_LEFT | VK_RIGHT | VK_BACK)
+            || (matches!(key, VK_HOME | VK_END) && !control)
+        {
+            self.list_focus = false;
+        }
+        if matches!(key, VK_UP | VK_DOWN | VK_PRIOR | VK_NEXT)
+            || (matches!(key, VK_HOME | VK_END) && control)
+        {
+            self.list_focus = true;
+        }
         let mut edited = false;
         match key {
             VK_LEFT => self.field.move_left(shift, control),
@@ -2419,7 +2846,15 @@ impl Ui {
             VK_HOME => self.field.home(shift),
             VK_END => self.field.end(shift),
             VK_BACK => edited = self.field.backspace(control),
+            VK_DELETE if self.list_focus && self.selected.is_some() => {
+                self.delete_selected(shift);
+            }
             VK_DELETE => edited = self.field.delete(control),
+            VK_F2 => {
+                if let Some(row) = self.selected {
+                    self.begin_rename(row);
+                }
+            }
             VK_UP => self.move_selection(-1),
             VK_DOWN => self.move_selection(1),
             VK_PRIOR => self.move_selection(-self.page_rows()),
@@ -2445,20 +2880,31 @@ impl Ui {
             }
             _ if control && key == b'A' as u16 => self.field.select_all(),
             _ if control && key == b'C' as u16 => {
-                if self.field.has_selection() {
+                if !self.list_focus && self.field.has_selection() {
                     let _ = context_menu::copy_text(self.hwnd, &self.field.selected_text());
-                } else if let Some(row) = self.selected {
-                    self.copy_row_path(row);
+                } else if self.selected.is_some() {
+                    // As files for Explorer, and as the path for text boxes.
+                    self.copy_selected(false);
                 }
             }
             _ if control && key == b'X' as u16 => {
-                if self.field.has_selection() {
+                if !self.list_focus && self.field.has_selection() {
                     let _ = context_menu::copy_text(self.hwnd, &self.field.selected_text());
                     edited = self.field.delete_selection();
+                } else if self.list_focus && self.selected.is_some() {
+                    self.copy_selected(true);
                 }
             }
             _ if control && key == b'V' as u16 => {
-                if let Some(text) = context_menu::paste_text(self.hwnd) {
+                let files = if self.list_focus {
+                    fileops::clipboard_files(self.hwnd)
+                } else {
+                    None
+                };
+                if let Some(files) = files {
+                    self.paste_files(files);
+                } else if let Some(text) = context_menu::paste_text(self.hwnd) {
+                    self.list_focus = false;
                     edited = self.field.insert(&text);
                 }
             }
@@ -2477,6 +2923,19 @@ impl Ui {
         if unit < 0x20 || unit == 0x7f {
             return;
         }
+        if let Some(rename) = &mut self.rename {
+            // Characters no name can hold are refused as they are typed.
+            let bad = char::from_u32(u32::from(unit)).is_some_and(fileops::is_forbidden_char);
+            if bad {
+                self.set_notice(fileops::FORBIDDEN_MESSAGE.into());
+            } else {
+                rename.field.insert_units(&[unit]);
+                self.caret_on = true;
+            }
+            self.invalidate();
+            return;
+        }
+        self.list_focus = false;
         self.field.insert_units(&[unit]);
         self.caret_on = true;
         self.on_search_changed();
@@ -2515,24 +2974,24 @@ impl Ui {
             });
         }
 
+        let rename = self.rename_view();
         let details = self.selected.and_then(|row| {
             let entry_ref = self.model.ids.get(row)?;
             let entry = self.index.entry(entry_ref);
             let name = String::from_utf16_lossy(entry.name_display);
             let is_dir = entry.is_dir();
+            let totals = self.index.folder_totals(entry_ref);
             Some(DetailsView {
                 icon: self.icons.index_for(&name, is_dir),
                 kind: self.cell_text(row, 4).unwrap_or_default(),
-                size: if is_dir {
+                size: if is_dir && totals.is_none() {
                     String::new()
                 } else {
-                    format!(
-                        "{} ({} {})",
-                        size_in(entry.size, self.settings.size_format),
-                        group_digits(entry.size),
-                        if entry.size == 1 { "byte" } else { "bytes" }
-                    )
+                    size_details(entry.size, self.settings.size_format)
                 },
+                items: totals
+                    .map(|(_, items)| item_count_text(items))
+                    .unwrap_or_default(),
                 modified: self.cell_text(row, 3).unwrap_or_default(),
                 folder: self.cell_text(row, 1).unwrap_or_default(),
                 name,
@@ -2680,6 +3139,7 @@ impl Ui {
             nav_pills,
             details_opacity: self.motion.details_opacity(now),
             rows,
+            rename,
             details,
             nav_icons,
             search: SearchView {
@@ -2687,7 +3147,13 @@ impl Ui {
                 empty: self.field.is_empty(),
                 scroll: self.search_scroll,
                 caret_x,
-                show_caret: self.focused && self.caret_on && !opaque,
+                // The caret leaves the search box while keys act on the
+                // results.
+                show_caret: self.focused
+                    && self.caret_on
+                    && !opaque
+                    && !self.list_focus
+                    && self.rename.is_none(),
                 selection,
             },
             count_text: self.count_text(),
@@ -2758,6 +3224,7 @@ impl Ui {
             index_text: data.index_text,
             filter_count: data.filter_count,
             rows: data.rows,
+            rename: data.rename,
             empty_message: data.empty_message,
             sort_column: data.sort_column,
             sort_ascending: data.sort_ascending,
@@ -2919,6 +3386,7 @@ struct FrameData {
     nav_pills: Vec<Rect>,
     details_opacity: f32,
     rows: Vec<RowView>,
+    rename: Option<RenameView>,
     details: Option<DetailsView>,
     nav_icons: Vec<i32>,
     search: SearchView,
@@ -2989,6 +3457,25 @@ fn category_icon(category: Category) -> (&'static str, bool) {
         Category::Code => ("a.json", false),
         Category::Custom => ("file", false),
     }
+}
+
+/// "1.2 MB (1,234,567 bytes)" for the details pane.
+fn size_details(bytes: u64, format: settings::SizeFormat) -> String {
+    format!(
+        "{} ({} {})",
+        size_in(bytes, format),
+        group_digits(bytes),
+        if bytes == 1 { "byte" } else { "bytes" }
+    )
+}
+
+/// "1,204 items" below a folder.
+fn item_count_text(items: u32) -> String {
+    format!(
+        "{} {}",
+        group_digits(u64::from(items)),
+        if items == 1 { "item" } else { "items" }
+    )
 }
 
 fn group_digits(value: u64) -> String {
@@ -3961,6 +4448,58 @@ pub fn run_scenarios(index: Arc<IndexSet>, screenshots: &Path) -> Result<(), Str
     }
     report.push_str(&format!(
         "05-path: rows={count} total={total} screenshot={}\n",
+        path.display()
+    ));
+
+    // Folders sorted by their totals, the biggest selected so the details
+    // pane shows its size and item count.
+    unsafe {
+        if let Some(ui) = ui_ref(hwnd) {
+            ui.sort_by(sort::COLUMN_SIZE, false);
+            ui.select_row(0);
+        }
+    }
+    pump_until_idle(hwnd, Duration::from_secs(5));
+    let (count, sizes, size_cell, items) = unsafe {
+        ui_ref(hwnd)
+            .map(|ui| {
+                let items = ui
+                    .model
+                    .ids
+                    .get(0)
+                    .and_then(|entry| ui.index.folder_totals(entry))
+                    .map(|(_, items)| item_count_text(items));
+                (
+                    ui.result_count(),
+                    ui.leading_sizes(10),
+                    ui.cell_text(0, 2).unwrap_or_default(),
+                    items,
+                )
+            })
+            .unwrap_or_default()
+    };
+    if count == 0 {
+        return Err("scenario 38-folder-sizes: expected folders, got none".into());
+    }
+    if sizes.windows(2).any(|pair| pair[0] < pair[1]) || sizes.first() == Some(&0) {
+        return Err(format!(
+            "scenario 38-folder-sizes: folder totals missing or out of order: {sizes:?}"
+        ));
+    }
+    let Some(items) = items else {
+        return Err("scenario 38-folder-sizes: no item count for the folder".into());
+    };
+    if size_cell.is_empty() {
+        return Err("scenario 38-folder-sizes: the Size column is empty".into());
+    }
+    let path = screenshots.join("38-folder-sizes.png");
+    unsafe {
+        if let Some(ui) = ui_ref(hwnd) {
+            ui.capture(&path)?;
+        }
+    }
+    report.push_str(&format!(
+        "38-folder-sizes: rows={count} size={size_cell} items={items} screenshot={}\n",
         path.display()
     ));
 

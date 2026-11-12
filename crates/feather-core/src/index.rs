@@ -1,7 +1,7 @@
 use std::io;
 
 use crate::entry::{EntrySummary, EntryView};
-use crate::format::{Manifest, CHECK_STRIDE, FRN_SIZE, META_SIZE};
+use crate::format::{Manifest, CHECK_STRIDE, COUNT_SIZE, FRN_SIZE, META_SIZE};
 use crate::mapped::MappedFile;
 
 pub struct VolumeIndex {
@@ -12,6 +12,8 @@ pub struct VolumeIndex {
     display: MappedFile,
     frn: MappedFile,
     check: MappedFile,
+    /// Items below each folder, when the index has folder totals.
+    counts: Option<MappedFile>,
     path_cache: std::sync::Mutex<std::collections::HashMap<u32, String>>,
 }
 
@@ -23,6 +25,11 @@ impl VolumeIndex {
         let display = MappedFile::open(&dir.join(manifest.display_name()))?;
         let frn = MappedFile::open(&dir.join(manifest.frn_name()))?;
         let check = MappedFile::open(&dir.join(manifest.check_name()))?;
+        let counts = if manifest.has_folder_totals() {
+            Some(MappedFile::open(&dir.join(manifest.count_name()))?)
+        } else {
+            None
+        };
 
         let index = Self {
             manifest,
@@ -35,6 +42,7 @@ impl VolumeIndex {
             display,
             frn,
             check,
+            counts,
             path_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         index.validate()?;
@@ -50,6 +58,16 @@ impl VolumeIndex {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "index table length mismatch",
+            ));
+        }
+        if self
+            .counts
+            .as_ref()
+            .is_some_and(|counts| counts.byte_len() != count * COUNT_SIZE)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "folder count table length mismatch",
             ));
         }
         if self.search.byte_len() as u64 != self.manifest.search_len
@@ -133,6 +151,23 @@ impl VolumeIndex {
 
     pub fn entry_count(&self) -> u32 {
         self.manifest.entry_count
+    }
+
+    /// True when folder `size` fields hold the total of everything below
+    /// them. Indexes written before folder totals existed say false: their
+    /// folders have size 0 until the next rebuild.
+    pub fn has_folder_totals(&self) -> bool {
+        self.counts.is_some()
+    }
+
+    /// The number of files and folders anywhere below folder `id`, or
+    /// `None` for a file or an index without folder totals.
+    pub fn folder_items(&self, id: u32) -> Option<u32> {
+        let counts = self.counts.as_ref()?;
+        if id >= self.manifest.entry_count || !self.entry_summary(id).is_dir() {
+            return None;
+        }
+        Some(read_u32(counts.as_slice(), id as usize * COUNT_SIZE))
     }
 
     pub fn iter_ids(&self) -> std::ops::Range<u32> {
