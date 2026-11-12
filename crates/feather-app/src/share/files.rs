@@ -144,12 +144,20 @@ impl Roots {
     /// `parent`. The item may not exist yet.
     pub fn resolve_new(&self, root: usize, parent: &str, name: &str) -> Result<PathBuf, Denied> {
         check_name(name)?;
+        if super::thumbs::risky_name(name) {
+            return Err(Denied::BadName);
+        }
         let folder = self.resolve(root, parent)?;
         if !folder.is_dir() {
             return Err(Denied::NotFound);
         }
         let path = folder.join(name);
         if self.is_blocked(&path) {
+            return Err(Denied::NotFound);
+        }
+        // An item that is there but hidden from visitors can't be replaced,
+        // and the answer doesn't tell it is there.
+        if path.symlink_metadata().is_ok() && !self.visible(&path) {
             return Err(Denied::NotFound);
         }
         Ok(path)

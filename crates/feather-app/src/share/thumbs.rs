@@ -25,6 +25,47 @@ pub fn media_type(path: &Path) -> Option<&'static str> {
     })
 }
 
+/// True for files the page may ask a preview of: pictures and videos.
+/// Never shortcuts or other shell links: Windows would preview what they
+/// point to, which may be anywhere on the PC or on another computer.
+pub fn previewable(path: &Path) -> bool {
+    if media_type(path).is_some() {
+        return true;
+    }
+    let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "heic"
+            | "heif"
+            | "tif"
+            | "tiff"
+            | "jxl"
+            | "ico"
+            | "dng"
+            | "cr2"
+            | "cr3"
+            | "nef"
+            | "arw"
+            | "raf"
+            | "orf"
+            | "rw2"
+    )
+}
+
+/// True for names a visitor may not create: files that make Windows reach
+/// out on its own when the owner opens the folder (shortcuts, internet
+/// links, library and search-connector files, folder settings), which can
+/// leak the owner's sign-in to another computer.
+pub fn risky_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower == "desktop.ini"
+        || [".lnk", ".url", ".library-ms", ".searchconnector-ms", ".scf"]
+            .iter()
+            .any(|extension| lower.ends_with(extension))
+}
+
 /// The largest preview asked for: big enough to fill a phone screen for
 /// pictures a browser can't show by itself (HEIC, TIFF).
 pub const MAX_SIDE: u32 = 2048;
@@ -51,6 +92,10 @@ pub fn thumbnail(path: &Path, side: u32) -> Option<Vec<u8>> {
         IShellItemImageFactory, SHCreateItemFromParsingName, SHCreateMemStream,
         SIIGBF_THUMBNAILONLY,
     };
+
+    if !previewable(path) {
+        return None;
+    }
 
     struct Com(bool);
     impl Drop for Com {
@@ -138,6 +183,42 @@ pub fn thumbnail(_path: &Path, _side: u32) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_pictures_and_videos_get_previews() {
+        assert!(previewable(Path::new("a.JPG")));
+        assert!(previewable(Path::new("clip.mp4")));
+        assert!(previewable(Path::new("raw.heic")));
+        for name in [
+            "pic.lnk",
+            "pic.jpg.lnk",
+            "x.url",
+            "a.library-ms",
+            "notes.txt",
+            "noext",
+        ] {
+            assert!(!previewable(Path::new(name)), "{name}");
+        }
+    }
+
+    #[test]
+    fn shell_link_files_may_not_be_created() {
+        for name in [
+            "a.lnk",
+            "A.LNK",
+            "x.url",
+            "l.library-ms",
+            "s.searchConnector-ms",
+            "x.scf",
+            "desktop.ini",
+            "Desktop.INI",
+        ] {
+            assert!(risky_name(name), "{name}");
+        }
+        for name in ["a.txt", "lnk", "photo.jpg", "desktop.ini.txt"] {
+            assert!(!risky_name(name), "{name}");
+        }
+    }
 
     #[test]
     fn only_media_is_shown_in_the_page() {

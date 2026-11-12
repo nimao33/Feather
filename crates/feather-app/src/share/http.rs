@@ -1235,6 +1235,9 @@ fn call(
             }
         }
         ("GET", "/api/thumb") => match shared.roots.resolve(params.root(), params.path()) {
+            Ok(file) if file.is_file() && !thumbs::previewable(&file) => {
+                Reply::Json(404, error_json("No preview for this kind of file."))
+            }
             Ok(file) if file.is_file() => {
                 let side = params
                     .get("size")
