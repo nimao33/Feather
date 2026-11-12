@@ -16,14 +16,16 @@
   tunnels, photo and video viewing.
 - Date filters: `dm:today`, `dm:lastweek`, `dm:2026-11`, ranges, and a
   Date modified section in Filters.
+- Folder totals: folder sizes and item counts in the Size column, sorting,
+  the details pane, and `size:` filters.
+- **Live updates** from the NTFS change journal (USN) for whole drives:
+  changes appear within about a second, folder totals included, and the
+  changes are folded into a new index when idle instead of rebuilding.
 - Linux window (a local page in a browser app window), CLI, per-user .msi
   installer with upgrades, CI on Windows and Linux.
 
 ## In progress
 
-- **Live updates** from the NTFS change journal (USN): changes appear within
-  about a second and whole-drive rebuilds become rare, removing the brief
-  memory spike each rebuild causes.
 - **Folder downloads** from the shared page as a streamed .zip.
 - **Linux release** tarball built by a release workflow next to the .msi.
 
@@ -39,6 +41,9 @@
 ## Known gaps
 
 - Date filters cover the modification date only; no calendar picker.
+- Only whole NTFS drives are followed live. Folders, network shares, and the
+  timed update modes are still rebuilt when the folder watcher reports
+  changes, so there a new file shows up within about a minute.
 - On Linux the index refreshes on a timer and has no NTFS fast path.
 - The installer is not code signed, so SmartScreen warns on first run.
 - The UI test harness needs an interactive desktop; it occasionally fails

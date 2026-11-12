@@ -7,9 +7,11 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::entry::EntryView;
 use crate::index::VolumeIndex;
+use crate::live::Overlay;
 use crate::path::path_within;
 
 /// Volumes beyond this count cannot fit in the search selection mask.
@@ -130,6 +132,26 @@ impl IndexSet {
         &self.volumes
     }
 
+    /// The folder each volume was opened from, by volume index.
+    pub fn sources(&self) -> &[PathBuf] {
+        &self.sources
+    }
+
+    /// The same volumes with live-change overlays: one per volume, `None`
+    /// for none. The mapped files are shared, not opened again; entry ids
+    /// stay valid across sets built this way from the same base.
+    pub fn with_overlays(&self, overlays: &[Option<Arc<Overlay>>]) -> Self {
+        Self {
+            volumes: self
+                .volumes
+                .iter()
+                .enumerate()
+                .map(|(index, volume)| volume.with_overlay(overlays.get(index).cloned().flatten()))
+                .collect(),
+            sources: self.sources.clone(),
+        }
+    }
+
     pub fn volume_count(&self) -> usize {
         self.volumes.len()
     }
@@ -171,10 +193,7 @@ impl IndexSet {
     }
 
     pub fn item_count(&self) -> u64 {
-        self.volumes
-            .iter()
-            .map(|volume| u64::from(volume.entry_count().saturating_sub(1)))
-            .sum()
+        self.volumes.iter().map(VolumeIndex::item_count).sum()
     }
 
     /// Builds the search mask from the volume prefixes the user excluded.

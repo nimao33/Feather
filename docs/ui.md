@@ -537,8 +537,11 @@ list with the arrow keys; typing, `Left`/`Right`/`Home`/`End`/`Backspace`,
 clicking the search box, or `Esc` give them back to the search text, and the
 search caret hides while the results have them. Rename, delete, and paste go
 through the shell (`ui/fileops.rs`), so Explorer's undo, Recycle Bin, and
-elevation prompts apply; afterwards the affected index roots are read again
-at once instead of waiting for the change watcher.
+elevation prompts apply. Afterwards the affected index roots are read again
+about 0.8 s later instead of waiting for the change watcher, except roots
+followed live (whole NTFS drives in Live mode): there the change journal
+reports the change within about a second, so no rebuild is started. A renamed
+item stays selected once the snapshot or index that has it comes in.
 
 The accelerators live in a single `CreateAcceleratorTableW` table. Both message
 loops call `TranslateAcceleratorW` before `TranslateMessage`. Dialogs use their

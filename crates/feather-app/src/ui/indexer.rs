@@ -10,6 +10,7 @@ use std::thread::JoinHandle;
 
 use feather_core::mft;
 use feather_core::scan::{library_dir_name, scan, write_tree, ScanOptions};
+use feather_core::IndexSet;
 
 use super::helper;
 pub use crate::library::{
@@ -96,6 +97,38 @@ impl Indexer {
                     },
                 );
                 let _ = sender.send(event);
+            })
+            .ok();
+        Self {
+            progress,
+            cancel,
+            events,
+            thread,
+            finished,
+            roots,
+        }
+    }
+
+    /// Writes the live changes in `set` into a new library beside
+    /// `library`: volumes with changes are folded into a new base (no disk
+    /// is read again), the others are carried over as they are.
+    pub fn fold(library: &Path, set: Arc<IndexSet>) -> Self {
+        let progress = Arc::new(AtomicU32::new(0));
+        let finished = Arc::new(AtomicU32::new(0));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (sender, events) = mpsc::channel();
+        let staged = staging_dir(library);
+        let roots: Vec<String> = set
+            .volumes()
+            .iter()
+            .filter(|volume| volume.has_changes())
+            .map(|volume| volume.prefix.clone())
+            .collect();
+        let thread_cancel = Arc::clone(&cancel);
+        let thread = std::thread::Builder::new()
+            .name("feather-fold".into())
+            .spawn(move || {
+                let _ = sender.send(fold_set(&staged, &set, &thread_cancel));
             })
             .ok();
         Self {
@@ -267,6 +300,40 @@ fn build(
     IndexEvent::Done {
         staged: staged.to_path_buf(),
         failures,
+    }
+}
+
+/// Writes `set` with its live changes as a library in `staged`.
+fn fold_set(staged: &Path, set: &IndexSet, cancel: &AtomicBool) -> IndexEvent {
+    let _ = std::fs::remove_dir_all(staged);
+    if let Err(error) = std::fs::create_dir_all(staged) {
+        return IndexEvent::Failed(format!("Could not create {}: {error}", staged.display()));
+    }
+    for (volume, source) in set.volumes().iter().zip(set.sources()) {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = std::fs::remove_dir_all(staged);
+            return IndexEvent::Cancelled;
+        }
+        let Some(name) = source.file_name() else {
+            continue;
+        };
+        let target = staged.join(name);
+        let result = if volume.has_changes() {
+            feather_core::live::fold(volume, &target).map(|_| ())
+        } else {
+            carry_over(source, &target)
+        };
+        if let Err(error) = result {
+            let _ = std::fs::remove_dir_all(staged);
+            return IndexEvent::Failed(format!("Could not update {}: {error}", volume.prefix));
+        }
+    }
+    if let Err(error) = std::fs::write(staged.join(COMPLETE_MARKER), b"ok") {
+        return IndexEvent::Failed(format!("Could not finish the index: {error}"));
+    }
+    IndexEvent::Done {
+        staged: staged.to_path_buf(),
+        failures: Vec::new(),
     }
 }
 
@@ -563,6 +630,77 @@ mod tests {
         assert_eq!(set.item_count(), 3);
         drop(set);
         drop(again);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn folding_writes_live_changes_into_a_new_library() {
+        use feather_core::live::{Change, EntryState, JournalCursor, Overlay, Rules};
+        use feather_core::scan::{Entries, ScanReport, Tree};
+        let base = temp_dir("fold");
+        let library = base.join("index");
+        let active = library.join("vol-c");
+        let mut entries = Entries::default();
+        for (name, parent, frn, dir) in [("", 0, 5u64, true), ("docs", 0, 100, true)] {
+            entries.push(name, parent, 0, 1, u16::from(dir));
+            entries.frn.push(frn);
+        }
+        let cursor = JournalCursor {
+            journal_id: 1,
+            next_usn: 10,
+        };
+        let tree = Tree {
+            root_display: "C:\\".into(),
+            entries,
+            report: ScanReport::default(),
+            journal: Some(cursor),
+        };
+        write_tree(&active, tree, std::time::Instant::now()).expect("write");
+        // A second volume without changes is carried over.
+        feather_core::synthetic::generate(&library.join("vol-d"), 50, "D:\\").expect("d");
+        let set = IndexSet::open(&library).expect("open");
+        let mut overlay = Overlay::new(&set.volumes()[0], cursor);
+        overlay.apply(
+            &set.volumes()[0],
+            &[Change::Upsert(EntryState {
+                frn: 200,
+                parent_frn: 100,
+                name: "new.txt".into(),
+                size: Some(4),
+                mtime: 2,
+                flags: 0,
+                created: true,
+            })],
+            &Rules::default(),
+        );
+        overlay.set_cursor(JournalCursor {
+            journal_id: 1,
+            next_usn: 99,
+        });
+        let live = Arc::new(set.with_overlays(&[Some(Arc::new(overlay)), None]));
+        let folder = Indexer::fold(&library, Arc::clone(&live));
+        let (staged, _) = finish(&folder);
+        let folded = IndexSet::open(&staged).expect("open folded");
+        assert_eq!(folded.item_count(), live.item_count());
+        assert!(!folded.volumes()[0].has_changes());
+        assert_eq!(
+            folded.volumes()[0].journal().map(|cursor| cursor.next_usn),
+            Some(99)
+        );
+        let id = folded.volumes()[0].lookup_frn(200).expect("folded in");
+        assert_eq!(
+            folded.volumes()[0].resolve_path(id).as_deref(),
+            Some("C:\\docs\\new.txt")
+        );
+        // Folder totals are written for the folded index too.
+        let docs = folded.volumes()[0].lookup_frn(100).expect("docs");
+        let docs = feather_core::EntryRef::new(0, docs);
+        assert_eq!(folded.folder_totals(docs), Some((4, 1)));
+        assert_eq!(
+            folded.folder_totals(feather_core::EntryRef::new(0, 0)),
+            Some((4, 2))
+        );
+        drop((folded, live, set, folder));
         let _ = std::fs::remove_dir_all(&base);
     }
 

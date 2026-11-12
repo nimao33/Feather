@@ -183,7 +183,7 @@ fn date_filters_match_synthetic_mtimes() {
     let before = matching("dm:<lastyear");
     let after = matching("dm:>=lastyear");
     assert!(!before.is_empty() && !after.is_empty());
-    assert_eq!(before.len() + after.len(), index.iter_ids().len());
+    assert_eq!(before.len() + after.len(), index.iter_ids().count());
     assert!(before.iter().all(|id| !after.contains(id)));
     // Combined with name and extension filters.
     let pdfs = matching("file ext:pdf dm:last30days");

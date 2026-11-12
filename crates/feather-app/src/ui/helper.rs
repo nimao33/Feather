@@ -10,6 +10,10 @@
 //!
 //! A declined prompt is remembered for the session; refreshes then use the
 //! slower folder walk without asking again.
+//!
+//! The helper also reads NTFS change journals for live updates: the app
+//! asks `usn` with a drive and a journal position about once a second and
+//! gets back the changes since, as a compact byte stream (`Batch::encode`).
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
@@ -18,6 +22,7 @@ use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
+use feather_core::live::{Batch, JournalCursor};
 use feather_core::mft;
 use feather_core::scan::{ScanOptions, Tree};
 use windows_sys::Win32::Foundation::{
@@ -31,6 +36,8 @@ use windows_sys::Win32::System::Pipes::{
 
 const FILE_FLAG_FIRST_PIPE_INSTANCE: u32 = 0x0008_0000;
 const BUFFER: u32 = 1 << 20;
+/// Journal records read per request. A long catch-up arrives in several.
+pub const JOURNAL_RECORDS: usize = 100_000;
 
 struct Session {
     reader: BufReader<File>,
@@ -60,6 +67,20 @@ pub fn available() -> bool {
 /// Reads `root` through the helper, starting it (one UAC prompt) if needed.
 /// Fails with `PermissionDenied` when the prompt is declined.
 pub fn read(root: &Path, options: &ScanOptions) -> io::Result<Tree> {
+    with_session(|session| request(session, root, options))
+}
+
+/// The changes on `drive` since `cursor`, read by the helper, starting it
+/// (one UAC prompt) if needed. Fails with `PermissionDenied` when the
+/// prompt is declined and `NotFound` when the journal no longer reaches
+/// back to the cursor.
+pub fn journal(drive: &str, cursor: JournalCursor) -> io::Result<Batch> {
+    with_session(|session| request_journal(session, drive, cursor))
+}
+
+/// Runs `ask` on the session's helper, starting it if needed and once more
+/// if it went away.
+fn with_session<T>(mut ask: impl FnMut(&mut Session) -> io::Result<T>) -> io::Result<T> {
     let mut guard = helper()
         .lock()
         .map_err(|_| io::Error::other("the helper lock is poisoned"))?;
@@ -82,8 +103,8 @@ pub fn read(root: &Path, options: &ScanOptions) -> io::Result<Tree> {
             }
         }
         let session = guard.session.as_mut().expect("session started");
-        match request(session, root, options) {
-            Ok(tree) => return Ok(tree),
+        match ask(session) {
+            Ok(answer) => return Ok(answer),
             // The helper went away (killed, crashed): start a new one once.
             Err(error) if attempt == 0 && error.kind() == io::ErrorKind::BrokenPipe => {
                 guard.session = None;
@@ -113,10 +134,29 @@ fn request(session: &mut Session, root: &Path, options: &ScanOptions) -> io::Res
     )
     .map_err(broken)?;
     session.writer.flush().map_err(broken)?;
+    answer(session, Tree::decode)
+}
+
+fn request_journal(session: &mut Session, drive: &str, cursor: JournalCursor) -> io::Result<Batch> {
+    writeln!(
+        session.writer,
+        "usn\t{drive}\t{:x}\t{}",
+        cursor.journal_id, cursor.next_usn
+    )
+    .map_err(broken)?;
+    session.writer.flush().map_err(broken)?;
+    answer(session, Batch::decode)
+}
+
+/// Reads the helper's answer: a status byte, then the payload or an error.
+fn answer<T>(
+    session: &mut Session,
+    decode: impl FnOnce(&mut BufReader<File>) -> io::Result<T>,
+) -> io::Result<T> {
     let mut status = [0u8; 1];
     session.reader.read_exact(&mut status).map_err(broken)?;
     if status[0] == 0 {
-        return Tree::decode(&mut session.reader);
+        return decode(&mut session.reader);
     }
     let mut len = [0u8; 4];
     session.reader.read_exact(&mut len)?;
@@ -125,6 +165,7 @@ fn request(session: &mut Session, root: &Path, options: &ScanOptions) -> io::Res
     let kind = match status[0] {
         2 => io::ErrorKind::Unsupported,
         3 => io::ErrorKind::NotFound,
+        4 => io::ErrorKind::PermissionDenied,
         _ => io::ErrorKind::Other,
     };
     Err(io::Error::new(
@@ -293,14 +334,41 @@ pub fn serve(pipe: &str) -> io::Result<()> {
                 .map(str::to_string)
                 .collect()
         };
-        let result = match fields.as_slice() {
+        // The answer is encoded first, so an error halfway through cannot
+        // leave half a reply on the pipe.
+        let result: io::Result<Vec<u8>> = match fields.as_slice() {
             ["scan", root, names, paths] => {
                 let options = ScanOptions {
                     excluded_names: split(names),
                     excluded_paths: split(paths),
                     ..ScanOptions::default()
                 };
-                mft::read(Path::new(root), &options)
+                mft::read(Path::new(root), &options).and_then(|tree| {
+                    let mut bytes = Vec::new();
+                    tree.encode(&mut bytes)?;
+                    Ok(bytes)
+                })
+            }
+            ["usn", drive, journal_id, next_usn] => {
+                match (u64::from_str_radix(journal_id, 16), next_usn.parse::<i64>()) {
+                    (Ok(journal_id), Ok(next_usn)) => feather_core::usn::read_changes(
+                        drive,
+                        JournalCursor {
+                            journal_id,
+                            next_usn,
+                        },
+                        JOURNAL_RECORDS,
+                    )
+                    .and_then(|batch| {
+                        let mut bytes = Vec::new();
+                        batch.encode(&mut bytes)?;
+                        Ok(bytes)
+                    }),
+                    _ => Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "bad journal position",
+                    )),
+                }
             }
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -308,14 +376,15 @@ pub fn serve(pipe: &str) -> io::Result<()> {
             )),
         };
         match result {
-            Ok(tree) => {
+            Ok(bytes) => {
                 writer.write_all(&[0])?;
-                tree.encode(&mut writer)?;
+                writer.write_all(&bytes)?;
             }
             Err(error) => {
                 let code = match error.kind() {
                     io::ErrorKind::Unsupported => 2,
                     io::ErrorKind::NotFound => 3,
+                    io::ErrorKind::PermissionDenied => 4,
                     _ => 1,
                 };
                 let message = error.to_string();
@@ -349,6 +418,27 @@ mod tests {
         // The helper keeps serving after an error.
         let again = request(&mut session, Path::new("Z:\\"), &ScanOptions::default());
         assert!(again.is_err());
+        // Journal requests cross too; a folder share has no journal.
+        let journal = request_journal(
+            &mut session,
+            r"\\server\share",
+            JournalCursor {
+                journal_id: 0xabc,
+                next_usn: 42,
+            },
+        );
+        assert_eq!(
+            journal.err().map(|error| error.kind()),
+            Some(io::ErrorKind::Unsupported)
+        );
+        // Without admin rights the volume cannot be opened, and that comes
+        // back as such, so the app knows not to rebuild over it.
+        if let Err(error) = request_journal(&mut session, "C:", JournalCursor::default()) {
+            assert!(matches!(
+                error.kind(),
+                io::ErrorKind::PermissionDenied | io::ErrorKind::NotFound
+            ));
+        }
         drop(session);
         assert!(helper.join().expect("helper thread").is_ok());
         assert!(serve("not-a-pipe").is_err());

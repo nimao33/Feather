@@ -41,6 +41,11 @@ web page.
   (one UAC prompt). Other drives and folders fall back to a normal folder walk.
 - **Stays up to date.** A file watcher notices changes and rebuilds only the
   drives that changed. Live, every 15 minutes, hourly or never.
+- **Live updates** for whole NTFS drives: in Live mode the helper reads the
+  drive's USN change journal about once a second, so new, renamed and deleted
+  files show up within a second (folder sizes too) without reading the drive
+  again. After a restart Feather catches up from the journal where the index
+  left it.
 - **Low memory.** The index is memory-mapped, so its pages are shared and
   dropped by Windows when it needs the RAM. Idle private memory is about
   25 MB for the window and about 15 MB for the helper.
@@ -247,8 +252,8 @@ docs/                 UI guide, index format, benchmarks, roadmap
 
 ## Not done yet
 
-- The index is rebuilt per drive on changes, not updated entry by entry from
-  the USN journal.
+- Folders and network shares (anything but a whole NTFS drive) are still
+  rebuilt on changes rather than updated entry by entry.
 - No file watcher on Linux yet; the index refreshes on a timer there.
 
 ## License

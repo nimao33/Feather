@@ -39,9 +39,6 @@ const ATTR_BITMAP: u32 = 0xb0;
 const SKIP_GAP: usize = 64;
 const ATTR_END: u32 = 0xffff_ffff;
 
-const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
-const FILE_ATTRIBUTE_SYSTEM: u32 = 0x4;
-
 fn u16_at(data: &[u8], at: usize) -> Option<u16> {
     Some(u16::from_le_bytes(data.get(at..at + 2)?.try_into().ok()?))
 }
@@ -235,6 +232,8 @@ struct Table {
     size: Vec<u64>,
     mtime: Vec<u64>,
     attributes: Vec<u32>,
+    /// The record's sequence number: the top 16 bits of its file reference.
+    sequence: Vec<u16>,
     names: Vec<u16>,
     extensions: Vec<Extension>,
 }
@@ -260,6 +259,7 @@ impl Table {
             size: vec![0; count],
             mtime: vec![0; count],
             attributes: vec![0; count],
+            sequence: vec![0; count],
             names: Vec::with_capacity(count * 12),
             extensions: Vec::new(),
         }
@@ -295,6 +295,7 @@ impl Table {
         }
         let slot = number - self.first;
         self.state[slot] |= 1 | if flags & 2 != 0 { 2 } else { 0 };
+        self.sequence[slot] = u16_at(record, 0x10).unwrap_or(0);
         for_each_attribute(record, |kind, offset| match kind {
             ATTR_STANDARD_INFORMATION => {
                 if let Some(content) = resident(record, offset) {
@@ -382,6 +383,7 @@ impl Table {
         self.size[start..end].copy_from_slice(&part.size);
         self.mtime[start..end].copy_from_slice(&part.mtime);
         self.attributes[start..end].copy_from_slice(&part.attributes);
+        self.sequence[start..end].copy_from_slice(&part.sequence);
         for (slot, value) in self.name_start[start..end].iter_mut().zip(&part.name_start) {
             *slot = value + names_base;
         }
@@ -736,6 +738,14 @@ pub fn read(root: &Path, options: &ScanOptions) -> io::Result<crate::scan::Tree>
             "only drive-letter paths can use the NTFS reader",
         ));
     };
+    // For a whole drive, note where the change journal stands before the
+    // table is read: replaying from here later may repeat a change the
+    // table already has, which is harmless, but never misses one.
+    let journal = if parts.is_empty() {
+        crate::usn::query(&drive).ok().map(|info| info.cursor())
+    } else {
+        None
+    };
     let table = read_table(&format!(r"\\.\{drive}"), options)?;
     crate::scan::phase("read table", started);
     let phase_start = Instant::now();
@@ -804,21 +814,20 @@ pub fn read(root: &Path, options: &ScanOptions) -> io::Result<crate::scan::Tree>
     }
     // (lowercase name, its UTF-16 length) so most names are rejected on
     // length alone.
-    let skip_names: Vec<(String, usize)> =
-        ["$recycle.bin", "system volume information", "$winreagent"]
-            .iter()
-            .map(|name| name.to_string())
-            .chain(
-                options
-                    .excluded_names
-                    .iter()
-                    .map(|name| name.to_lowercase()),
-            )
-            .map(|name| {
-                let units = name.encode_utf16().count();
-                (name, units)
-            })
-            .collect();
+    let skip_names: Vec<(String, usize)> = crate::live::ALWAYS_SKIPPED
+        .iter()
+        .map(|name| name.to_string())
+        .chain(
+            options
+                .excluded_names
+                .iter()
+                .map(|name| name.to_lowercase()),
+        )
+        .map(|name| {
+            let units = name.encode_utf16().count();
+            (name, units)
+        })
+        .collect();
 
     let max_entries = if options.max_entries == 0 {
         ScanOptions::default().max_entries
@@ -863,22 +872,16 @@ pub fn read(root: &Path, options: &ScanOptions) -> io::Result<crate::scan::Tree>
     // Names go straight from the table into one buffer: no string per
     // entry, and the table is let go as soon as they are copied.
     let mut entries = Entries::with_capacity(order.len());
+    entries.frn.reserve_exact(order.len());
     let mut name = String::new();
     for (index, &(record, parent)) in order.iter().enumerate() {
         let record = record as usize;
+        entries
+            .frn
+            .push(record as u64 | (u64::from(table.sequence[record]) << 48));
         let is_dir = table.state[record] & 2 != 0;
         let attributes = table.attributes[record];
-        let flags = u16::from(is_dir)
-            | if attributes & FILE_ATTRIBUTE_HIDDEN != 0 {
-                2
-            } else {
-                0
-            }
-            | if attributes & FILE_ATTRIBUTE_SYSTEM != 0 {
-                4
-            } else {
-                0
-            };
+        let flags = crate::live::entry_flags(is_dir, attributes);
         name.clear();
         if index == 0 {
             // The root entry is the scanned folder itself: no name, always
@@ -905,6 +908,7 @@ pub fn read(root: &Path, options: &ScanOptions) -> io::Result<crate::scan::Tree>
         root_display,
         entries,
         report,
+        journal,
     })
 }
 
