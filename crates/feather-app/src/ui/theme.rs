@@ -276,6 +276,34 @@ pub fn apply_window_effects(hwnd: HWND, dark: bool, material: Material) {
 /// The color behind Windows' minimize, maximize, and close buttons on a
 /// window with a solid background. It has to match what Feather paints
 /// around them, which changes with the theme and with what sits there.
+/// Draws Windows' own popup menus (Explorer's right-click menu, the tray
+/// menu) dark or light to match Feather. Windows offers no documented way;
+/// this is the uxtheme entry point Explorer and other apps use
+/// (SetPreferredAppMode, ordinal 135, Windows 10 1903 and later), followed
+/// by FlushMenuThemes (136) so open menus pick it up. Does nothing where
+/// it isn't there.
+pub fn set_menu_dark(dark: bool) {
+    use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+    type SetPreferredAppMode = unsafe extern "system" fn(i32) -> i32;
+    type FlushMenuThemes = unsafe extern "system" fn();
+    const FORCE_DARK: i32 = 2;
+    const FORCE_LIGHT: i32 = 3;
+    unsafe {
+        let library = LoadLibraryW(windows_sys::core::w!("uxtheme.dll"));
+        if library.is_null() {
+            return;
+        }
+        if let Some(set) = GetProcAddress(library, 135 as *const u8) {
+            let set: SetPreferredAppMode = std::mem::transmute(set);
+            set(if dark { FORCE_DARK } else { FORCE_LIGHT });
+        }
+        if let Some(flush) = GetProcAddress(library, 136 as *const u8) {
+            let flush: FlushMenuThemes = std::mem::transmute(flush);
+            flush();
+        }
+    }
+}
+
 pub fn set_caption_color(hwnd: HWND, color: Color) {
     const DWMWA_CAPTION_COLOR: u32 = 35;
     let channel = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u32;

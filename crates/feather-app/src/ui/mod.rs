@@ -102,6 +102,8 @@ const NARROW_MAX: usize = 100_000;
 const TIMER_CARET: usize = 3;
 /// Fires a while after the window loses focus, to give memory back.
 const TIMER_TRIM: usize = 4;
+/// The least time between two live updates of the visible results.
+const LIVE_EVERY: Duration = Duration::from_secs(3);
 /// Checks once a second whether a game or other full-screen app is in
 /// front, to set the shortcut aside while it is.
 const TIMER_FULLSCREEN: usize = 9;
@@ -262,6 +264,9 @@ pub struct Ui {
     live_off: bool,
     /// The newest live snapshot, waiting for the running swap to finish.
     live_pending: Option<Arc<IndexSet>>,
+    /// When the last live snapshot was shown: changes are taken in at most
+    /// every few seconds, so a busy drive doesn't keep the list moving.
+    live_shown: Option<Instant>,
     /// A live snapshot was taken in while hidden; search it when shown.
     live_stale: bool,
     /// The live overlay is large: fold it into a new base when idle.
@@ -414,6 +419,7 @@ impl Ui {
             live_roots: Vec::new(),
             live_off: false,
             live_pending: None,
+            live_shown: None,
             live_stale: false,
             fold_wanted: false,
             pending_rebuild: Vec::new(),
@@ -456,6 +462,7 @@ impl Ui {
             Palette::new(dark, self.settings.accent, self.material)
         };
         theme::apply_window_effects(self.hwnd, self.palette.dark, self.material);
+        theme::set_menu_dark(self.palette.dark);
         self.caption_shown = None;
         self.sync_caption();
         let picture = if self.settings.custom_theme {
@@ -1024,8 +1031,15 @@ impl Ui {
                 }
             }
         }
-        if self.swap.is_none() {
+        // Live changes wait while a rename is being typed, and come in at
+        // most every few seconds while the window is shown.
+        let calm = self.rename.is_none()
+            && self
+                .live_shown
+                .is_none_or(|at| at.elapsed() >= LIVE_EVERY || !self.is_shown());
+        if self.swap.is_none() && calm {
             if let Some(set) = self.live_pending.take() {
+                self.live_shown = Some(Instant::now());
                 self.install_snapshot(set);
             } else if self.live_stale && self.is_shown() {
                 self.live_stale = false;
@@ -1279,8 +1293,17 @@ impl Ui {
             sharing.set_index(Arc::clone(&self.index));
         }
         self.controller = swap.controller;
-        self.model = swap.model;
-        self.epoch += 1;
+        let quiet = !swap.rebuilt;
+        let mut model = swap.model;
+        if quiet {
+            // Shown in place: the same search, so its timing stays.
+            model.elapsed_ms = self.model.elapsed_ms;
+        }
+        let before = self.selected;
+        self.model = model;
+        if !quiet {
+            self.epoch += 1;
+        }
         self.rename = None;
         if self.sort_column != sort::COLUMN_NAME || !self.sort_ascending {
             self.apply_sort();
@@ -1305,8 +1328,10 @@ impl Ui {
         self.selected = None;
         if let Some(row) = keep {
             self.selected = Some(row);
-            self.motion
-                .select_row(Some((self.epoch, row)), Instant::now());
+            if !(quiet && before == Some(row)) {
+                self.motion
+                    .select_row(Some((self.epoch, row)), Instant::now());
+            }
         } else if self.model.result_count() > 0 {
             self.set_selected(Some(0));
         }

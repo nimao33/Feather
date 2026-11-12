@@ -60,7 +60,10 @@ pub fn show(
     if use_shell {
         match unsafe { show_shell(owner, path) } {
             Ok(()) => return Ok(()),
-            Err(error) => eprintln!("shell context menu: {error}"),
+            // The menu was shown and a command was chosen: its failure is
+            // reported, never followed by a second menu.
+            Err(Failure::Command(error)) => return Err(error),
+            Err(Failure::Menu(error)) => eprintln!("shell context menu: {error}"),
         }
     }
     unsafe { show_fallback(owner, path) }
@@ -93,34 +96,46 @@ pub fn handle_menu_message(message: u32, wparam: usize, lparam: isize) -> Option
     })
 }
 
-unsafe fn show_shell(owner: HWND, path: &str) -> Result<(), String> {
+/// Why the shell menu path ended: before the menu showed (then the small
+/// menu stands in), or running the command chosen in it.
+enum Failure {
+    Menu(String),
+    Command(String),
+}
+
+/// The first command id given to the shell menu; chosen ids are offsets
+/// from it when invoked.
+const FIRST_COMMAND: u32 = 1;
+
+unsafe fn show_shell(owner: HWND, path: &str) -> Result<(), Failure> {
     let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
     SHParseDisplayName(&HSTRING::from(path), None, &mut pidl, 0, None)
-        .map_err(|error| format!("SHParseDisplayName failed: {error}"))?;
+        .map_err(|error| Failure::Menu(format!("SHParseDisplayName failed: {error}")))?;
     let result = show_shell_pidl(owner, pidl);
     CoTaskMemFree(Some(pidl as *const c_void));
     result
 }
 
-unsafe fn show_shell_pidl(owner: HWND, pidl: *mut ITEMIDLIST) -> Result<(), String> {
+unsafe fn show_shell_pidl(owner: HWND, pidl: *mut ITEMIDLIST) -> Result<(), Failure> {
     let mut child: *mut ITEMIDLIST = std::ptr::null_mut();
     let parent: IShellFolder = SHBindToParent(pidl, Some(&mut child))
-        .map_err(|error| format!("SHBindToParent failed: {error}"))?;
+        .map_err(|error| Failure::Menu(format!("SHBindToParent failed: {error}")))?;
     let context: IContextMenu = parent
         .GetUIObjectOf(owner, &[child as *const ITEMIDLIST], None)
-        .map_err(|error| format!("GetUIObjectOf(IContextMenu) failed: {error}"))?;
+        .map_err(|error| Failure::Menu(format!("GetUIObjectOf(IContextMenu) failed: {error}")))?;
 
-    let menu = CreatePopupMenu().map_err(|error| format!("CreatePopupMenu failed: {error}"))?;
+    let menu = CreatePopupMenu()
+        .map_err(|error| Failure::Menu(format!("CreatePopupMenu failed: {error}")))?;
     context
         .QueryContextMenu(
             menu,
             0,
-            1,
+            FIRST_COMMAND,
             0x7fff,
             CMF_NORMAL | CMF_EXPLORE | CMF_EXTENDEDVERBS,
         )
         .ok()
-        .map_err(|error| format!("QueryContextMenu failed: {error}"))?;
+        .map_err(|error| Failure::Menu(format!("QueryContextMenu failed: {error}")))?;
 
     let menu3 = context.cast::<IContextMenu3>().ok();
     let menu2 = context.cast::<IContextMenu2>().ok();
@@ -145,18 +160,21 @@ unsafe fn show_shell_pidl(owner: HWND, pidl: *mut ITEMIDLIST) -> Result<(), Stri
     drop(_guard);
 
     if command.0 != 0 {
+        // The shell wants the command as an offset from the first id it was
+        // given, not the id itself: the id ran the item below the one chosen.
+        let offset = command.0 as usize - FIRST_COMMAND as usize;
         let info = CMINVOKECOMMANDINFOEX {
             cbSize: size_of::<CMINVOKECOMMANDINFOEX>() as u32,
             fMask: CMIC_MASK_UNICODE,
             hwnd: owner,
-            lpVerb: PCSTR(command.0 as *const u8),
-            lpVerbW: PCWSTR(command.0 as *const u16),
+            lpVerb: PCSTR(offset as *const u8),
+            lpVerbW: PCWSTR(offset as *const u16),
             nShow: SW_SHOWNORMAL.0,
             ..Default::default()
         };
         context
             .InvokeCommand(&info as *const _ as *const CMINVOKECOMMANDINFO)
-            .map_err(|error| format!("InvokeCommand failed: {error}"))?;
+            .map_err(|error| Failure::Command(format!("That didn't work: {error}")))?;
     }
     Ok(())
 }
