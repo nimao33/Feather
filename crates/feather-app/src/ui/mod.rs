@@ -6,6 +6,7 @@ mod eyedropper;
 mod fileops;
 pub(crate) mod form;
 mod frames;
+mod fullscreen;
 mod gfx;
 pub(crate) mod glyphs;
 mod help;
@@ -100,6 +101,9 @@ const NARROW_MAX: usize = 100_000;
 const TIMER_CARET: usize = 3;
 /// Fires a while after the window loses focus, to give memory back.
 const TIMER_TRIM: usize = 4;
+/// Checks once a second whether a game or other full-screen app is in
+/// front, to set the shortcut aside while it is.
+const TIMER_FULLSCREEN: usize = 9;
 const ID_CLEAR_SEARCH: usize = 3001;
 const ID_FOCUS_SEARCH: usize = 3002;
 const DEFAULT_WIDTH: i32 = 1200;
@@ -193,6 +197,8 @@ pub struct Ui {
     last_progress: Instant,
     /// Whether the global shortcut is registered to this window.
     hotkey_on: bool,
+    /// The shortcut is set aside because a full-screen app is in front.
+    hotkey_paused: bool,
     /// Whether the tray icon is showing.
     tray_on: bool,
     /// Set when the shortcut brought the window up; Escape then hides it.
@@ -349,6 +355,7 @@ impl Ui {
             indexing_root: String::new(),
             last_progress: Instant::now(),
             hotkey_on: false,
+            hotkey_paused: false,
             tray_on: false,
             summoned: false,
             quitting: false,
@@ -388,6 +395,7 @@ impl Ui {
         ui.layout();
         unsafe {
             SetTimer(hwnd, TIMER_RESULTS, 16, None);
+            SetTimer(hwnd, TIMER_FULLSCREEN, 1000, None);
             SetTimer(
                 hwnd,
                 TIMER_CARET,
@@ -1566,6 +1574,7 @@ impl Ui {
                 let text = self.search_text();
                 self.start_search(&text);
             }
+            TIMER_FULLSCREEN => self.follow_fullscreen(),
             TIMER_TRIM => {
                 unsafe {
                     KillTimer(self.hwnd, TIMER_TRIM);
@@ -2503,7 +2512,27 @@ impl Ui {
     }
 
     /// The shortcut toggles: it hides Feather when Feather is in front.
+    /// Releases the shortcut while a game or other full-screen app is in
+    /// front, so the keys reach it and Feather doesn't pop up over it, and
+    /// takes it back afterwards.
+    fn follow_fullscreen(&mut self) {
+        let pause = self.persist
+            && self.settings.pause_in_fullscreen
+            && fullscreen::app_in_front(self.hwnd);
+        if pause && self.hotkey_on {
+            self.unregister_hotkey();
+            self.hotkey_paused = true;
+        } else if !pause && self.hotkey_paused {
+            self.hotkey_paused = false;
+            self.register_hotkey();
+        }
+    }
+
     fn on_hotkey(&mut self) {
+        // A press that arrives just as a game takes the screen.
+        if self.settings.pause_in_fullscreen && fullscreen::app_in_front(self.hwnd) {
+            return;
+        }
         let in_front = unsafe { GetForegroundWindow() == self.hwnd };
         if in_front && self.is_shown() {
             self.dismiss();

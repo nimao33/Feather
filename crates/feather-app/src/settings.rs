@@ -482,6 +482,9 @@ pub struct Settings {
     pub default_category: Category,
     pub start_at_login: bool,
     pub close_to_tray: bool,
+    /// The shortcut does nothing while a game or other full-screen app is
+    /// in front, so its keys reach the game.
+    pub pause_in_fullscreen: bool,
     pub tray_icon_visible: bool,
     pub hotkey: String,
     pub start_menu_shortcut: bool,
@@ -573,6 +576,7 @@ impl Default for Settings {
             default_category: Category::Everything,
             start_at_login: false,
             close_to_tray: true,
+            pause_in_fullscreen: true,
             tray_icon_visible: false,
             hotkey: hotkey::DEFAULT.to_string(),
             filters: FilterSet::default(),
@@ -700,6 +704,11 @@ impl Settings {
         );
         let _ = writeln!(text, "start_at_login={}", bool_value(self.start_at_login));
         let _ = writeln!(text, "close_to_tray={}", bool_value(self.close_to_tray));
+        let _ = writeln!(
+            text,
+            "pause_in_fullscreen={}",
+            bool_value(self.pause_in_fullscreen)
+        );
         let _ = writeln!(
             text,
             "tray_icon_visible={}",
@@ -1058,6 +1067,10 @@ pub fn parse(text: &str) -> LoadedSettings {
                 Some(flag) => settings.close_to_tray = flag,
                 None => warnings.push(invalid()),
             },
+            "pause_in_fullscreen" => match parse_bool(value) {
+                Some(flag) => settings.pause_in_fullscreen = flag,
+                None => warnings.push(invalid()),
+            },
             "tray_icon_visible" => match parse_bool(value) {
                 Some(flag) => settings.tray_icon_visible = flag,
                 None => warnings.push(invalid()),
@@ -1264,6 +1277,7 @@ pub const SETTING_KEYS: &[&str] = &[
     "default_category",
     "start_at_login",
     "close_to_tray",
+    "pause_in_fullscreen",
     "tray_icon_visible",
     "hotkey",
     "excluded_volumes",
@@ -1641,6 +1655,7 @@ mod dialog {
     const SHELL_MENU: Id = "shell_menu";
     const HOTKEY: Id = "hotkey";
     const CLOSE_TO_TRAY: Id = "close_to_tray";
+    const PAUSE_IN_FULLSCREEN: Id = "pause_in_fullscreen";
     const START_AT_LOGIN: Id = "start_at_login";
     const START_MENU: Id = "start_menu_shortcut";
     const SHARE_HTTP: Id = "share_http";
@@ -1848,6 +1863,7 @@ mod dialog {
         };
         form.set_text(HOTKEY, shortcut);
         form.set_on(CLOSE_TO_TRAY, settings.close_to_tray);
+        form.set_on(PAUSE_IN_FULLSCREEN, settings.pause_in_fullscreen);
         form.set_on(START_AT_LOGIN, settings.start_at_login);
         form.set_on(START_MENU, settings.start_menu_shortcut);
         form.set_on(DESKTOP, settings.desktop_shortcut);
@@ -2055,6 +2071,12 @@ mod dialog {
         "",
         "None",
     );
+        form.switch(
+            PAUSE_IN_FULLSCREEN,
+            "Not while a game is full screen",
+            Some("While a game, a full-screen video or a presentation is in front, the shortcut does nothing and its keys go to that app."),
+            true,
+        );
         form.heading("Running in the background");
         form.switch(
             CLOSE_TO_TRAY,
@@ -2512,6 +2534,7 @@ mod dialog {
             settings.always_on_top = form.is_on(ALWAYS_ON_TOP);
             settings.use_shell_context_menu = form.is_on(SHELL_MENU);
             settings.close_to_tray = form.is_on(CLOSE_TO_TRAY);
+            settings.pause_in_fullscreen = form.is_on(PAUSE_IN_FULLSCREEN);
             settings.start_at_login = form.is_on(START_AT_LOGIN);
             settings.start_menu_shortcut = form.is_on(START_MENU);
             settings.desktop_shortcut = form.is_on(DESKTOP);
@@ -3000,6 +3023,7 @@ mod tests {
             default_category: Category::Files,
             start_at_login: true,
             close_to_tray: true,
+            pause_in_fullscreen: true,
             tray_icon_visible: false,
             hotkey: "Ctrl + Alt + F".into(),
             filters: FilterSet {
