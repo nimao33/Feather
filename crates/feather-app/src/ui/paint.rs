@@ -42,9 +42,21 @@ pub struct DetailsView {
     pub name: String,
     pub kind: String,
     pub size: String,
+    /// For a folder: how many items are below it ("1,204 items").
+    pub items: String,
     pub modified: String,
     pub folder: String,
     pub icon: i32,
+}
+
+/// The box a result's new name is typed in (F2).
+pub struct RenameView {
+    pub rect: Rect,
+    pub layout: Option<IDWriteTextLayout>,
+    pub scroll: f32,
+    pub caret_x: f32,
+    pub show_caret: bool,
+    pub selection: Vec<(f32, f32)>,
 }
 
 pub struct SearchView {
@@ -103,6 +115,8 @@ pub struct Frame<'a> {
     pub index_text: String,
     pub filter_count: usize,
     pub rows: Vec<RowView>,
+    /// A result being renamed in place.
+    pub rename: Option<RenameView>,
     pub empty_message: Option<String>,
     pub sort_column: Button,
     pub sort_ascending: bool,
@@ -659,6 +673,9 @@ fn paint_list(p: &Painter, icons: &mut IconCache, frame: &Frame) {
             pal.text2,
         );
     }
+    if let Some(rename) = &frame.rename {
+        paint_rename(p, frame, rename);
+    }
     if let Some(message) = &frame.empty_message {
         p.text(
             message,
@@ -683,6 +700,32 @@ fn paint_list(p: &Painter, icons: &mut IconCache, frame: &Frame) {
         }
         p.fill_round(thumb, 3.0, pal.scrollbar);
     }
+}
+
+/// An edit box over the name, like Explorer's: the name, its selection, and
+/// the caret, on a solid field with an accent outline.
+fn paint_rename(p: &Painter, frame: &Frame, rename: &RenameView) {
+    let pal = &frame.palette;
+    let rect = rename.rect;
+    p.fill_round(rect, 6.0, pal.opaque_base());
+    p.stroke_round(rect, 6.0, pal.accent, 1.5);
+    let area = Rect::new(rect.l + 6.0, rect.t + 3.0, rect.r - 6.0, rect.b - 3.0);
+    p.clip(area);
+    let origin = area.l - rename.scroll;
+    for &(left, right) in &rename.selection {
+        p.fill(
+            Rect::new(origin + left, area.t, origin + right, area.b),
+            pal.accent.alpha(0.28),
+        );
+    }
+    if let Some(text) = &rename.layout {
+        p.text_layout(text, origin, area.t, pal.text);
+    }
+    if rename.show_caret {
+        let x = (origin + rename.caret_x).round() + 0.5;
+        p.line(x, area.t + 1.0, x, area.b - 1.0, pal.accent, 1.5);
+    }
+    p.unclip();
 }
 
 fn paint_details(p: &Painter, icons: &mut IconCache, frame: &Frame) {
@@ -747,6 +790,7 @@ fn paint_details(p: &Painter, icons: &mut IconCache, frame: &Frame) {
     for (label, value) in [
         ("Type", details.kind.as_str()),
         ("Size", details.size.as_str()),
+        ("Contains", details.items.as_str()),
         ("Modified", details.modified.as_str()),
         ("Folder", details.folder.as_str()),
     ] {

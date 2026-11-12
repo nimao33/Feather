@@ -680,13 +680,19 @@ fn search(app: &App, params: &Params) -> String {
                 }
                 if in_page {
                     let view = index.entry(reference);
+                    // Folders have a size only when the index has totals.
+                    let size = if view.is_dir() && !volume.has_folder_totals() {
+                        "null".to_string()
+                    } else {
+                        view.size.to_string()
+                    };
                     rows.push(format!(
                         "{{\"path\":{},\"name\":{},\"folder\":{},\"dir\":{},\"size\":{},\"modified\":{}}}",
                         quote(&path),
                         quote(&String::from_utf16_lossy(view.name_display)),
                         quote(&parent_of(&path)),
                         view.is_dir(),
-                        view.size,
+                        size,
                         unix_seconds(view.mtime)
                     ));
                 }

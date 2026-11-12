@@ -54,8 +54,9 @@ function grouped(number) {
   return number.toLocaleString();
 }
 
-function size(bytes, dir) {
-  if (dir) return '';
+function size(bytes) {
+  // Folders come without a size from indexes built before folder totals.
+  if (bytes == null) return '';
   const unit = (power, name) => {
     const value = bytes / 1024 ** power;
     const places = value >= 100 ? 0 : value >= 10 ? 1 : 2;
@@ -97,7 +98,7 @@ function rowFor(item, index) {
   const text = element('span', 'text');
   text.append(element('span', 'title', item.name), element('span', 'where', item.folder));
   name.append(element('span', item.dir ? 'kind dir' : 'kind'), text);
-  row.append(name, element('span', 'size', size(item.size, item.dir)), element('span', 'when', when(item.modified)));
+  row.append(name, element('span', 'size', size(item.size)), element('span', 'when', when(item.modified)));
   if (index === state.selected) row.setAttribute('aria-selected', 'true');
   return row;
 }
