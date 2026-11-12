@@ -729,6 +729,9 @@ impl Session<'_> {
 
     fn delete(&mut self, argument: &str) -> io::Result<()> {
         match self.place(argument).and_then(|place| self.existing(place)) {
+            Some((_, path)) if path.is_dir() && self.shared.roots.holds_blocked(&path) => {
+                self.reply(550, "That folder holds a folder that isn't shared.")
+            }
             Some((root, path)) if !self.shared.roots.is_root(root, &path) => {
                 match files::recycle(&path) {
                     Ok(()) => {
@@ -766,6 +769,10 @@ impl Session<'_> {
         let Some((from_root, from)) = self.rename_from.take() else {
             return self.reply(503, "Send RNFR first.");
         };
+        // A new name above a left-out folder would expose it.
+        if from.is_dir() && self.shared.roots.holds_blocked(&from) {
+            return self.reply(553, "That folder holds a folder that isn't shared.");
+        }
         match self.new_item(argument) {
             Some((root, target)) if root == from_root && !target.exists() => {
                 match std::fs::rename(&from, &target) {

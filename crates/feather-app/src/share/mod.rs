@@ -1639,6 +1639,15 @@ mod tests {
         // A folder holding a left-out folder can't be moved, so the left-out
         // folder stays left out; a copy leaves it, and hidden files, behind.
         assert_eq!(post("/api/move?root=0&path=docs&to_root=1&to=").0, 403);
+        // Renaming or deleting it would expose or remove the left-out folder
+        // too: a new name changes the path it is left out by.
+        assert_eq!(post("/api/rename?root=0&path=docs&to=docs2").0, 403);
+        assert!(shared.join("docs").join("private").is_dir());
+        assert_eq!(post("/api/delete?root=0&path=docs").0, 403);
+        assert_eq!(post("/api/delete?root=0&path=docs&permanent=1").0, 403);
+        assert!(shared.join("docs").join("private").is_dir());
+        #[cfg(windows)]
+        assert_eq!(post("/api/delete?root=0&path=docs/sub&permanent=1").0, 403);
         assert_eq!(post("/api/copy?root=0&path=docs&to_root=1&to=").0, 201);
         assert!(second.join("docs").join("sub").join("b.txt").is_file());
         assert!(!second.join("docs").join("private").exists());
@@ -1669,6 +1678,13 @@ mod tests {
         assert_eq!(post("/api/mkdir?root=0&path=docs&name=New").0, 201);
         assert_eq!(post("/api/mkdir?root=0&path=docs&name=New").0, 409);
         assert_eq!(post("/api/mkdir?root=0&path=docs/private&name=x").0, 404);
+        // Deleting for good: never on Windows, which has the Recycle Bin.
+        #[cfg(windows)]
+        {
+            assert_eq!(post("/api/delete?root=0&path=docs/New&permanent=1").0, 403);
+            std::fs::remove_dir(shared.join("docs").join("New")).unwrap();
+        }
+        #[cfg(not(windows))]
         assert_eq!(post("/api/delete?root=0&path=docs/New&permanent=1").0, 200);
         assert!(!shared.join("docs").join("New").exists());
         assert_eq!(

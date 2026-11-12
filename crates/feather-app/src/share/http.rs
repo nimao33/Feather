@@ -1306,8 +1306,9 @@ fn call(
         ("POST", "/api/rename") if full => {
             let to = params.get("to").unwrap_or("");
             let path = params.path();
+            // Either separator: resolve accepts both.
             let parent = path
-                .rsplit_once('/')
+                .rsplit_once(['/', '\\'])
                 .map(|(parent, _)| parent)
                 .unwrap_or("");
             match (
@@ -1316,6 +1317,11 @@ fn call(
             ) {
                 (Ok(from), _) if shared.roots.is_root(params.root(), &from) => {
                     Reply::Json(403, error_json("A shared folder itself can't be renamed."))
+                }
+                // Left-out folders are matched by their full path, so a new
+                // name for a folder above one would expose it.
+                (Ok(from), _) if from.is_dir() && shared.roots.holds_blocked(&from) => {
+                    Reply::Json(403, error_json("This folder holds a folder that isn't shared, so it can't be renamed, moved or deleted from here."))
                 }
                 (Ok(_), Ok(target)) if target.exists() => Reply::Json(
                     409,
@@ -1346,6 +1352,15 @@ fn call(
             Ok(target) if shared.roots.is_root(params.root(), &target) => {
                 Reply::Json(403, error_json("A shared folder itself can't be deleted."))
             }
+            Ok(target) if target.is_dir() && shared.roots.holds_blocked(&target) => {
+                Reply::Json(403, error_json("This folder holds a folder that isn't shared, so it can't be renamed, moved or deleted from here."))
+            }
+            // Windows always has the Recycle Bin: visitors never delete for
+            // good there.
+            Ok(_) if cfg!(windows) && params.get("permanent") == Some("1") => Reply::Json(
+                403,
+                error_json("Items can only be moved to the Recycle Bin."),
+            ),
             Ok(target) => {
                 // For good only when the person chose that, after the trash
                 // couldn't take it.
