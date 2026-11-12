@@ -67,8 +67,20 @@ web page.
   TLS for the folders you choose, behind a password. It is reachable from this
   PC, your local network (with a QR code for your phone), or the internet
   through Cloudflare Tunnel, ngrok or a forwarded port. The web page shows
-  photos and videos in place, with thumbnails, swiping and a video player
-  made for phones.
+  photos and videos in place, with thumbnails, swiping, pinch to zoom and
+  turn, and a video player made for phones. Folders show their total size,
+  download as a zip, and sort by name, size, date or type. With full access,
+  people can upload files and folders, and hold (or right-click) an item to
+  move, copy, rename or delete it; deleted items go to the Recycle Bin (or
+  the trash on Linux).
+- **Install the share page as an app** on a phone ("Add to Home screen"). It
+  remembers the computer's addresses (local network and tunnel), and when the
+  one it was opened at stops answering, it looks for the others, prefers the
+  local network, or reads the QR code from Settings. Browsers tie an
+  installed web app to the address it was installed from: another address
+  opens in the browser, not in the app, and the app only installs where the
+  browser trusts the certificate (a tunnel's address, not Feather's own
+  certificate on the local network).
 - **CLI**: `feather search`, `feather index scan`, `feather config`, with
   JSON output.
 
