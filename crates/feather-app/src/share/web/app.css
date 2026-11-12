@@ -305,6 +305,7 @@ body.viewing { overflow: hidden; }
 /* The video and its controls turn together, so the controls stay along
    the bottom edge of the video as it is seen. */
 .pframe { position: absolute; left: 50%; top: 50%; width: 100%; height: 100%; overflow: hidden; transform: translate(-50%, -50%); transform-origin: 50% 50%; }
+.pspin { position: absolute; left: 50%; top: 50%; width: 100%; height: 100%; transform: translate(-50%, -50%); transform-origin: 50% 50%; }
 .player video { position: absolute; left: 50%; top: 50%; width: 100%; height: 100%; max-width: none; object-fit: contain; transform: translate(-50%, -50%); transform-origin: 50% 50%; }
 .player .pnote { position: absolute; left: 50%; top: 42%; transform: translate(-50%, -50%); padding: 10px 16px; border-radius: 20px; background: rgba(20, 18, 16, 0.75); font-size: 15px; font-weight: 600; opacity: 0; pointer-events: none; transition: opacity 150ms ease-out; }
 .player .pnote.show { opacity: 1; }

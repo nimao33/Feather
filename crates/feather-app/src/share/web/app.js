@@ -413,8 +413,8 @@ function thumbImage(entry, className) {
 const ICONS = {
   play: '<svg viewBox="0 0 20 20" aria-hidden="true"><path class="fill" d="M6 4.2v11.6a.6.6 0 0 0 .9.5l9.2-5.8a.6.6 0 0 0 0-1L6.9 3.7a.6.6 0 0 0-.9.5Z"/></svg>',
   pause: '<svg viewBox="0 0 20 20" aria-hidden="true"><rect class="fill" x="5" y="4" width="3.4" height="12" rx="1"/><rect class="fill" x="11.6" y="4" width="3.4" height="12" rx="1"/></svg>',
-  back: '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4.2 9.5a6 6 0 1 1 1.9 4.9M4 4.5v4.8h4.8"/><text class="fill" x="11.4" y="13" font-size="6.2" font-weight="700" text-anchor="middle">10</text></svg>',
-  forward: '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M15.8 9.5a6 6 0 1 0-1.9 4.9M16 4.5v4.8h-4.8"/><text class="fill" x="8.6" y="13" font-size="6.2" font-weight="700" text-anchor="middle">10</text></svg>',
+  back: '<svg viewBox="0 0 20 20" aria-hidden="true"><path class="fill" d="M9.6 5.2 3.4 10l6.2 4.8V5.2Zm7 0L10.4 10l6.2 4.8V5.2Z"/></svg>',
+  forward: '<svg viewBox="0 0 20 20" aria-hidden="true"><path class="fill" d="M10.4 5.2 16.6 10l-6.2 4.8V5.2Zm-7 0L9.6 10l-6.2 4.8V5.2Z"/></svg>',
   loop: '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 9V8a3 3 0 0 1 3-3h9m-2.5-2.5L16 5l-2.5 2.5M16 11v1a3 3 0 0 1-3 3H4m2.5 2.5L4 15l2.5-2.5"/></svg>',
   rotate: '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M15.5 9.5A5.5 5.5 0 1 1 13 4.9M13.5 2v3.2h-3.2"/></svg>',
   sound: '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3.5 8v4h3l4 3.5v-11l-4 3.5h-3Z"/><path d="M13.5 7.5a3.5 3.5 0 0 1 0 5M15.5 5.5a6.4 6.4 0 0 1 0 9"/></svg>',
@@ -493,7 +493,10 @@ function videoPlayer(source, entry) {
   row.append(play, back, forward, time, gap, loop, rotate, sound, full);
   controls.append(seek, row);
   const note = element('div', 'pnote');
-  frame.append(video, big, skip, controls, note);
+  // Only `spin` (the picture) turns; the controls stay upright.
+  const spin = element('div', 'pspin');
+  spin.append(video);
+  frame.append(spin, big, skip, controls, note);
   shell.append(frame);
 
   // `turn` is a quarter turn or more; `live` is what two fingers add
@@ -505,9 +508,9 @@ function videoPlayer(source, entry) {
 
   const fit = () => {
     const sideways = turn % 180 !== 0;
-    frame.style.width = (sideways ? shell.clientHeight : shell.clientWidth) + 'px';
-    frame.style.height = (sideways ? shell.clientWidth : shell.clientHeight) + 'px';
-    frame.style.transform = 'translate(-50%, -50%) rotate(' + (turn + live) + 'deg)';
+    spin.style.width = (sideways ? shell.clientHeight : shell.clientWidth) + 'px';
+    spin.style.height = (sideways ? shell.clientWidth : shell.clientHeight) + 'px';
+    spin.style.transform = 'translate(-50%, -50%) rotate(' + (turn + live) + 'deg)';
   };
   const resized = 'ResizeObserver' in window ? new ResizeObserver(fit) : null;
   if (resized) resized.observe(shell);
@@ -559,9 +562,11 @@ function videoPlayer(source, entry) {
       if (video.buffered.start(index) <= video.currentTime + 0.5) loaded = Math.max(loaded, video.buffered.end(index));
     }
     const buffered = Number.isFinite(length) && length > 0 ? loaded / length : 0;
-    if (!seeking) seek.value = String(Math.round(at * 1000));
-    seek.style.setProperty('--played', (at * 100).toFixed(2) + '%');
     seek.style.setProperty('--loaded', (Math.max(at, buffered) * 100).toFixed(2) + '%');
+    // While a finger is on the bar, it and the time follow the finger.
+    if (seeking) return;
+    seek.value = String(Math.round(at * 1000));
+    seek.style.setProperty('--played', (at * 100).toFixed(2) + '%');
     time.textContent = clock(video.currentTime) + ' / ' + clock(length);
   };
 
@@ -610,16 +615,52 @@ function videoPlayer(source, entry) {
   };
   document.addEventListener('fullscreenchange', fullChanged);
 
+  // Dragging: the bar and the time follow the finger at once, and the
+  // picture follows as fast as the connection allows: one quick seek (to a
+  // nearby keyframe) at a time, always to where the finger is now. Letting
+  // go seeks exactly there.
+  // Some recordings (phones, screen recorders) don't say how long they
+  // are, which leaves nothing to seek in: asking for a time far past the
+  // end makes the browser find the length, then playback starts over.
+  video.addEventListener('loadedmetadata', () => {
+    if (video.duration !== Infinity) return;
+    const resume = !video.paused;
+    video.addEventListener('durationchange', function found() {
+      if (!Number.isFinite(video.duration)) return;
+      video.removeEventListener('durationchange', found);
+      video.currentTime = 0;
+      if (resume) video.play().catch(() => {});
+      progress();
+    });
+    video.currentTime = 1e101;
+  });
+  let wanted = null;
+  const seekTo = (seconds, exact) => {
+    if (!exact && typeof video.fastSeek === 'function') video.fastSeek(seconds);
+    else video.currentTime = seconds;
+  };
+  video.addEventListener('seeked', () => {
+    if (seeking && wanted !== null && Math.abs(video.currentTime - wanted) > 0.25) seekTo(wanted, false);
+  });
   seek.addEventListener('input', () => {
     seeking = true;
     if (Number.isFinite(video.duration)) {
-      video.currentTime = (Number(seek.value) / 1000) * video.duration;
+      wanted = (Number(seek.value) / 1000) * video.duration;
       seek.style.setProperty('--played', (Number(seek.value) / 10).toFixed(2) + '%');
-      time.textContent = clock(video.currentTime) + ' / ' + clock(video.duration);
+      time.textContent = clock(wanted) + ' / ' + clock(video.duration);
+      if (!video.seeking) seekTo(wanted, false);
     }
     wake();
   });
-  seek.addEventListener('change', () => { seeking = false; });
+  const letGo = () => {
+    if (!seeking) return;
+    seeking = false;
+    if (wanted !== null) seekTo(wanted, true);
+    wanted = null;
+  };
+  seek.addEventListener('change', letGo);
+  seek.addEventListener('pointerup', letGo);
+  seek.addEventListener('pointercancel', letGo);
 
   // A click plays and pauses; a finger tap shows or hides the controls.
   // Taps that were part of a pinch, a pan, or a swipe don't count.
@@ -647,7 +688,7 @@ function videoPlayer(source, entry) {
   shell.toggle = toggle;
   shell.wake = wake;
   shell.skipBy = skipBy;
-  shell.frame = frame;
+  shell.frame = spin;
   shell.zoomed = video;
   /** The whole turn as seen, for the viewer's gestures. */
   shell.turnBase = () => turn;
@@ -656,7 +697,7 @@ function videoPlayer(source, entry) {
   shell.settle = (degrees) => {
     turn = (((Math.round((turn + degrees) / 90) * 90) % 360) + 360) % 360;
     live = 0;
-    animateOnce(frame);
+    animateOnce(spin);
     fit();
   };
   shell.upright = () => { turn = 0; live = 0; fit(); };
@@ -891,6 +932,9 @@ function atFit() {
 }
 
 /** The turn the picture already has before the gesture's own. */
+/** Degrees two fingers must twist before a pinch starts to rotate. */
+const TURN_THRESHOLD = 20;
+
 function baseTurn() {
   return viewer.shell && viewer.shell.turnBase ? viewer.shell.turnBase() : 0;
 }
@@ -1037,7 +1081,11 @@ function wireGestures() {
       let turned = now.angle - pinch.angle;
       if (turned > 180) turned -= 360;
       if (turned < -180) turned += 360;
-      gesture.a = pinch.a + turned;
+      // Fingers always twist a little while pinching: turn only once the
+      // twist passes a threshold, then follow it from there without a jump.
+      if (!pinch.turning && Math.abs(turned) > TURN_THRESHOLD) pinch.turning = Math.sign(turned);
+      const applied = pinch.turning ? turned - pinch.turning * TURN_THRESHOLD : 0;
+      gesture.a = pinch.a + applied;
       const turn = ((baseTurn() + gesture.a) * Math.PI) / 180;
       gesture.x = now.x - gesture.s * (pinch.cx * Math.cos(turn) - pinch.cy * Math.sin(turn));
       gesture.y = now.y - gesture.s * (pinch.cx * Math.sin(turn) + pinch.cy * Math.cos(turn));
@@ -1088,24 +1136,46 @@ function wireGestures() {
       setTimeout(() => { viewer.swiped = false; }, 400);
     }
     gesture.pan = null;
-    // Two quick taps in one place: back to fit. (Mice double-click.)
+    // Two quick taps in one place: on a video's sides, 10 seconds back or
+    // forward (keep tapping to skip more); elsewhere, back to fit. (Mice
+    // double-click.)
     if (event.type === 'pointerup' && event.pointerType !== 'mouse' && !gesture.moved && gesture.pointers.size === 0) {
       const now = Date.now();
       const last = gesture.lastTap;
-      if (last && now - last.at < 320 && Math.hypot(event.clientX - last.x, event.clientY - last.y) < 40) {
-        gesture.lastTap = null;
-        resetView(true);
-        if (viewer.shell && viewer.shell.wake) viewer.shell.wake();
+      const side = sideOf(event.clientX);
+      if (last && last.skipping && side === last.skipping && now - last.at < 600) {
+        viewer.shell.skipBy(side === 'left' ? -10 : 10);
+        gesture.lastTap = { at: now, x: event.clientX, y: event.clientY, skipping: side };
+      } else if (last && now - last.at < 320 && Math.hypot(event.clientX - last.x, event.clientY - last.y) < 40) {
+        if (side) {
+          viewer.shell.skipBy(side === 'left' ? -10 : 10);
+          gesture.lastTap = { at: now, x: event.clientX, y: event.clientY, skipping: side };
+        } else {
+          gesture.lastTap = null;
+          resetView(true);
+          if (viewer.shell && viewer.shell.wake) viewer.shell.wake();
+        }
       } else {
         gesture.lastTap = { at: now, x: event.clientX, y: event.clientY };
       }
     }
   };
+  /** 'left' or 'right' when `x` is in an outer third of a playing video. */
+  const sideOf = (x) => {
+    if (!viewer.shell || !viewer.shell.skipBy) return null;
+    const box = stage.getBoundingClientRect();
+    const at = (x - box.left) / Math.max(1, box.width);
+    if (at < 1 / 3) return 'left';
+    if (at > 2 / 3) return 'right';
+    return null;
+  };
   stage.addEventListener('pointerup', up);
   stage.addEventListener('pointercancel', up);
   stage.addEventListener('dblclick', (event) => {
     if (event.target.closest && event.target.closest('.controls, .pbtn')) return;
-    resetView(true);
+    const side = sideOf(event.clientX);
+    if (side) viewer.shell.skipBy(side === 'left' ? -10 : 10);
+    else resetView(true);
   });
   stage.addEventListener('wheel', (event) => {
     if (!viewer.shell) return;
