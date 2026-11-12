@@ -21,9 +21,11 @@ pub mod firewall;
 mod ftp;
 pub(crate) mod http;
 pub mod secret;
+pub mod sizes;
 pub mod thumbs;
 pub mod tls;
 pub mod tunnel;
+mod zip;
 
 use std::io::Write as _;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
@@ -127,7 +129,9 @@ impl Config {
 /// State both servers share.
 pub(crate) struct Shared {
     pub config: Config,
-    pub roots: files::Roots,
+    pub roots: Arc<files::Roots>,
+    /// Folder totals, added up away from the requests.
+    pub sizes: Arc<sizes::Sizes>,
     pub guard: auth::Guard,
     pub sessions: auth::Sessions,
     pub tls: Arc<rustls::ServerConfig>,
@@ -143,6 +147,8 @@ pub(crate) struct Shared {
     /// Serves plain HTTP instead of HTTPS. Only tests set it, to drive the
     /// page from a browser on 127.0.0.1.
     pub plain: bool,
+    /// The addresses people can open, for the page to remember.
+    pub status: Arc<Mutex<Status>>,
 }
 
 impl Shared {
@@ -244,7 +250,8 @@ impl Sharing {
         });
         let shared = Arc::new(Shared {
             config: config.clone(),
-            roots,
+            roots: Arc::new(roots),
+            sizes: Arc::default(),
             guard: auth::Guard::default(),
             sessions: auth::Sessions::default(),
             tls: tls.unwrap_or(fallback),
@@ -256,6 +263,7 @@ impl Sharing {
             handshakes: auth::Handshakes::default(),
             open_csrf: auth::token(24),
             plain: plain_for_tests,
+            status: Arc::clone(&status),
         });
         let mut sharing = Self {
             shared: Arc::clone(&shared),
@@ -765,6 +773,79 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// The installed app's files and its ping are there for anyone, and the
+    /// ping says only that this is Feather.
+    #[test]
+    fn the_installed_app_can_find_feather_again() {
+        let (base, shared, state) = sample_share("pwa");
+        let port = free_port();
+        let mut config = Config::from_settings(&Settings::default());
+        config.http = HttpMode::Download;
+        config.access = ShareAccess::Local;
+        config.http_port = port;
+        config.user = "tester".into();
+        config.password_hash = auth::hash_password("abcd").unwrap();
+        config.folders = vec![shared.to_string_lossy().to_string()];
+        let sharing = Sharing::start_in(config, Arc::new(IndexSet::empty()), &state);
+        let tls_config = client(&std::fs::read(state.join("server.cer")).unwrap());
+        let host = format!("Host: localhost:{port}\r\nConnection: close\r\n");
+        let (code, head, body) = https(
+            &tls_config,
+            port,
+            &format!("GET /api/ping HTTP/1.1\r\n{host}Origin: https://other.example\r\n\r\n"),
+            b"",
+        );
+        assert_eq!(code, 200);
+        assert!(head.contains("Access-Control-Allow-Origin: *"));
+        assert!(!head.contains("Set-Cookie"));
+        assert_eq!(body, b"{\"app\":\"feather\"}");
+        let (code, head, _) = https(
+            &tls_config,
+            port,
+            &format!(
+                "OPTIONS /api/ping HTTP/1.1\r\n{host}Origin: https://other.example\r\n\
+                 Access-Control-Request-Method: GET\r\nAccess-Control-Request-Private-Network: true\r\n\r\n"
+            ),
+            b"",
+        );
+        assert_eq!(code, 204);
+        assert!(head.contains("Access-Control-Allow-Private-Network: true"));
+        // Nothing else answers other sites.
+        let (code, head, _) = https(
+            &tls_config,
+            port,
+            &format!("GET /api/info HTTP/1.1\r\n{host}Origin: https://other.example\r\n\r\n"),
+            b"",
+        );
+        assert_eq!(code, 401);
+        assert!(!head.contains("Access-Control-Allow-Origin"));
+        for (path, kind) in [
+            ("/manifest.webmanifest", "application/manifest+json"),
+            ("/sw.js", "text/javascript"),
+            ("/reconnect", "text/html"),
+            ("/reconnect.js", "text/javascript"),
+            ("/icon-192.png", "image/png"),
+            ("/icon-512.png", "image/png"),
+            ("/icon-maskable.png", "image/png"),
+            ("/apple-touch-icon.png", "image/png"),
+        ] {
+            let (code, head, body) = https(
+                &tls_config,
+                port,
+                &format!("GET {path} HTTP/1.1\r\n{host}\r\n"),
+                b"",
+            );
+            assert_eq!(code, 200, "{path}");
+            assert!(
+                head.contains(&format!("Content-Type: {kind}")),
+                "{path}: {head}"
+            );
+            assert!(!body.is_empty(), "{path}");
+        }
+        drop(sharing);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn end_to_end_encryption_never_sends_the_password() {
         use super::http::{cipher, frame_aad, open, seal};
@@ -863,6 +944,15 @@ mod tests {
             b"",
         );
         assert_eq!(code, 403);
+        // Folders aren't zipped end to end, and the page is told why.
+        let (code, _, body) = https(
+            &tls_config,
+            port,
+            &format!("GET /api/zip?root=0&path=docs HTTP/1.1\r\n{signed}\r\n"),
+            b"",
+        );
+        assert_eq!(code, 403);
+        assert!(String::from_utf8_lossy(&body).contains("encrypted end to end"));
 
         // A sealed listing.
         let request = seal(&session, b"feather request", b"op=/api/list&root=0&path=");
@@ -1031,7 +1121,11 @@ mod tests {
         config.folders = vec![shared.to_string_lossy().to_string()];
         let sharing = Sharing::start_with(config, Arc::new(IndexSet::empty()), &state, true);
         println!("ready {:?}", sharing.status().problems);
-        std::thread::sleep(Duration::from_secs(180));
+        let seconds = std::env::var("FEATHER_PAGE_SECONDS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(180);
+        std::thread::sleep(Duration::from_secs(seconds));
     }
 
     #[test]
@@ -1262,6 +1356,49 @@ mod tests {
             std::fs::read(shared.join("docs").join("b.txt")).unwrap(),
             b"up"
         );
+        // The same name again: the page is asked, then told what to do.
+        let put = |query: &str, body: &[u8]| {
+            https(
+                &tls_config,
+                http_port,
+                &format!(
+                    "PUT /api/upload?{query} HTTP/1.1\r\n{signed}X-Feather-Csrf: {csrf}\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                ),
+                body,
+            )
+        };
+        let (code, _, body) = put("root=0&path=docs&name=b.txt", b"again");
+        assert_eq!(code, 409);
+        assert!(String::from_utf8_lossy(&body).contains("\"conflict\":true"));
+        let (code, _, body) = put("root=0&path=docs&name=b.txt&conflict=keep", b"both");
+        assert_eq!(code, 201);
+        assert!(String::from_utf8_lossy(&body).contains("b (2).txt"));
+        assert_eq!(
+            std::fs::read(shared.join("docs").join("b (2).txt")).unwrap(),
+            b"both"
+        );
+        let (code, _, _) = put("root=0&path=docs&name=b.txt&conflict=replace", b"new");
+        assert_eq!(code, 201);
+        assert_eq!(
+            std::fs::read(shared.join("docs").join("b.txt")).unwrap(),
+            b"new"
+        );
+        // A whole folder: its folders are made, safely.
+        let (code, _, _) = put("root=0&path=docs&name=c.txt&sub=Trip%2FDay+1", b"c");
+        assert_eq!(code, 201);
+        assert_eq!(
+            std::fs::read(shared.join("docs").join("Trip").join("Day 1").join("c.txt")).unwrap(),
+            b"c"
+        );
+        for sub in ["..%2F..", "Trip%2F..%2F..%2Fescape", "a%3Ab", "CON"] {
+            let (code, _, _) = put(&format!("root=0&path=docs&name=d.txt&sub={sub}"), b"d");
+            assert_eq!(code, 400, "{sub}");
+        }
+        assert!(!base.join("escape").exists() && !base.join("d.txt").exists());
+        // A file where a folder should be.
+        let (code, _, _) = put("root=0&path=docs&name=e.txt&sub=a.txt", b"e");
+        assert_eq!(code, 409);
 
         // FTP refuses to sign in without TLS, then works over it.
         let control = TcpStream::connect(("127.0.0.1", ftp_port)).unwrap();
@@ -1340,6 +1477,499 @@ mod tests {
             !log.contains("correct horse"),
             "passwords never reach the log"
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The body of a chunked reply.
+    fn unchunk(mut body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let line = body.windows(2).position(|w| w == b"\r\n").unwrap();
+            let size = usize::from_str_radix(std::str::from_utf8(&body[..line]).unwrap(), 16)
+                .expect("a chunk size");
+            body = &body[line + 2..];
+            if size == 0 {
+                assert_eq!(body, b"\r\n", "the reply ends cleanly");
+                return out;
+            }
+            out.extend_from_slice(&body[..size]);
+            assert_eq!(&body[size..size + 2], b"\r\n");
+            body = &body[size + 2..];
+        }
+    }
+
+    #[cfg(windows)]
+    fn make_hidden(path: &std::path::Path) {
+        use std::os::windows::ffi::OsStrExt;
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        // FILE_ATTRIBUTE_HIDDEN
+        let done = unsafe {
+            windows_sys::Win32::Storage::FileSystem::SetFileAttributesW(wide.as_ptr(), 0x2)
+        };
+        assert_ne!(done, 0);
+    }
+
+    /// A link (a junction on Windows) at `link` to the folder `target`.
+    fn link_folder(target: &std::path::Path, link: &std::path::Path) -> bool {
+        #[cfg(windows)]
+        {
+            std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .is_ok_and(|output| output.status.success())
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+    }
+
+    /// Move, copy, new folder, and delete: both ends stay inside what is
+    /// shared and may be seen, folders can't go into themselves, names
+    /// already taken are asked about, and folder totals leave out what
+    /// isn't shared.
+    #[test]
+    fn moving_and_copying_stay_inside_what_is_shared() {
+        let base = std::env::temp_dir().join(format!("feather-move-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let shared = base.join("shared");
+        let second = base.join("second");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(shared.join("docs").join("sub")).unwrap();
+        std::fs::create_dir_all(shared.join("docs").join("private")).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(shared.join("docs").join("a.txt"), b"hello").unwrap();
+        std::fs::write(shared.join("docs").join("sub").join("b.txt"), b"bb").unwrap();
+        std::fs::write(shared.join("docs").join("private").join("p.txt"), b"p").unwrap();
+        let hidden = if cfg!(windows) { "hid.txt" } else { ".hid.txt" };
+        std::fs::write(shared.join("docs").join(hidden), b"hidden").unwrap();
+        #[cfg(windows)]
+        make_hidden(&shared.join("docs").join(hidden));
+        let real = files::display_path(&std::fs::canonicalize(&shared).unwrap());
+        let sep = std::path::MAIN_SEPARATOR;
+
+        let start = |mode: HttpMode| {
+            let state = base.join(format!("state-{mode:?}"));
+            let port = free_port();
+            let mut config = Config::from_settings(&Settings::default());
+            config.http = mode;
+            config.access = ShareAccess::Local;
+            config.http_port = port;
+            config.folders = vec![
+                shared.to_string_lossy().to_string(),
+                second.to_string_lossy().to_string(),
+            ];
+            config.excluded = vec![format!("{real}{sep}docs{sep}private")];
+            config.show_hidden = false;
+            config.show_system = false;
+            let sharing = Sharing::start_in(config, Arc::new(IndexSet::empty()), &state);
+            let tls_config = client(&std::fs::read(state.join("server.cer")).unwrap());
+            (sharing, tls_config, port)
+        };
+        let (sharing, tls_config, port) = start(HttpMode::Full);
+        let host = format!("Host: localhost:{port}\r\nConnection: close\r\n");
+        let (_, _, body) = https(
+            &tls_config,
+            port,
+            &format!("GET /api/info HTTP/1.1\r\n{host}\r\n"),
+            b"",
+        );
+        let info = String::from_utf8(body).unwrap();
+        let csrf = info
+            .split("\"csrf\":\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap()
+            .to_string();
+        let post = |call: &str| -> (u16, String) {
+            let (code, _, body) = https(
+                &tls_config,
+                port,
+                &format!("POST {call} HTTP/1.1\r\n{host}X-Feather-Csrf: {csrf}\r\n\r\n"),
+                b"",
+            );
+            (code, String::from_utf8_lossy(&body).into_owned())
+        };
+
+        // A file moves to the shared folder's top, and back.
+        let (code, body) = post("/api/move?root=0&path=docs/a.txt&to=");
+        assert_eq!(code, 201, "{body}");
+        assert!(shared.join("a.txt").is_file() && !shared.join("docs").join("a.txt").exists());
+        assert_eq!(post("/api/move?root=0&path=a.txt&to=docs").0, 201);
+        // Copied into the other shared folder.
+        assert_eq!(
+            post("/api/copy?root=0&path=docs/a.txt&to_root=1&to=").0,
+            201
+        );
+        assert_eq!(std::fs::read(second.join("a.txt")).unwrap(), b"hello");
+        // Taken names are asked about, then kept both or replaced.
+        let (code, body) = post("/api/copy?root=0&path=docs/a.txt&to_root=1&to=");
+        assert_eq!(code, 409);
+        assert!(body.contains("\"conflict\":true"), "{body}");
+        let (code, body) = post("/api/copy?root=0&path=docs/a.txt&to_root=1&to=&conflict=keep");
+        assert_eq!(code, 201);
+        assert!(body.contains("a (2).txt"), "{body}");
+        std::fs::write(shared.join("docs").join("sub").join("a.txt"), b"newer").unwrap();
+        assert_eq!(
+            post("/api/move?root=0&path=docs/sub/a.txt&to_root=1&to=&conflict=replace").0,
+            201
+        );
+        assert_eq!(std::fs::read(second.join("a.txt")).unwrap(), b"newer");
+        // Copying beside itself keeps both; moving onto itself can't be.
+        assert_eq!(
+            post("/api/copy?root=0&path=docs/a.txt&to=docs&conflict=keep").0,
+            201
+        );
+        assert!(shared.join("docs").join("a (2).txt").is_file());
+        assert_eq!(
+            post("/api/move?root=0&path=docs/a.txt&to=docs&conflict=replace").0,
+            400
+        );
+
+        // A folder can't go into itself, or below itself.
+        assert_eq!(post("/api/move?root=0&path=docs&to=docs").0, 400);
+        assert_eq!(post("/api/copy?root=0&path=docs&to=docs/sub").0, 400);
+        // A shared folder itself can't be moved.
+        assert_eq!(post("/api/move?root=0&path=&to_root=1&to=").0, 403);
+        // A folder holding a left-out folder can't be moved, so the left-out
+        // folder stays left out; a copy leaves it, and hidden files, behind.
+        assert_eq!(post("/api/move?root=0&path=docs&to_root=1&to=").0, 403);
+        assert_eq!(post("/api/copy?root=0&path=docs&to_root=1&to=").0, 201);
+        assert!(second.join("docs").join("sub").join("b.txt").is_file());
+        assert!(!second.join("docs").join("private").exists());
+        assert!(!second.join("docs").join(hidden).exists());
+        // Left-out, hidden, outside, and malformed places, at either end.
+        for call in [
+            "/api/move?root=0&path=docs/private/p.txt&to=",
+            "/api/copy?root=0&path=docs/private&to_root=1&to=",
+            &format!("/api/copy?root=0&path=docs/{hidden}&to_root=1&to="),
+            "/api/move?root=0&path=docs/sub/b.txt&to=docs/private",
+            "/api/copy?root=0&path=docs/sub/b.txt&to_root=7&to=",
+            "/api/copy?root=0&path=docs/sub/b.txt&to=missing",
+            "/api/copy?root=0&path=docs/sub/b.txt&to=docs/sub/b.txt",
+        ] {
+            assert_eq!(post(call).0, 404, "{call}");
+        }
+        for call in [
+            "/api/copy?root=0&path=../outside&to=",
+            "/api/copy?root=0&path=docs/sub/b.txt&to=../outside",
+            "/api/copy?root=0&path=docs/sub/b.txt&to=docs%5C..%5C..%5Coutside",
+        ] {
+            assert_eq!(post(call).0, 400, "{call}");
+        }
+        assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
+        assert!(shared.join("docs").join("private").join("p.txt").is_file());
+
+        // New folders, and deleting.
+        assert_eq!(post("/api/mkdir?root=0&path=docs&name=New").0, 201);
+        assert_eq!(post("/api/mkdir?root=0&path=docs&name=New").0, 409);
+        assert_eq!(post("/api/mkdir?root=0&path=docs/private&name=x").0, 404);
+        assert_eq!(post("/api/delete?root=0&path=docs/New&permanent=1").0, 200);
+        assert!(!shared.join("docs").join("New").exists());
+        assert_eq!(
+            post("/api/delete?root=0&path=docs/private/p.txt&permanent=1").0,
+            404
+        );
+        assert_eq!(post("/api/delete?root=0&path=&permanent=1").0, 403);
+
+        // Folder totals come later, and count only what may be seen.
+        let mut sizes = String::new();
+        for _ in 0..300 {
+            let (code, _, body) = https(
+                &tls_config,
+                port,
+                &format!("GET /api/sizes?root=0&path= HTTP/1.1\r\n{host}\r\n"),
+                b"",
+            );
+            assert_eq!(code, 200);
+            sizes = String::from_utf8(body).unwrap();
+            if sizes.contains("\"waiting\":0") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // docs: a.txt (5), a (2).txt (5), sub/b.txt (2); not p.txt or hid.txt.
+        assert!(
+            sizes.contains("{\"name\":\"docs\",\"size\":12,\"items\":3,\"partial\":false}"),
+            "{sizes}"
+        );
+        assert_eq!(
+            https(
+                &tls_config,
+                port,
+                &format!("GET /api/sizes?root=0&path=docs/private HTTP/1.1\r\n{host}\r\n"),
+                b"",
+            )
+            .0,
+            404
+        );
+        let log = std::fs::read_to_string(base.join("state-Full").join("sharing.log"))
+            .unwrap_or_default();
+        assert!(log.contains(" move ") && log.contains(" copy "), "{log}");
+        drop(sharing);
+
+        // Without full access nothing can be changed.
+        let (sharing, tls_config, port) = start(HttpMode::Download);
+        let host = format!("Host: localhost:{port}\r\nConnection: close\r\n");
+        let (_, _, body) = https(
+            &tls_config,
+            port,
+            &format!("GET /api/info HTTP/1.1\r\n{host}\r\n"),
+            b"",
+        );
+        let info = String::from_utf8(body).unwrap();
+        let csrf = info
+            .split("\"csrf\":\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap()
+            .to_string();
+        for call in [
+            "/api/move?root=0&path=docs/sub/b.txt&to=",
+            "/api/copy?root=0&path=docs/sub/b.txt&to=",
+            "/api/mkdir?root=0&path=&name=x",
+            "/api/delete?root=0&path=docs/sub/b.txt",
+        ] {
+            let (code, _, _) = https(
+                &tls_config,
+                port,
+                &format!("POST {call} HTTP/1.1\r\n{host}X-Feather-Csrf: {csrf}\r\n\r\n"),
+                b"",
+            );
+            assert_eq!(code, 404, "{call}");
+        }
+        drop(sharing);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn folders_download_as_a_zip_of_only_what_may_be_seen() {
+        let base = std::env::temp_dir().join(format!("feather-zip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let shared = base.join("shared");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(shared.join("docs").join("sub")).unwrap();
+        std::fs::create_dir_all(shared.join("docs").join("private")).unwrap();
+        std::fs::create_dir_all(shared.join("docs").join("empty")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(shared.join("docs").join("a.txt"), b"hello").unwrap();
+        let big: Vec<u8> = (0..300_000u32).map(|n| (n % 251) as u8).collect();
+        std::fs::write(shared.join("docs").join("sub").join("Fotó 1.bin"), &big).unwrap();
+        std::fs::write(shared.join("docs").join("private").join("p.txt"), b"p").unwrap();
+        std::fs::write(outside.join("secret.txt"), b"secret").unwrap();
+        let hidden = if cfg!(windows) { "hid.txt" } else { ".hid.txt" };
+        std::fs::write(shared.join("docs").join(hidden), b"hidden").unwrap();
+        #[cfg(windows)]
+        make_hidden(&shared.join("docs").join(hidden));
+        let linked = link_folder(&outside, &shared.join("docs").join("out"));
+        // A link back up must not loop.
+        let looped = link_folder(
+            &shared.join("docs"),
+            &shared.join("docs").join("sub").join("up"),
+        );
+        // A file another program holds open can't be read: it is left out.
+        #[cfg(windows)]
+        let _held = {
+            use std::os::windows::fs::OpenOptionsExt;
+            std::fs::write(shared.join("docs").join("locked.txt"), b"busy").unwrap();
+            std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(shared.join("docs").join("locked.txt"))
+                .unwrap()
+        };
+        let real = files::display_path(&std::fs::canonicalize(&shared).unwrap());
+        let sep = std::path::MAIN_SEPARATOR;
+
+        let state = base.join("state");
+        let port = free_port();
+        let mut config = Config::from_settings(&Settings::default());
+        // Downloading is the least a share allows; that's all a zip needs.
+        config.http = HttpMode::Download;
+        config.access = ShareAccess::Local;
+        config.http_port = port;
+        config.user = "tester".into();
+        config.password_hash = auth::hash_password("abcd").unwrap();
+        config.folders = vec![shared.to_string_lossy().to_string()];
+        config.excluded = vec![format!("{real}{sep}docs{sep}private")];
+        config.show_hidden = false;
+        config.show_system = false;
+        let sharing = Sharing::start_in(config, Arc::new(IndexSet::empty()), &state);
+        let tls_config = client(&std::fs::read(state.join("server.cer")).unwrap());
+        let host = format!("Host: localhost:{port}\r\nConnection: close\r\n");
+
+        // Signed out: nothing.
+        let (code, _, _) = https(
+            &tls_config,
+            port,
+            &format!("GET /api/zip?root=0&path=docs HTTP/1.1\r\n{host}\r\n"),
+            b"",
+        );
+        assert_eq!(code, 401);
+        let form = "user=tester&password=abcd";
+        let (_, head, _) = https(&tls_config, port, &sign_in_form(&host, form, ""), b"");
+        let cookie = head
+            .lines()
+            .find_map(|line| line.strip_prefix("Set-Cookie: "))
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        let signed = format!("{host}Cookie: {cookie}\r\n");
+
+        let (code, head, body) = https(
+            &tls_config,
+            port,
+            &format!("GET /api/zip?root=0&path=docs HTTP/1.1\r\n{signed}\r\n"),
+            b"",
+        );
+        assert_eq!(code, 200, "{head}");
+        assert!(head.contains("Content-Type: application/zip"));
+        assert!(head.contains("Transfer-Encoding: chunked"));
+        assert!(!head.contains("Content-Length"));
+        assert!(head.contains("filename=\"docs.zip\""), "{head}");
+        let entries = zip::read::entries(&unchunk(&body));
+        let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        let data = |name: &str| {
+            entries
+                .iter()
+                .find(|entry| entry.name == name)
+                .map(|entry| entry.data.clone())
+        };
+        assert_eq!(
+            data("docs/a.txt").as_deref(),
+            Some(&b"hello"[..]),
+            "{names:?}"
+        );
+        assert_eq!(data("docs/sub/Fotó 1.bin"), Some(big.clone()));
+        assert!(names.contains(&"docs/") && names.contains(&"docs/empty/"));
+        assert!(names.contains(&"docs/sub/"));
+        for name in &names {
+            assert!(
+                !name.contains("private"),
+                "left out folders aren't zipped: {name}"
+            );
+            assert!(
+                !name.contains("hid.txt"),
+                "hidden files aren't zipped: {name}"
+            );
+            assert!(
+                !name.contains("out/"),
+                "links outside aren't followed: {name}"
+            );
+            assert!(!name.contains("secret"), "{name}");
+            assert!(
+                !name.contains("sub/up/"),
+                "a link back up isn't followed: {name}"
+            );
+        }
+        assert!(linked || cfg!(windows), "made the link outside");
+        let _ = looped;
+        #[cfg(windows)]
+        {
+            assert!(!names.contains(&"docs/locked.txt"));
+            let note = data("docs/Feather - not included.txt").expect("a note");
+            assert!(String::from_utf8_lossy(&note).contains("docs/locked.txt"));
+        }
+
+        // The whole shared folder is named after it.
+        let (code, head, body) = https(
+            &tls_config,
+            port,
+            &format!("GET /api/zip?root=0&path= HTTP/1.1\r\n{signed}\r\n"),
+            b"",
+        );
+        assert_eq!(code, 200);
+        assert!(head.contains("filename=\"shared.zip\""), "{head}");
+        let entries = zip::read::entries(&unchunk(&body));
+        assert!(entries
+            .iter()
+            .any(|entry| entry.name == "shared/docs/a.txt"));
+
+        // Some of a folder: only what was chosen, and only visible names.
+        let (code, _, body) = https(
+            &tls_config,
+            port,
+            &format!(
+                "GET /api/zip?root=0&path=docs&name=a.txt&name=sub&name=private HTTP/1.1\r\n{signed}\r\n"
+            ),
+            b"",
+        );
+        assert_eq!(code, 200);
+        let entries = zip::read::entries(&unchunk(&body));
+        let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert!(names.contains(&"docs/a.txt") && names.contains(&"docs/sub/Fotó 1.bin"));
+        assert!(!names
+            .iter()
+            .any(|name| name.contains("empty") || name.contains("private")));
+        let (code, _, _) = https(
+            &tls_config,
+            port,
+            &format!("GET /api/zip?root=0&path=docs&name=..%2Fouter HTTP/1.1\r\n{signed}\r\n"),
+            b"",
+        );
+        assert_eq!(code, 400);
+
+        // HTTP/1.0 has no chunks: the zip ends with the connection.
+        let (code, head, body) = https(
+            &tls_config,
+            port,
+            &format!(
+                "GET /api/zip?root=0&path=docs/sub HTTP/1.0\r\nHost: localhost\r\nCookie: {cookie}\r\n\r\n"
+            ),
+            b"",
+        );
+        assert_eq!(code, 200);
+        assert!(!head.contains("chunked"));
+        assert!(zip::read::entries(&body)
+            .iter()
+            .any(|entry| entry.name == "sub/Fotó 1.bin"));
+
+        // Only folders a visitor could open themselves.
+        for path in [
+            "../outside",
+            "docs/../..",
+            "docs/private",
+            "docs/out",
+            "docs%5C..%5C..%5Coutside",
+            "missing",
+        ] {
+            let (code, _, body) = https(
+                &tls_config,
+                port,
+                &format!("GET /api/zip?root=0&path={path} HTTP/1.1\r\n{signed}\r\n"),
+                b"",
+            );
+            assert!(code == 400 || code == 404, "{path}: {code}");
+            assert!(!String::from_utf8_lossy(&body).contains("secret"));
+        }
+        let (code, _, _) = https(
+            &tls_config,
+            port,
+            &format!("GET /api/zip?root=0&path=docs/a.txt HTTP/1.1\r\n{signed}\r\n"),
+            b"",
+        );
+        assert_eq!(code, 400);
+        let (code, _, _) = https(
+            &tls_config,
+            port,
+            &format!("GET /api/zip?root=7&path= HTTP/1.1\r\n{signed}\r\n"),
+            b"",
+        );
+        assert_eq!(code, 404);
+
+        drop(sharing);
+        let log = std::fs::read_to_string(state.join("sharing.log")).unwrap();
+        assert!(log.contains("download folder"), "{log}");
+        assert!(log.contains("zip of docs done"), "{log}");
         let _ = std::fs::remove_dir_all(&base);
     }
 

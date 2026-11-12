@@ -228,7 +228,16 @@ impl Roots {
         Some(item(name, &metadata))
     }
 
-    fn is_blocked(&self, path: &Path) -> bool {
+    /// True when `folder` is, or holds, a left-out folder: moving it would
+    /// carry that folder somewhere it is no longer left out.
+    pub fn holds_blocked(&self, folder: &Path) -> bool {
+        let display = display_path(folder);
+        self.blocked
+            .iter()
+            .any(|blocked| path_within(blocked, &display) || path_within(&display, blocked))
+    }
+
+    pub(crate) fn is_blocked(&self, path: &Path) -> bool {
         let display = display_path(path);
         self.blocked
             .iter()
@@ -236,7 +245,7 @@ impl Roots {
     }
 
     /// Hidden and system items follow the "What to show" settings.
-    fn visible(&self, path: &Path) -> bool {
+    pub(crate) fn visible(&self, path: &Path) -> bool {
         let Ok(metadata) = std::fs::symlink_metadata(path) else {
             return true;
         };
@@ -275,14 +284,24 @@ fn attributes(path: &Path, _metadata: &std::fs::Metadata) -> (bool, bool) {
 }
 
 #[cfg(windows)]
-fn is_reparse(metadata: &std::fs::Metadata) -> bool {
+pub(crate) fn is_reparse(metadata: &std::fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
     metadata.file_attributes() & 0x400 != 0
 }
 
 #[cfg(not(windows))]
-fn is_reparse(_metadata: &std::fs::Metadata) -> bool {
+pub(crate) fn is_reparse(_metadata: &std::fs::Metadata) -> bool {
     false
+}
+
+/// `name` inside the relative folder `parent`.
+pub fn join_relative(parent: &str, name: &str) -> String {
+    let parent = parent.trim_matches(['/', '\\']);
+    if parent.is_empty() {
+        name.to_string()
+    } else {
+        format!("{parent}/{name}")
+    }
 }
 
 /// The names in a relative path, either slash.
@@ -326,7 +345,7 @@ pub fn check_name(name: &str) -> Result<(), Denied> {
 
 /// `real` is `root` or inside it. Both are resolved paths.
 #[cfg(windows)]
-fn inside(root: &Path, real: &Path) -> bool {
+pub(crate) fn inside(root: &Path, real: &Path) -> bool {
     let root = root.to_string_lossy().to_lowercase();
     let real = real.to_string_lossy().to_lowercase();
     let root = root.trim_end_matches(['\\', '/']);
@@ -340,7 +359,7 @@ fn inside(root: &Path, real: &Path) -> bool {
 /// sensitive here: `/srv/Share` is not inside `/srv/share`, so a link to a
 /// folder that differs only in case stays outside.
 #[cfg(not(windows))]
-fn inside(root: &Path, real: &Path) -> bool {
+pub(crate) fn inside(root: &Path, real: &Path) -> bool {
     real.starts_with(root)
 }
 
@@ -370,7 +389,7 @@ fn relative_to(path: &str, root: &str) -> Option<String> {
     Some(rest.to_string())
 }
 
-fn same_path(a: &Path, b: &Path) -> bool {
+pub(crate) fn same_path(a: &Path, b: &Path) -> bool {
     a.to_string_lossy()
         .trim_end_matches(['\\', '/'])
         .eq_ignore_ascii_case(b.to_string_lossy().trim_end_matches(['\\', '/']))
@@ -400,14 +419,123 @@ pub fn recycle(path: &Path) -> Result<(), String> {
     }
 }
 
+/// Moves a file or folder to the desktop's trash (the freedesktop.org
+/// trash in `~/.local/share/Trash`), so a visitor's delete can be undone.
+/// Something on another drive can't be moved there; the page then asks
+/// whether to delete it for good.
 #[cfg(not(windows))]
 pub fn recycle(path: &Path) -> Result<(), String> {
-    let result = if path.is_dir() {
+    use std::io::Write as _;
+    use std::os::unix::fs::DirBuilderExt as _;
+    const NO_TRASH: &str = "It can't be moved to the trash on the computer running Feather.";
+    let trash = trash_folder().ok_or(NO_TRASH)?;
+    let (files, info) = (trash.join("files"), trash.join("info"));
+    for folder in [&trash, &files, &info] {
+        let _ = std::fs::DirBuilder::new().mode(0o700).create(folder);
+    }
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .ok_or(NO_TRASH)?;
+    let (stem, extension) = match name.rfind('.') {
+        Some(dot) if dot > 0 => (&name[..dot], &name[dot..]),
+        _ => (name.as_str(), ""),
+    };
+    for number in 1..10_000 {
+        let candidate = if number == 1 {
+            name.clone()
+        } else {
+            format!("{stem}.{number}{extension}")
+        };
+        let note = info.join(format!("{candidate}.trashinfo"));
+        let Ok(mut file) = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&note)
+        else {
+            continue;
+        };
+        if std::fs::symlink_metadata(files.join(&candidate)).is_ok() {
+            drop(file);
+            let _ = std::fs::remove_file(&note);
+            continue;
+        }
+        let written = write!(
+            file,
+            "[Trash Info]
+Path={}
+DeletionDate={}
+",
+            trash_path(path),
+            super::timestamp().replace(' ', "T")
+        );
+        drop(file);
+        if written.is_ok() && std::fs::rename(path, files.join(&candidate)).is_ok() {
+            return Ok(());
+        }
+        let _ = std::fs::remove_file(&note);
+        return Err(NO_TRASH.into());
+    }
+    Err(NO_TRASH.into())
+}
+
+/// The user's trash folder.
+#[cfg(not(windows))]
+fn trash_folder() -> Option<PathBuf> {
+    let data = std::env::var_os("XDG_DATA_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|value| !value.is_empty())
+                .map(|home| PathBuf::from(home).join(".local").join("share"))
+        })?;
+    Some(data.join("Trash"))
+}
+
+/// A path as a `.trashinfo` file writes it: percent-encoded bytes.
+#[cfg(not(windows))]
+fn trash_path(path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut out = String::new();
+    for &byte in path.as_os_str().as_bytes() {
+        if byte.is_ascii_alphanumeric() || b"/-_.~".contains(&byte) {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+/// Deletes a file or folder for good, when the person said so after the
+/// trash couldn't take it.
+pub fn remove(path: &Path) -> Result<(), String> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    let result = if metadata.is_dir() {
         std::fs::remove_dir_all(path)
     } else {
         std::fs::remove_file(path)
     };
-    result.map_err(|error| error.to_string())
+    result.map_err(|error| format!("It couldn't be deleted: {error}"))
+}
+
+/// A name beside `taken` that nothing has yet, like `photo (2).jpg` for
+/// `photo.jpg`, or `None` after many tries.
+pub fn free_name(taken: &Path) -> Option<PathBuf> {
+    let folder = taken.parent()?;
+    let name = taken.file_name()?.to_str()?;
+    // A folder's dots are part of its name; a file keeps its extension.
+    let (stem, extension) = match name.rfind('.') {
+        Some(dot) if dot > 0 && !taken.is_dir() => (&name[..dot], &name[dot..]),
+        _ => (name, ""),
+    };
+    (2..10_000).find_map(|number| {
+        let candidate = format!("{stem} ({number}){extension}");
+        let path = folder.join(&candidate);
+        (check_name(&candidate).is_ok() && std::fs::symlink_metadata(&path).is_err())
+            .then_some(path)
+    })
 }
 
 /// A resolved path the way Windows shows it: without `\\?\`.
@@ -464,7 +592,10 @@ fn data_folders() -> Vec<PathBuf> {
         bases.push(home.join(".local").join("share"));
         bases.push(home.join(".cache"));
     }
-    bases.into_iter().map(|base| base.join("feather")).collect()
+    let mut folders: Vec<PathBuf> = bases.into_iter().map(|base| base.join("feather")).collect();
+    // What was deleted, from the share or anywhere else, stays deleted.
+    folders.extend(trash_folder());
+    folders
 }
 
 #[cfg(test)]

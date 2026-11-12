@@ -22,6 +22,7 @@ use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
 use rustls::{ServerConnection, StreamOwned};
 
 use super::files::{self, Denied, Item};
+use super::zip::ZipWriter;
 use super::{allowed, auth, thumbs, Shared};
 use crate::settings::{HttpMode, ShareAccess, Tunnel};
 
@@ -48,12 +49,42 @@ const FRAME_OVERHEAD: u64 = 4 + 12 + 1 + 16;
 /// Replies bigger than this are compressed when the browser accepts gzip.
 const COMPRESS_FROM: usize = 1024;
 
+/// A folder's zip holds at most this many files and folders...
+const ZIP_ENTRIES: usize = 100_000;
+/// ...and goes at most this deep.
+const ZIP_DEPTH: usize = 64;
+/// Why folders aren't zipped end to end: sealed downloads are decrypted in
+/// the page's memory before they are saved, and a folder can be far bigger
+/// than a phone can hold.
+const SEALED_ZIP: &str = "Folders can't be downloaded as a zip while the share is encrypted end to end. Open the folder and download its files one at a time.";
+
 const APP_HTML: &str = include_str!("web/app.html");
 const LOGIN_HTML: &str = include_str!("web/login.html");
 const APP_CSS: &str = include_str!("web/app.css");
 const APP_JS: &str = include_str!("web/app.js");
 const LOGIN_JS: &str = include_str!("web/login.js");
 const ICON_SVG: &str = include_str!("web/icon.svg");
+const RECONNECT_HTML: &str = include_str!("web/reconnect.html");
+const RECONNECT_JS: &str = include_str!("web/reconnect.js");
+const SERVICE_WORKER: &str = include_str!("web/sw.js");
+const MANIFEST: &str = include_str!("web/manifest.webmanifest");
+const ICON_192: &[u8] = include_bytes!("web/icon-192.png");
+const ICON_512: &[u8] = include_bytes!("web/icon-512.png");
+const ICON_MASKABLE: &[u8] = include_bytes!("web/icon-maskable.png");
+const APPLE_TOUCH_ICON: &[u8] = include_bytes!("web/apple-touch-icon.png");
+
+/// A page file. The browser test server can read them from
+/// `FEATHER_WEB_DIR` instead, so changes show without a rebuild.
+fn asset(name: &str, built_in: &'static str) -> &'static str {
+    #[cfg(test)]
+    if let Some(folder) = std::env::var_os("FEATHER_WEB_DIR") {
+        if let Ok(text) = std::fs::read_to_string(Path::new(&folder).join(name)) {
+            return Box::leak(text.into_boxed_str());
+        }
+    }
+    let _ = name;
+    built_in
+}
 
 /// Sent with every response.
 const SECURITY_HEADERS: &str = "Strict-Transport-Security: max-age=31536000\r\n\
@@ -64,8 +95,24 @@ Cross-Origin-Opener-Policy: same-origin\r\n\
 Cross-Origin-Resource-Policy: same-origin\r\n\
 Permissions-Policy: camera=(), microphone=(), geolocation=(), interest-cohort=()\r\n\
 Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; \
-img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; \
-base-uri 'none'\r\n\
+img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'; manifest-src 'self'; \
+worker-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'\r\n\
+Server: Feather\r\n";
+
+/// The reconnect page, shown by the installed app when its address stops
+/// answering: it may ask other addresses of this Feather if they answer
+/// (`/api/ping` only), and use the camera to read the QR code in Settings.
+/// It never holds or sends anything from the share.
+const RECONNECT_HEADERS: &str = "Strict-Transport-Security: max-age=31536000\r\n\
+X-Content-Type-Options: nosniff\r\n\
+X-Frame-Options: DENY\r\n\
+Referrer-Policy: no-referrer\r\n\
+Cross-Origin-Opener-Policy: same-origin\r\n\
+Cross-Origin-Resource-Policy: same-origin\r\n\
+Permissions-Policy: camera=(self), microphone=(), geolocation=(), interest-cohort=()\r\n\
+Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; \
+img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' https:; manifest-src 'self'; \
+form-action 'none'; frame-ancestors 'none'; base-uri 'none'\r\n\
 Server: Feather\r\n";
 
 pub fn spawn(shared: Arc<Shared>, listener: TcpListener) -> JoinHandle<()> {
@@ -234,6 +281,8 @@ pub(crate) struct Request {
     pub(crate) headers: Vec<(String, String)>,
     pub(crate) length: u64,
     pub(crate) close: bool,
+    /// HTTP/1.0, which has no chunked replies.
+    pub(crate) http10: bool,
 }
 
 impl Request {
@@ -261,6 +310,15 @@ impl Params {
             .iter()
             .find(|(key, _)| key == name)
             .map(|(_, value)| value.as_str())
+    }
+
+    /// Every value given for `name`.
+    fn all(&self, name: &str) -> Vec<&str> {
+        self.0
+            .iter()
+            .filter(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+            .collect()
     }
 
     fn root(&self) -> usize {
@@ -342,6 +400,7 @@ pub(crate) fn parse(head: &[u8]) -> Result<Request, u16> {
         headers,
         length: length.unwrap_or(0),
         close,
+        http10: version == "HTTP/1.0",
     })
 }
 
@@ -667,14 +726,58 @@ fn handle(shared: &Shared, conn: &mut Conn, request: &Request, client: IpAddr) -
     };
     let e2e = shared.e2e.is_some();
     match (request.method.as_str(), request.path.as_str()) {
-        ("GET", "/app.css") => static_file(conn, request, "text/css; charset=utf-8", APP_CSS),
-        ("GET", "/app.js") => static_file(conn, request, "text/javascript; charset=utf-8", APP_JS),
-        ("GET", "/login.js") => {
-            static_file(conn, request, "text/javascript; charset=utf-8", LOGIN_JS)
+        ("GET", "/app.css") => static_bytes(
+            conn,
+            request,
+            "text/css; charset=utf-8",
+            asset("app.css", APP_CSS).as_bytes(),
+        ),
+        ("GET", "/app.js") => static_bytes(
+            conn,
+            request,
+            "text/javascript; charset=utf-8",
+            asset("app.js", APP_JS).as_bytes(),
+        ),
+        ("GET", "/login.js") => static_bytes(
+            conn,
+            request,
+            "text/javascript; charset=utf-8",
+            asset("login.js", LOGIN_JS).as_bytes(),
+        ),
+        ("GET", "/icon.svg" | "/favicon.ico") => static_bytes(
+            conn,
+            request,
+            "image/svg+xml",
+            asset("icon.svg", ICON_SVG).as_bytes(),
+        ),
+        ("GET", "/icon-192.png") => static_bytes(conn, request, "image/png", ICON_192),
+        ("GET", "/icon-512.png") => static_bytes(conn, request, "image/png", ICON_512),
+        ("GET", "/icon-maskable.png") => static_bytes(conn, request, "image/png", ICON_MASKABLE),
+        ("GET", "/apple-touch-icon.png" | "/apple-touch-icon-precomposed.png") => {
+            static_bytes(conn, request, "image/png", APPLE_TOUCH_ICON)
         }
-        ("GET", "/icon.svg" | "/favicon.ico") => {
-            static_file(conn, request, "image/svg+xml", ICON_SVG)
-        }
+        ("GET", "/manifest.webmanifest") => static_bytes(
+            conn,
+            request,
+            "application/manifest+json",
+            asset("manifest.webmanifest", MANIFEST).as_bytes(),
+        ),
+        ("GET", "/sw.js") => static_bytes(
+            conn,
+            request,
+            "text/javascript; charset=utf-8",
+            asset("sw.js", SERVICE_WORKER).as_bytes(),
+        ),
+        ("GET", "/reconnect.js") => static_bytes(
+            conn,
+            request,
+            "text/javascript; charset=utf-8",
+            asset("reconnect.js", RECONNECT_JS).as_bytes(),
+        ),
+        ("GET", "/reconnect") => reconnect_page(conn),
+        // Whether this is a Feather that answers, for the installed app
+        // looking for its other addresses. Says nothing else, to anyone.
+        ("GET" | "OPTIONS", "/api/ping") => ping(conn, request),
         ("GET", "/login") => {
             if session.is_some() {
                 redirect(conn, "/", &[])?;
@@ -713,7 +816,8 @@ fn handle(shared: &Shared, conn: &mut Conn, request: &Request, client: IpAddr) -
         ("POST", "/e2e/login") if e2e => e2e_login(shared, conn, request, client),
         ("GET", "/") => {
             if session.is_some() {
-                let page = APP_HTML.replace("{{e2e}}", if e2e { "1" } else { "0" });
+                let page =
+                    asset("app.html", APP_HTML).replace("{{e2e}}", if e2e { "1" } else { "0" });
                 send(
                     conn,
                     200,
@@ -750,6 +854,10 @@ fn handle(shared: &Shared, conn: &mut Conn, request: &Request, client: IpAddr) -
                 (Some(key), "/api/sealed-upload") => {
                     sealed_upload(shared, conn, request, client, &token_value, &key)
                 }
+                (Some(_), "/api/zip") => {
+                    json(conn, 403, &error_json(SEALED_ZIP))?;
+                    Ok(true)
+                }
                 // Signed in end to end: nothing travels in the clear.
                 (Some(_), _) => {
                     json(
@@ -781,6 +889,16 @@ pub(crate) fn static_file(
     content_type: &str,
     body: &'static str,
 ) -> io::Result<bool> {
+    static_bytes(conn, request, content_type, body.as_bytes())
+}
+
+/// Like `static_file`, for pictures.
+fn static_bytes(
+    conn: &mut Conn,
+    request: &Request,
+    content_type: &str,
+    body: &'static [u8],
+) -> io::Result<bool> {
     static TAGS: OnceLock<std::sync::Mutex<std::collections::HashMap<usize, String>>> =
         OnceLock::new();
     let tags = TAGS.get_or_init(Default::default);
@@ -789,7 +907,7 @@ pub(crate) fn static_file(
         .unwrap()
         .entry(body.as_ptr() as usize)
         .or_insert_with(|| {
-            let digest = ring::digest::digest(&ring::digest::SHA256, body.as_bytes());
+            let digest = ring::digest::digest(&ring::digest::SHA256, body);
             format!("\"{}\"", auth::hex(&digest.as_ref()[..12]))
         })
         .clone();
@@ -802,7 +920,47 @@ pub(crate) fn static_file(
         conn.wire.flush()?;
         return Ok(true);
     }
-    send(conn, 200, content_type, body.as_bytes(), &cache, false)?;
+    send(conn, 200, content_type, body, &cache, false)?;
+    Ok(true)
+}
+
+/// The installed app's page for when its address stops answering.
+fn reconnect_page(conn: &mut Conn) -> io::Result<bool> {
+    let body = asset("reconnect.html", RECONNECT_HTML);
+    let text = format!(
+        "HTTP/1.1 200 OK\r\n{RECONNECT_HEADERS}Content-Type: text/html; charset=utf-8\r\n\
+         Content-Length: {}\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\
+         Keep-Alive: timeout=15\r\n\r\n",
+        body.len()
+    );
+    conn.wire.write_all(text.as_bytes())?;
+    conn.wire.write_all(body.as_bytes())?;
+    conn.wire.flush()?;
+    Ok(true)
+}
+
+/// `{"app":"feather"}` for anyone, from any page, so the installed app can
+/// tell which of the addresses it remembers answer. Private network access
+/// preflights are allowed, since the local address is usually private.
+fn ping(conn: &mut Conn, request: &Request) -> io::Result<bool> {
+    let mut headers = vec![("Access-Control-Allow-Origin", "*".to_string())];
+    if request.method == "OPTIONS" {
+        headers.push(("Access-Control-Allow-Methods", "GET".to_string()));
+        headers.push(("Access-Control-Max-Age", "600".to_string()));
+        if request.header("access-control-request-private-network") == Some("true") {
+            headers.push(("Access-Control-Allow-Private-Network", "true".to_string()));
+        }
+        send(conn, 204, "text/plain", b"", &headers, false)?;
+    } else {
+        send(
+            conn,
+            200,
+            "application/json; charset=utf-8",
+            b"{\"app\":\"feather\"}",
+            &headers,
+            false,
+        )?;
+    }
     Ok(true)
 }
 
@@ -815,7 +973,7 @@ fn login_page(conn: &mut Conn, e2e: bool, status: u16, message: &str) -> io::Res
             escape_html(message)
         )
     };
-    let page = LOGIN_HTML
+    let page = asset("login.html", LOGIN_HTML)
         .replace("{{note}}", &note)
         .replace("{{e2e}}", if e2e { "1" } else { "0" });
     send(
@@ -984,6 +1142,9 @@ enum Reply {
     File(PathBuf, bool),
     /// A JPEG preview of a file, at most this many pixels across.
     Thumb(PathBuf, u32),
+    /// A folder as a zip: the shared folder's number, the path in it, and
+    /// when only some of what's in it is wanted, their names.
+    Zip(usize, String, Vec<String>),
     /// Signed out.
     Logout,
 }
@@ -1024,8 +1185,19 @@ fn call(
                     )
                 }
             };
+            // Every web address of this Feather, for the installed app to
+            // try when the one it was opened at stops answering.
+            let addresses: Vec<String> = shared
+                .status
+                .lock()
+                .unwrap()
+                .addresses
+                .iter()
+                .filter(|address| address.starts_with("https://"))
+                .map(|address| quote(address))
+                .collect();
             ok(format!(
-                "{{\"user\":{},\"mode\":\"{}\",\"csrf\":{},\"local\":{},\"roots\":[{}]}}",
+                "{{\"user\":{},\"mode\":\"{}\",\"csrf\":{},\"local\":{},\"addresses\":[{}],\"bin\":\"{}\",\"roots\":[{}]}}",
                 quote(if shared.config.open() {
                     ""
                 } else {
@@ -1034,6 +1206,8 @@ fn call(
                 mode_name(mode),
                 quote(csrf),
                 quote(&local),
+                addresses.join(","),
+                if cfg!(windows) { "Recycle Bin" } else { "trash" },
                 roots.join(",")
             ))
         }
@@ -1086,6 +1260,26 @@ fn call(
             ),
             Err(denied) => refuse(denied),
         },
+        ("GET", "/api/zip") => match shared.roots.resolve(params.root(), params.path()) {
+            Ok(folder) if folder.is_dir() => {
+                let names: Vec<String> = params.all("name").into_iter().map(String::from).collect();
+                if names.iter().any(|name| files::check_name(name).is_err()) {
+                    return refuse(Denied::BadName);
+                }
+                let what = if names.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({} chosen)", names.len())
+                };
+                shared.log(
+                    client,
+                    &format!("download folder {}{what}", files::display_path(&folder)),
+                );
+                Reply::Zip(params.root(), params.path().to_string(), names)
+            }
+            Ok(_) => Reply::Json(400, error_json("That is a file, not a folder.")),
+            Err(denied) => refuse(denied),
+        },
         ("POST", "/api/mkdir") if full => {
             let name = params.get("name").unwrap_or("");
             match shared.roots.resolve_new(params.root(), params.path(), name) {
@@ -1095,6 +1289,7 @@ fn call(
                 ),
                 Ok(target) => match std::fs::create_dir(&target) {
                     Ok(()) => {
+                        shared.sizes.forget();
                         shared.log(
                             client,
                             &format!("new folder {}", files::display_path(&target)),
@@ -1128,6 +1323,7 @@ fn call(
                 ),
                 (Ok(from), Ok(target)) => match std::fs::rename(&from, &target) {
                     Ok(()) => {
+                        shared.sizes.forget();
                         shared.log(
                             client,
                             &format!(
@@ -1150,17 +1346,278 @@ fn call(
             Ok(target) if shared.roots.is_root(params.root(), &target) => {
                 Reply::Json(403, error_json("A shared folder itself can't be deleted."))
             }
-            Ok(target) => match files::recycle(&target) {
-                Ok(()) => {
-                    shared.log(client, &format!("delete {}", files::display_path(&target)));
-                    ok("{}".into())
+            Ok(target) => {
+                // For good only when the person chose that, after the trash
+                // couldn't take it.
+                let permanent = params.get("permanent") == Some("1");
+                let result = if permanent {
+                    files::remove(&target)
+                } else {
+                    files::recycle(&target)
+                };
+                shared.sizes.forget();
+                match result {
+                    Ok(()) => {
+                        let how = if permanent {
+                            "delete for good"
+                        } else {
+                            "delete"
+                        };
+                        shared.log(client, &format!("{how} {}", files::display_path(&target)));
+                        ok(format!("{{\"permanent\":{permanent}}}"))
+                    }
+                    Err(error) if !permanent && cfg!(not(windows)) => Reply::Json(
+                        409,
+                        format!("{{\"error\":{},\"permanent\":true}}", quote(&error)),
+                    ),
+                    Err(error) => Reply::Json(400, error_json(&error)),
                 }
-                Err(error) => Reply::Json(400, error_json(&error)),
-            },
+            }
             Err(denied) => refuse(denied),
         },
+        ("POST", "/api/move") if full => transfer(shared, params, client, false),
+        ("POST", "/api/copy") if full => transfer(shared, params, client, true),
+        ("GET", "/api/sizes") => folder_sizes(shared, params),
         _ => Reply::Json(404, error_json("Not found.")),
     }
+}
+
+fn denied_json(denied: Denied) -> Reply {
+    match denied {
+        Denied::BadName => Reply::Json(400, error_json("That name isn't allowed.")),
+        Denied::NotFound => Reply::Json(404, error_json("Not found.")),
+    }
+}
+
+/// Moves or copies one file or folder (`root`, `path`) into the folder
+/// `to` of shared folder `to_root`. Both ends go through the same checks as
+/// everything else, a folder can't go into itself, and a folder holding a
+/// left-out folder can't be moved, since that would carry it out of the
+/// list. A name already taken is answered with the same 409 as an upload,
+/// so the page can ask Replace, Keep both, or Skip; Replace sends what was
+/// there to the Recycle Bin first.
+fn transfer(shared: &Shared, params: &Params, client: IpAddr, copy: bool) -> Reply {
+    let roots = &shared.roots;
+    let root = params.root();
+    let to_root = params
+        .get("to_root")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(root);
+    let to = params.get("to").unwrap_or("").trim_matches('/');
+    let from = match roots.resolve(root, params.path()) {
+        Ok(from) => from,
+        Err(denied) => return denied_json(denied),
+    };
+    let folder = match roots.resolve(to_root, to) {
+        Ok(folder) if folder.is_dir() => folder,
+        Ok(_) => return denied_json(Denied::NotFound),
+        Err(denied) => return denied_json(denied),
+    };
+    if !copy && roots.is_root(root, &from) {
+        return Reply::Json(403, error_json("A shared folder itself can't be moved."));
+    }
+    let Some(name) = from
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+    else {
+        return Reply::Json(403, error_json("That can't be moved."));
+    };
+    if from.is_dir() && files::inside(&from, &folder) {
+        return Reply::Json(400, error_json("A folder can't go into itself."));
+    }
+    if !copy && from.is_dir() && roots.holds_blocked(&from) {
+        return Reply::Json(
+            403,
+            error_json("That folder holds a folder that isn't shared, so it can't be moved."),
+        );
+    }
+    let mut target = match roots.resolve_new(to_root, to, &name) {
+        Ok(target) => target,
+        Err(denied) => return denied_json(denied),
+    };
+    let here = files::same_path(&target, &from);
+    if std::fs::symlink_metadata(&target).is_ok() {
+        match Conflict::of(params) {
+            Conflict::Ask => return Reply::Json(409, conflict_json(&name, target.is_dir())),
+            Conflict::KeepBoth if here && !copy => {
+                return Reply::Json(400, error_json("It's already in that folder."))
+            }
+            Conflict::KeepBoth => match files::free_name(&target) {
+                Some(free) => target = free,
+                None => return Reply::Json(409, error_json("No free name was found.")),
+            },
+            Conflict::Replace if here || files::inside(&target, &from) => {
+                return Reply::Json(400, error_json("Something can't replace itself."))
+            }
+            Conflict::Replace => {
+                // Only something the visitor can see may be replaced.
+                let Ok(existing) = roots.resolve(to_root, &files::join_relative(to, &name)) else {
+                    return Reply::Json(409, error_json("That name can't be used there."));
+                };
+                if roots.is_root(to_root, &existing) || roots.holds_blocked(&existing) {
+                    return Reply::Json(409, error_json("That can't be replaced."));
+                }
+                if let Err(error) = files::recycle(&existing) {
+                    return Reply::Json(400, error_json(&error));
+                }
+                shared.log(
+                    client,
+                    &format!("delete {} (replaced)", files::display_path(&existing)),
+                );
+            }
+        }
+    }
+    shared.sizes.forget();
+    let result = if copy {
+        copy_tree(roots, &from, &target).map(|_| ())
+    } else {
+        move_item(roots, &from, &target)
+    };
+    match result {
+        Ok(()) => {
+            shared.log(
+                client,
+                &format!(
+                    "{} {} to {}",
+                    if copy { "copy" } else { "move" },
+                    files::display_path(&from),
+                    files::display_path(&target)
+                ),
+            );
+            Reply::Json(201, saved_json(&target))
+        }
+        Err(error) => Reply::Json(400, error_json(&error)),
+    }
+}
+
+/// Moves in one step on one drive. Across drives it copies what a visitor
+/// may see and removes the original only when that was everything.
+fn move_item(roots: &files::Roots, from: &Path, target: &Path) -> Result<(), String> {
+    if std::fs::rename(from, target).is_ok() {
+        return Ok(());
+    }
+    let left_out = copy_tree(roots, from, target)?;
+    if left_out > 0 {
+        return Err(format!(
+            "It was copied, but {left_out} hidden or unreadable item(s) couldn't come along, \
+             so the original was kept."
+        ));
+    }
+    files::remove(from)
+}
+
+/// Copies a file, or a folder and what a visitor may see in it, to
+/// `target`, which doesn't exist yet. Links aren't followed. Returns how
+/// many items were left out; on failure, what was made is removed.
+fn copy_tree(roots: &files::Roots, from: &Path, target: &Path) -> Result<usize, String> {
+    let failed = |error: io::Error| {
+        let _ = files::remove(target);
+        format!("Couldn't copy it: {error}")
+    };
+    if !from.is_dir() {
+        return copy_file(from, target).map(|()| 0).map_err(failed);
+    }
+    let mut left_out = 0;
+    let mut count = 0;
+    let mut pending = vec![(from.to_path_buf(), target.to_path_buf(), 0usize)];
+    while let Some((source, made, depth)) = pending.pop() {
+        std::fs::create_dir(&made).map_err(failed)?;
+        let listing = std::fs::read_dir(&source).map_err(failed)?;
+        for entry in listing.flatten() {
+            count += 1;
+            if count > ZIP_ENTRIES {
+                let _ = files::remove(target);
+                return Err("That folder holds too many items to copy here.".into());
+            }
+            let path = entry.path();
+            let name = entry.file_name();
+            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                left_out += 1;
+                continue;
+            };
+            let usable = name
+                .to_str()
+                .is_some_and(|name| files::check_name(name).is_ok())
+                && roots.visible(&path)
+                && !roots.is_blocked(&path)
+                && !metadata.file_type().is_symlink()
+                && !files::is_reparse(&metadata);
+            if !usable {
+                left_out += 1;
+            } else if metadata.is_dir() {
+                if depth + 1 >= ZIP_DEPTH {
+                    left_out += 1;
+                } else {
+                    pending.push((path, made.join(&name), depth + 1));
+                }
+            } else if copy_file(&path, &made.join(&name)).is_err() {
+                left_out += 1;
+            }
+        }
+    }
+    Ok(left_out)
+}
+
+/// Copies one file without overwriting anything.
+fn copy_file(from: &Path, to: &Path) -> io::Result<()> {
+    let mut source = std::fs::File::open(from)?;
+    let mut made = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(to)?;
+    let copied = io::copy(&mut source, &mut made).and_then(|_| made.flush());
+    if copied.is_err() {
+        drop(made);
+        let _ = std::fs::remove_file(to);
+    }
+    copied
+}
+
+/// The totals of the folders in folder `path` of shared folder `root`, as
+/// far as they are known; the page asks again for the rest. With `self=1`,
+/// the total of the folder itself.
+fn folder_sizes(shared: &Shared, params: &Params) -> Reply {
+    let folder = match shared.roots.resolve(params.root(), params.path()) {
+        Ok(folder) if folder.is_dir() => folder,
+        Ok(_) => return Reply::Json(400, error_json("That is a file, not a folder.")),
+        Err(denied) => return denied_json(denied),
+    };
+    let (names, paths): (Vec<String>, Vec<PathBuf>) = if params.get("self") == Some("1") {
+        (vec![String::new()], vec![folder])
+    } else {
+        let Ok((items, _)) = shared.roots.list(&folder, LIST_LIMIT) else {
+            return Reply::Json(404, error_json("That folder can't be opened."));
+        };
+        items
+            .into_iter()
+            .filter(|item| item.dir)
+            .filter_map(|item| {
+                let path = files::join_relative(params.path(), &item.name);
+                let real = shared.roots.resolve(params.root(), &path).ok()?;
+                Some((item.name, real))
+            })
+            .unzip()
+    };
+    let totals = shared.sizes.lookup(&shared.roots, &paths);
+    let waiting = totals.iter().filter(|total| total.is_none()).count();
+    let found: Vec<String> = names
+        .iter()
+        .zip(totals)
+        .filter_map(|(name, total)| {
+            let total = total?;
+            Some(format!(
+                "{{\"name\":{},\"size\":{},\"items\":{},\"partial\":{}}}",
+                quote(name),
+                total.bytes,
+                total.items,
+                total.partial
+            ))
+        })
+        .collect();
+    Reply::Json(
+        200,
+        format!("{{\"sizes\":[{}],\"waiting\":{waiting}}}", found.join(",")),
+    )
 }
 
 /// An API call without end-to-end encryption.
@@ -1228,6 +1685,9 @@ fn plain_api(
             return download_plain(conn, request, &path, inline);
         }
         Reply::Thumb(path, side) => return thumb_plain(conn, request, &path, side),
+        Reply::Zip(root, relative, names) => {
+            return zip_plain(shared, conn, request, client, root, &relative, &names)
+        }
     }
     Ok(true)
 }
@@ -1452,24 +1912,448 @@ fn download_plain(
     Ok(true)
 }
 
+/// A reply body in HTTP/1.1 chunks, so a download cut short shows as
+/// failed instead of as a broken zip.
+struct Chunked<'a> {
+    wire: &'a mut Wire,
+    buffer: Vec<u8>,
+    /// HTTP/1.0: plain bytes, ended by closing the connection.
+    raw: bool,
+}
+
+impl Chunked<'_> {
+    const SIZE: usize = 64 * 1024;
+
+    fn emit(&mut self) -> io::Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        if self.raw {
+            self.wire.write_all(&self.buffer)?;
+        } else {
+            self.wire
+                .write_all(format!("{:x}\r\n", self.buffer.len()).as_bytes())?;
+            self.wire.write_all(&self.buffer)?;
+            self.wire.write_all(b"\r\n")?;
+        }
+        self.buffer.clear();
+        Ok(())
+    }
+
+    fn end(mut self) -> io::Result<()> {
+        self.emit()?;
+        if !self.raw {
+            self.wire.write_all(b"0\r\n\r\n")?;
+        }
+        self.wire.flush()
+    }
+}
+
+impl Write for Chunked<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.buffer.len() + bytes.len() > Self::SIZE {
+            self.emit()?;
+        }
+        self.buffer.extend_from_slice(bytes);
+        if self.buffer.len() >= Self::SIZE {
+            self.emit()?;
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// What went into a folder's zip.
+#[derive(Default)]
+pub(crate) struct Packed {
+    pub(crate) files: u64,
+    pub(crate) bytes: u64,
+    /// Paths in the zip that couldn't be read, or were nested too deep.
+    pub(crate) skipped: Vec<String>,
+    /// The entry limit was reached.
+    pub(crate) truncated: bool,
+}
+
+/// A name that is safe as one part of a path inside a zip.
+fn zip_part(name: &str) -> String {
+    let clean: String = name
+        .chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '/' | '\\' | ':') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    match clean.trim() {
+        "" | "." | ".." => "folder".into(),
+        _ => clean,
+    }
+}
+
+fn modified_secs(metadata: &std::fs::Metadata) -> u64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|time| time.as_secs())
+        .unwrap_or(0)
+}
+
+/// The zip's name for folder `relative` of shared folder `root`.
+fn zip_top(shared: &Shared, root: usize, relative: &str) -> String {
+    let name = relative
+        .rsplit(['/', '\\'])
+        .find(|part| !part.is_empty())
+        .or_else(|| shared.roots.roots.get(root).map(|root| root.name.as_str()))
+        .unwrap_or("Shared");
+    zip_part(name)
+}
+
+fn shared_dir(roots: &files::Roots, root: usize, relative: &str) -> Result<PathBuf, Denied> {
+    roots.resolve(root, relative).and_then(|real| {
+        if real.is_dir() {
+            Ok(real)
+        } else {
+            Err(Denied::NotFound)
+        }
+    })
+}
+
+/// Writes folder `relative` of shared folder `root`, and everything in it a
+/// visitor may see, into `zip` under `top/`. Every file and folder goes
+/// through `Roots::resolve`, the same check as a single download: names,
+/// hidden and system items, left-out folders, and links or junctions that
+/// lead outside the shared folder are all left out, silently, as a listing
+/// leaves them out. Each folder is read once, so a link back up can't loop.
+/// Files that can't be read are left out and named in a note at the end.
+pub(crate) fn pack_folder<W: Write>(
+    roots: &files::Roots,
+    root: usize,
+    relative: &str,
+    only: &[String],
+    top: &str,
+    zip: &mut ZipWriter<W>,
+    stop: &dyn Fn() -> bool,
+) -> io::Result<Packed> {
+    let mut packed = Packed::default();
+    let mut seen = std::collections::HashSet::new();
+    let relative = relative.trim_matches(['/', '\\']).to_string();
+    // Folders still to read: path in the share, path in the zip, depth.
+    let mut pending = vec![(relative, top.to_string(), 0usize)];
+    while let Some((folder, inside, depth)) = pending.pop() {
+        if stop() {
+            return Ok(packed);
+        }
+        let Ok(real) = shared_dir(roots, root, &folder) else {
+            continue;
+        };
+        if !seen.insert(real.clone()) {
+            continue;
+        }
+        if zip.len() >= ZIP_ENTRIES {
+            packed.truncated = true;
+            break;
+        }
+        let modified = std::fs::metadata(&real)
+            .map(|metadata| modified_secs(&metadata))
+            .unwrap_or(0);
+        zip.add_dir(&inside, modified)?;
+        let Ok(listing) = std::fs::read_dir(&real) else {
+            packed.skipped.push(format!("{inside}/"));
+            continue;
+        };
+        let mut names: Vec<String> = listing
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+            .filter(|name| files::check_name(name).is_ok())
+            .collect();
+        names.sort_by_key(|name| name.to_lowercase());
+        let mut folders = Vec::new();
+        for name in names {
+            if depth == 0 && !only.is_empty() && !only.contains(&name) {
+                continue;
+            }
+            let path = if folder.is_empty() {
+                name.clone()
+            } else {
+                format!("{folder}/{name}")
+            };
+            let in_zip = format!("{inside}/{}", zip_part(&name));
+            // Anything a visitor couldn't open alone isn't packed, or named.
+            let Ok(real) = roots.resolve(root, &path) else {
+                continue;
+            };
+            let Ok(metadata) = std::fs::metadata(&real) else {
+                continue;
+            };
+            if metadata.is_dir() {
+                if depth + 1 >= ZIP_DEPTH {
+                    packed.skipped.push(format!("{in_zip}/"));
+                } else {
+                    folders.push((path, in_zip, depth + 1));
+                }
+                continue;
+            }
+            if zip.len() >= ZIP_ENTRIES {
+                packed.truncated = true;
+                break;
+            }
+            if stop() {
+                return Ok(packed);
+            }
+            let Ok(mut file) = std::fs::File::open(&real) else {
+                packed.skipped.push(in_zip);
+                continue;
+            };
+            let before = zip.written();
+            let whole =
+                zip.add_file(&in_zip, modified_secs(&metadata), metadata.len(), &mut file)?;
+            packed.files += 1;
+            packed.bytes += zip.written() - before;
+            if !whole {
+                packed.skipped.push(format!("{in_zip} (incomplete)"));
+            }
+        }
+        if packed.truncated {
+            break;
+        }
+        // The stack takes the last first, so push in reverse name order.
+        pending.extend(folders.into_iter().rev());
+    }
+    if !packed.skipped.is_empty() || packed.truncated {
+        let note = skipped_note(&packed);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|time| time.as_secs())
+            .unwrap_or(0);
+        zip.add_file(
+            &format!("{top}/Feather - not included.txt"),
+            now,
+            note.len() as u64,
+            &mut note.as_bytes(),
+        )?;
+    }
+    Ok(packed)
+}
+
+fn skipped_note(packed: &Packed) -> String {
+    let mut note =
+        String::from("Feather couldn't put everything from this folder in the zip.\r\n\r\n");
+    if packed.truncated {
+        note.push_str(&format!(
+            "The zip stopped at {ZIP_ENTRIES} files and folders. Download the folders \
+             inside one at a time for the rest.\r\n\r\n"
+        ));
+    }
+    if !packed.skipped.is_empty() {
+        note.push_str("These couldn't be read, or were nested too deep:\r\n");
+        for path in packed.skipped.iter().take(1000) {
+            note.push_str(path);
+            note.push_str("\r\n");
+        }
+        if packed.skipped.len() > 1000 {
+            note.push_str(&format!("...and {} more\r\n", packed.skipped.len() - 1000));
+        }
+    }
+    note
+}
+
+/// A folder as a zip, streamed: nothing is gathered first, in memory or on
+/// disk, so the download starts at once and can be any size.
+fn zip_plain(
+    shared: &Shared,
+    conn: &mut Conn,
+    request: &Request,
+    client: IpAddr,
+    root: usize,
+    relative: &str,
+    only: &[String],
+) -> io::Result<bool> {
+    let top = zip_top(shared, root, relative);
+    let disposition: String = disposition(&format!("{top}.zip"), false)
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect();
+    let mut text = format!("HTTP/1.1 200 OK\r\n{SECURITY_HEADERS}");
+    text.push_str("Content-Type: application/zip\r\nCache-Control: no-store\r\n");
+    text.push_str(&format!("Content-Disposition: {disposition}\r\n"));
+    text.push_str(if request.http10 {
+        "Connection: close\r\n\r\n"
+    } else {
+        "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\nKeep-Alive: timeout=15\r\n\r\n"
+    });
+    conn.wire.write_all(text.as_bytes())?;
+    let mut body = Chunked {
+        wire: &mut conn.wire,
+        buffer: Vec::with_capacity(Chunked::SIZE),
+        raw: request.http10,
+    };
+    let mut zip = ZipWriter::new(&mut body);
+    let stop = || shared.stopping();
+    let Ok(packed) = pack_folder(&shared.roots, root, relative, only, &top, &mut zip, &stop) else {
+        // The visitor left; the download shows as failed.
+        return Ok(false);
+    };
+    if shared.stopping() || zip.finish().is_err() || body.end().is_err() {
+        return Ok(false);
+    }
+    let mut summary = format!(
+        "zip of {top} done: {} files, {} bytes",
+        packed.files, packed.bytes
+    );
+    if !packed.skipped.is_empty() {
+        summary.push_str(&format!(", {} left out", packed.skipped.len()));
+    }
+    if packed.truncated {
+        summary.push_str(", stopped at the entry limit");
+    }
+    shared.log(client, &summary);
+    Ok(!request.http10)
+}
+
+fn denied_reply(denied: Denied) -> (u16, String) {
+    match denied {
+        Denied::BadName => (400, error_json("That name isn't allowed.")),
+        Denied::NotFound => (404, error_json("Not found.")),
+    }
+}
+
+/// What to do when something with the same name is already there.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Conflict {
+    /// Say so (409) and let the visitor choose.
+    Ask,
+    Replace,
+    /// Use a free name like `name (2).txt`.
+    KeepBoth,
+}
+
+impl Conflict {
+    fn of(params: &Params) -> Self {
+        match (params.get("conflict"), params.get("replace")) {
+            (Some("replace"), _) | (None, Some("1")) => Conflict::Replace,
+            (Some("keep"), _) => Conflict::KeepBoth,
+            _ => Conflict::Ask,
+        }
+    }
+}
+
+/// The 409 reply that lets the page ask Replace, Keep both, or Skip.
+fn conflict_json(name: &str, folder: bool) -> String {
+    format!(
+        "{{\"error\":{},\"conflict\":true,\"name\":{},\"dir\":{folder}}}",
+        quote(&format!("{name} is already there.")),
+        quote(name)
+    )
+}
+
+/// Makes the folders of `sub` (like `Trip/Day 1`) inside folder `path` of
+/// shared folder `root`, as an uploaded folder had them. Each name is
+/// checked like any other, and a name taken by something a visitor can't
+/// see, or by a file, is refused. Returns the path the files go in.
+fn make_folders(
+    shared: &Shared,
+    root: usize,
+    path: &str,
+    sub: &str,
+) -> Result<String, (u16, String)> {
+    let mut at = path.trim_matches('/').to_string();
+    for (depth, part) in sub
+        .split(['/', '\\'])
+        .filter(|part| !part.is_empty())
+        .enumerate()
+    {
+        files::check_name(part).map_err(denied_reply)?;
+        if depth >= 32 {
+            return Err((400, error_json("Those folders are nested too deep.")));
+        }
+        let next = if at.is_empty() {
+            part.to_string()
+        } else {
+            format!("{at}/{part}")
+        };
+        match shared.roots.resolve(root, &next) {
+            Ok(folder) if folder.is_dir() => {}
+            Ok(_) => {
+                return Err((
+                    409,
+                    error_json(&format!(
+                        "A file called {part} is in the way of that folder."
+                    )),
+                ))
+            }
+            Err(_) => {
+                let target = shared
+                    .roots
+                    .resolve_new(root, &at, part)
+                    .map_err(denied_reply)?;
+                // Taken by something hidden or left out: not ours to touch.
+                if std::fs::symlink_metadata(&target).is_ok() {
+                    return Err(denied_reply(Denied::NotFound));
+                }
+                std::fs::create_dir(&target).map_err(|error| {
+                    (
+                        400,
+                        error_json(&format!("Couldn't create the folder {part}: {error}")),
+                    )
+                })?;
+            }
+        }
+        at = next;
+    }
+    Ok(at)
+}
+
 /// Where an upload goes, checked before any of it is read.
 fn upload_target(shared: &Shared, params: &Params) -> Result<PathBuf, (u16, String)> {
     let name = params.get("name").unwrap_or("");
-    let replace = params.get("replace") == Some("1");
-    let target = shared
+    files::check_name(name).map_err(denied_reply)?;
+    let root = params.root();
+    // The place must be a folder a visitor may use before anything is made in it.
+    match shared.roots.resolve(root, params.path()) {
+        Ok(folder) if folder.is_dir() => {}
+        Ok(_) => return Err(denied_reply(Denied::NotFound)),
+        Err(denied) => return Err(denied_reply(denied)),
+    }
+    let folder = match params.get("sub").filter(|sub| !sub.is_empty()) {
+        Some(sub) => make_folders(shared, root, params.path(), sub)?,
+        None => params.path().to_string(),
+    };
+    let mut target = shared
         .roots
-        .resolve_new(params.root(), params.path(), name)
-        .map_err(|denied| match denied {
-            Denied::BadName => (400, error_json("That name isn't allowed.")),
-            Denied::NotFound => (404, error_json("Not found.")),
-        })?;
-    if target.is_dir() || (target.exists() && !replace) {
-        return Err((409, error_json("A file with that name is already there.")));
+        .resolve_new(root, &folder, name)
+        .map_err(denied_reply)?;
+    let taken = std::fs::symlink_metadata(&target).is_ok();
+    match Conflict::of(params) {
+        _ if !taken => {}
+        Conflict::KeepBoth => {
+            target =
+                files::free_name(&target).ok_or((409, error_json("No free name was found.")))?;
+        }
+        Conflict::Replace if target.is_file() => {}
+        Conflict::Replace => {
+            return Err((409, error_json("A folder with that name is already there.")));
+        }
+        Conflict::Ask => return Err((409, conflict_json(name, target.is_dir()))),
     }
     if target.parent().is_none() {
         return Err((400, error_json("That folder can't be used.")));
     }
     Ok(target)
+}
+
+/// The reply to an upload: the name it was saved under.
+fn saved_json(target: &Path) -> String {
+    let name = target
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    format!("{{\"name\":{}}}", quote(&name))
 }
 
 /// Writes beside the target, then moves it into place in one step.
@@ -1519,8 +2403,9 @@ fn upload_plain(
         conn.read_body(length, &mut |bytes| file.write_all(bytes))
     }) {
         Ok(()) => {
+            shared.sizes.forget();
             shared.log(client, &format!("upload {}", files::display_path(&target)));
-            json(conn, 201, "{}")?;
+            json(conn, 201, &saved_json(&target))?;
             Ok(true)
         }
         Err(error) => {
@@ -1610,7 +2495,10 @@ fn sealed_call(
         return Ok(true);
     };
     let op = params.get("op").unwrap_or("").to_string();
-    let method = if matches!(op.as_str(), "/api/info" | "/api/list" | "/api/search") {
+    let method = if matches!(
+        op.as_str(),
+        "/api/info" | "/api/list" | "/api/search" | "/api/sizes"
+    ) {
         "GET"
     } else {
         "POST"
@@ -1621,7 +2509,9 @@ fn sealed_call(
             shared.sessions.remove(token_value);
             (200, "{}".into())
         }
-        Reply::File(..) | Reply::Thumb(..) => (400, error_json("Use the download call.")),
+        Reply::File(..) | Reply::Thumb(..) | Reply::Zip(..) => {
+            (400, error_json("Use the download call."))
+        }
     };
     let mut aad = b"feather reply".to_vec();
     aad.extend_from_slice(&nonce);
@@ -1687,6 +2577,10 @@ fn sealed_download(
         },
         Reply::Json(status, body) => {
             json(conn, status, &body)?;
+            return Ok(true);
+        }
+        Reply::Zip(..) => {
+            json(conn, 403, &error_json(SEALED_ZIP))?;
             return Ok(true);
         }
         Reply::Logout => return Ok(false),
@@ -1784,8 +2678,9 @@ fn sealed_upload(
     });
     match result {
         Ok(()) => {
+            shared.sizes.forget();
             shared.log(client, &format!("upload {}", files::display_path(&target)));
-            json(conn, 201, "{}")?;
+            json(conn, 201, &saved_json(&target))?;
             Ok(true)
         }
         Err(error) => {
