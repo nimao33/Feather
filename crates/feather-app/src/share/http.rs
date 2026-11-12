@@ -1288,6 +1288,7 @@ fn call(
                 ),
                 Ok(target) => match std::fs::create_dir(&target) {
                     Ok(()) => {
+                        shared.sizes.forget();
                         shared.log(
                             client,
                             &format!("new folder {}", files::display_path(&target)),
@@ -1321,6 +1322,7 @@ fn call(
                 ),
                 (Ok(from), Ok(target)) => match std::fs::rename(&from, &target) {
                     Ok(()) => {
+                        shared.sizes.forget();
                         shared.log(
                             client,
                             &format!(
@@ -1343,17 +1345,278 @@ fn call(
             Ok(target) if shared.roots.is_root(params.root(), &target) => {
                 Reply::Json(403, error_json("A shared folder itself can't be deleted."))
             }
-            Ok(target) => match files::recycle(&target) {
-                Ok(()) => {
-                    shared.log(client, &format!("delete {}", files::display_path(&target)));
-                    ok("{}".into())
+            Ok(target) => {
+                // For good only when the person chose that, after the trash
+                // couldn't take it.
+                let permanent = params.get("permanent") == Some("1");
+                let result = if permanent {
+                    files::remove(&target)
+                } else {
+                    files::recycle(&target)
+                };
+                shared.sizes.forget();
+                match result {
+                    Ok(()) => {
+                        let how = if permanent {
+                            "delete for good"
+                        } else {
+                            "delete"
+                        };
+                        shared.log(client, &format!("{how} {}", files::display_path(&target)));
+                        ok(format!("{{\"permanent\":{permanent}}}"))
+                    }
+                    Err(error) if !permanent && cfg!(not(windows)) => Reply::Json(
+                        409,
+                        format!("{{\"error\":{},\"permanent\":true}}", quote(&error)),
+                    ),
+                    Err(error) => Reply::Json(400, error_json(&error)),
                 }
-                Err(error) => Reply::Json(400, error_json(&error)),
-            },
+            }
             Err(denied) => refuse(denied),
         },
+        ("POST", "/api/move") if full => transfer(shared, params, client, false),
+        ("POST", "/api/copy") if full => transfer(shared, params, client, true),
+        ("GET", "/api/sizes") => folder_sizes(shared, params),
         _ => Reply::Json(404, error_json("Not found.")),
     }
+}
+
+fn denied_json(denied: Denied) -> Reply {
+    match denied {
+        Denied::BadName => Reply::Json(400, error_json("That name isn't allowed.")),
+        Denied::NotFound => Reply::Json(404, error_json("Not found.")),
+    }
+}
+
+/// Moves or copies one file or folder (`root`, `path`) into the folder
+/// `to` of shared folder `to_root`. Both ends go through the same checks as
+/// everything else, a folder can't go into itself, and a folder holding a
+/// left-out folder can't be moved, since that would carry it out of the
+/// list. A name already taken is answered with the same 409 as an upload,
+/// so the page can ask Replace, Keep both, or Skip; Replace sends what was
+/// there to the Recycle Bin first.
+fn transfer(shared: &Shared, params: &Params, client: IpAddr, copy: bool) -> Reply {
+    let roots = &shared.roots;
+    let root = params.root();
+    let to_root = params
+        .get("to_root")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(root);
+    let to = params.get("to").unwrap_or("").trim_matches('/');
+    let from = match roots.resolve(root, params.path()) {
+        Ok(from) => from,
+        Err(denied) => return denied_json(denied),
+    };
+    let folder = match roots.resolve(to_root, to) {
+        Ok(folder) if folder.is_dir() => folder,
+        Ok(_) => return denied_json(Denied::NotFound),
+        Err(denied) => return denied_json(denied),
+    };
+    if !copy && roots.is_root(root, &from) {
+        return Reply::Json(403, error_json("A shared folder itself can't be moved."));
+    }
+    let Some(name) = from
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+    else {
+        return Reply::Json(403, error_json("That can't be moved."));
+    };
+    if from.is_dir() && files::inside(&from, &folder) {
+        return Reply::Json(400, error_json("A folder can't go into itself."));
+    }
+    if !copy && from.is_dir() && roots.holds_blocked(&from) {
+        return Reply::Json(
+            403,
+            error_json("That folder holds a folder that isn't shared, so it can't be moved."),
+        );
+    }
+    let mut target = match roots.resolve_new(to_root, to, &name) {
+        Ok(target) => target,
+        Err(denied) => return denied_json(denied),
+    };
+    let here = files::same_path(&target, &from);
+    if std::fs::symlink_metadata(&target).is_ok() {
+        match Conflict::of(params) {
+            Conflict::Ask => return Reply::Json(409, conflict_json(&name, target.is_dir())),
+            Conflict::KeepBoth if here && !copy => {
+                return Reply::Json(400, error_json("It's already in that folder."))
+            }
+            Conflict::KeepBoth => match files::free_name(&target) {
+                Some(free) => target = free,
+                None => return Reply::Json(409, error_json("No free name was found.")),
+            },
+            Conflict::Replace if here || files::inside(&target, &from) => {
+                return Reply::Json(400, error_json("Something can't replace itself."))
+            }
+            Conflict::Replace => {
+                // Only something the visitor can see may be replaced.
+                let Ok(existing) = roots.resolve(to_root, &files::join_relative(to, &name)) else {
+                    return Reply::Json(409, error_json("That name can't be used there."));
+                };
+                if roots.is_root(to_root, &existing) || roots.holds_blocked(&existing) {
+                    return Reply::Json(409, error_json("That can't be replaced."));
+                }
+                if let Err(error) = files::recycle(&existing) {
+                    return Reply::Json(400, error_json(&error));
+                }
+                shared.log(
+                    client,
+                    &format!("delete {} (replaced)", files::display_path(&existing)),
+                );
+            }
+        }
+    }
+    shared.sizes.forget();
+    let result = if copy {
+        copy_tree(roots, &from, &target).map(|_| ())
+    } else {
+        move_item(roots, &from, &target)
+    };
+    match result {
+        Ok(()) => {
+            shared.log(
+                client,
+                &format!(
+                    "{} {} to {}",
+                    if copy { "copy" } else { "move" },
+                    files::display_path(&from),
+                    files::display_path(&target)
+                ),
+            );
+            Reply::Json(201, saved_json(&target))
+        }
+        Err(error) => Reply::Json(400, error_json(&error)),
+    }
+}
+
+/// Moves in one step on one drive. Across drives it copies what a visitor
+/// may see and removes the original only when that was everything.
+fn move_item(roots: &files::Roots, from: &Path, target: &Path) -> Result<(), String> {
+    if std::fs::rename(from, target).is_ok() {
+        return Ok(());
+    }
+    let left_out = copy_tree(roots, from, target)?;
+    if left_out > 0 {
+        return Err(format!(
+            "It was copied, but {left_out} hidden or unreadable item(s) couldn't come along, \
+             so the original was kept."
+        ));
+    }
+    files::remove(from)
+}
+
+/// Copies a file, or a folder and what a visitor may see in it, to
+/// `target`, which doesn't exist yet. Links aren't followed. Returns how
+/// many items were left out; on failure, what was made is removed.
+fn copy_tree(roots: &files::Roots, from: &Path, target: &Path) -> Result<usize, String> {
+    let failed = |error: io::Error| {
+        let _ = files::remove(target);
+        format!("Couldn't copy it: {error}")
+    };
+    if !from.is_dir() {
+        return copy_file(from, target).map(|()| 0).map_err(failed);
+    }
+    let mut left_out = 0;
+    let mut count = 0;
+    let mut pending = vec![(from.to_path_buf(), target.to_path_buf(), 0usize)];
+    while let Some((source, made, depth)) = pending.pop() {
+        std::fs::create_dir(&made).map_err(failed)?;
+        let listing = std::fs::read_dir(&source).map_err(failed)?;
+        for entry in listing.flatten() {
+            count += 1;
+            if count > ZIP_ENTRIES {
+                let _ = files::remove(target);
+                return Err("That folder holds too many items to copy here.".into());
+            }
+            let path = entry.path();
+            let name = entry.file_name();
+            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                left_out += 1;
+                continue;
+            };
+            let usable = name
+                .to_str()
+                .is_some_and(|name| files::check_name(name).is_ok())
+                && roots.visible(&path)
+                && !roots.is_blocked(&path)
+                && !metadata.file_type().is_symlink()
+                && !files::is_reparse(&metadata);
+            if !usable {
+                left_out += 1;
+            } else if metadata.is_dir() {
+                if depth + 1 >= ZIP_DEPTH {
+                    left_out += 1;
+                } else {
+                    pending.push((path, made.join(&name), depth + 1));
+                }
+            } else if copy_file(&path, &made.join(&name)).is_err() {
+                left_out += 1;
+            }
+        }
+    }
+    Ok(left_out)
+}
+
+/// Copies one file without overwriting anything.
+fn copy_file(from: &Path, to: &Path) -> io::Result<()> {
+    let mut source = std::fs::File::open(from)?;
+    let mut made = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(to)?;
+    let copied = io::copy(&mut source, &mut made).and_then(|_| made.flush());
+    if copied.is_err() {
+        drop(made);
+        let _ = std::fs::remove_file(to);
+    }
+    copied
+}
+
+/// The totals of the folders in folder `path` of shared folder `root`, as
+/// far as they are known; the page asks again for the rest. With `self=1`,
+/// the total of the folder itself.
+fn folder_sizes(shared: &Shared, params: &Params) -> Reply {
+    let folder = match shared.roots.resolve(params.root(), params.path()) {
+        Ok(folder) if folder.is_dir() => folder,
+        Ok(_) => return Reply::Json(400, error_json("That is a file, not a folder.")),
+        Err(denied) => return denied_json(denied),
+    };
+    let (names, paths): (Vec<String>, Vec<PathBuf>) = if params.get("self") == Some("1") {
+        (vec![String::new()], vec![folder])
+    } else {
+        let Ok((items, _)) = shared.roots.list(&folder, LIST_LIMIT) else {
+            return Reply::Json(404, error_json("That folder can't be opened."));
+        };
+        items
+            .into_iter()
+            .filter(|item| item.dir)
+            .filter_map(|item| {
+                let path = files::join_relative(params.path(), &item.name);
+                let real = shared.roots.resolve(params.root(), &path).ok()?;
+                Some((item.name, real))
+            })
+            .unzip()
+    };
+    let totals = shared.sizes.lookup(&shared.roots, &paths);
+    let waiting = totals.iter().filter(|total| total.is_none()).count();
+    let found: Vec<String> = names
+        .iter()
+        .zip(totals)
+        .filter_map(|(name, total)| {
+            let total = total?;
+            Some(format!(
+                "{{\"name\":{},\"size\":{},\"items\":{},\"partial\":{}}}",
+                quote(name),
+                total.bytes,
+                total.items,
+                total.partial
+            ))
+        })
+        .collect();
+    Reply::Json(
+        200,
+        format!("{{\"sizes\":[{}],\"waiting\":{waiting}}}", found.join(",")),
+    )
 }
 
 /// An API call without end-to-end encryption.
@@ -2138,6 +2401,7 @@ fn upload_plain(
         conn.read_body(length, &mut |bytes| file.write_all(bytes))
     }) {
         Ok(()) => {
+            shared.sizes.forget();
             shared.log(client, &format!("upload {}", files::display_path(&target)));
             json(conn, 201, &saved_json(&target))?;
             Ok(true)
@@ -2229,7 +2493,10 @@ fn sealed_call(
         return Ok(true);
     };
     let op = params.get("op").unwrap_or("").to_string();
-    let method = if matches!(op.as_str(), "/api/info" | "/api/list" | "/api/search") {
+    let method = if matches!(
+        op.as_str(),
+        "/api/info" | "/api/list" | "/api/search" | "/api/sizes"
+    ) {
         "GET"
     } else {
         "POST"
@@ -2409,6 +2676,7 @@ fn sealed_upload(
     });
     match result {
         Ok(()) => {
+            shared.sizes.forget();
             shared.log(client, &format!("upload {}", files::display_path(&target)));
             json(conn, 201, &saved_json(&target))?;
             Ok(true)
