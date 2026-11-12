@@ -22,7 +22,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use feather_core::live::{
-    entry_flags, Batch, Change, EntryState, JournalCursor, Overlay, Rules, FILE_ATTRIBUTE_DIRECTORY,
+    entry_flags, Batch, Change, EntryState, JournalCursor, Overlay, Rules,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
 };
 use feather_core::IndexSet;
 
@@ -350,7 +351,11 @@ impl Follower {
             };
             for item in items {
                 let is_dir = item.attributes & FILE_ATTRIBUTE_DIRECTORY != 0;
-                if is_dir {
+                // Junctions and folder links are listed but never walked
+                // into, like the MFT reader: their target's entries belong
+                // where they really are, and links can loop.
+                let is_link = item.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+                if is_dir && !is_link {
                     folders.push((item.frn, path.join(&item.name)));
                 }
                 changes.push(Change::Upsert(EntryState {
@@ -564,8 +569,14 @@ mod tests {
                 mtime: 2,
             };
             Ok(match path.to_string_lossy().as_ref() {
-                "C:\\restored" => vec![item(401, "inner", 0x10), item(402, "a.txt", 0x20)],
+                "C:\\restored" => vec![
+                    item(401, "inner", 0x10),
+                    item(402, "a.txt", 0x20),
+                    // A junction to inner: listed, never walked into.
+                    item(404, "link", 0x410),
+                ],
                 "C:\\restored\\inner" => vec![item(403, "b.txt", 0x20)],
+                "C:\\restored\\link" => vec![item(403, "b.txt", 0x20)],
                 _ => Vec::new(),
             })
         });
@@ -588,7 +599,12 @@ mod tests {
             Some("C:\\restored\\inner\\b.txt")
         );
         assert_eq!(volume.entry(deep).size, 5);
-        assert_eq!(listed.lock().unwrap().len(), 2);
+        assert!(volume.lookup_frn(404).is_some(), "the junction is listed");
+        assert_eq!(
+            listed.lock().unwrap().len(),
+            2,
+            "the junction is not walked"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

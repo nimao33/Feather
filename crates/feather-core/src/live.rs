@@ -36,6 +36,8 @@ const CURSOR_MAGIC: &[u8; 8] = b"FTHRUSN1";
 const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
 const FILE_ATTRIBUTE_SYSTEM: u32 = 0x4;
 pub const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+/// Junctions, symbolic links and other reparse points.
+pub const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 
 /// The index flags for an entry: bit 0 folder, bit 1 hidden, bit 2 system.
 pub fn entry_flags(is_dir: bool, attributes: u32) -> u16 {

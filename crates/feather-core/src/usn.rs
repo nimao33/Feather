@@ -281,9 +281,9 @@ mod imp {
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FileBasicInfo, FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo,
         FileStandardInfo, GetFileInformationByHandleEx, OpenFileById, FILE_BASIC_INFO,
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_BOTH_DIR_INFO, FILE_ID_DESCRIPTOR, FILE_LIST_DIRECTORY,
-        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        FILE_STANDARD_INFO, OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_BOTH_DIR_INFO,
+        FILE_ID_DESCRIPTOR, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, OPEN_EXISTING,
     };
     use windows_sys::Win32::System::IO::DeviceIoControl;
 
@@ -293,7 +293,6 @@ mod imp {
     const FSCTL_QUERY_USN_JOURNAL: u32 = 0x0009_00f4;
     const FSCTL_READ_USN_JOURNAL: u32 = 0x0009_00bb;
     const ERROR_FILE_NOT_FOUND: i32 = 2;
-    const ERROR_INVALID_PARAMETER: i32 = 87;
     const ERROR_HANDLE_EOF: i32 = 38;
     const ERROR_NO_MORE_FILES: i32 = 18;
     const ERROR_JOURNAL_DELETE_IN_PROGRESS: i32 = 1178;
@@ -389,6 +388,16 @@ mod imp {
         query_handle(&open_volume(drive)?)
     }
 
+    /// Only "not found" means the file is gone. Other failures, such as
+    /// ERROR_INVALID_PARAMETER for a link that can't be opened, leave the
+    /// entry as it is rather than removing it.
+    pub(super) fn gone_or_unknown(error: Option<i32>) -> Lookup {
+        match error {
+            Some(ERROR_FILE_NOT_FOUND) => Lookup::Gone,
+            _ => Lookup::Unknown,
+        }
+    }
+
     /// What a file is now, asked by reference through the volume.
     fn facts(volume: &Handle, frn: u64) -> Lookup {
         let mut descriptor: FILE_ID_DESCRIPTOR = unsafe { std::mem::zeroed() };
@@ -402,15 +411,15 @@ mod imp {
                 FILE_READ_ATTRIBUTES,
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 std::ptr::null(),
-                FILE_FLAG_BACKUP_SEMANTICS,
+                // The link itself, not what it points to: without this,
+                // junctions and symbolic links fail to open and were taken
+                // for deleted. The MFT reader indexes links the same way.
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
             )
         };
         if handle == INVALID_HANDLE_VALUE {
             let error = io::Error::last_os_error();
-            return match error.raw_os_error() {
-                Some(ERROR_FILE_NOT_FOUND) | Some(ERROR_INVALID_PARAMETER) => Lookup::Gone,
-                _ => Lookup::Unknown,
-            };
+            return gone_or_unknown(error.raw_os_error());
         }
         let handle = Handle(handle);
         let mut basic: FILE_BASIC_INFO = unsafe { std::mem::zeroed() };
@@ -606,6 +615,18 @@ mod imp {
 
 #[cfg(test)]
 mod tests {
+
+    #[cfg(windows)]
+    #[test]
+    fn only_not_found_means_a_file_is_gone() {
+        use super::imp::gone_or_unknown;
+        assert!(matches!(gone_or_unknown(Some(2)), Lookup::Gone));
+        // A link that can't be opened is not a deleted file.
+        assert!(matches!(gone_or_unknown(Some(87)), Lookup::Unknown));
+        assert!(matches!(gone_or_unknown(Some(5)), Lookup::Unknown));
+        assert!(matches!(gone_or_unknown(None), Lookup::Unknown));
+    }
+
     use super::*;
 
     /// A USN_RECORD_V2 as the journal lays it out, padded to 8 bytes.
