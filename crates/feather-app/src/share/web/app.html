@@ -33,6 +33,9 @@
     <button id="zip" class="zip" type="button" hidden title="Download this folder as a .zip">
       <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 3v10m-4-4 4 4 4-4M4 16h12"/></svg><span>Download folder</span>
     </button>
+    <button id="sort" class="icon-tool" type="button" aria-label="Sort" aria-haspopup="menu" title="Sort">
+      <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M6 3.5v13m-3-3 3 3 3-3M14 16.5v-13m-3 3 3-3 3 3"/></svg>
+    </button>
     <div class="views" role="group" aria-label="Show as">
       <button id="as-list" type="button" aria-label="List" title="List" aria-pressed="true">
         <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 3.5h12M2 8h12M2 12.5h12"/></svg>
@@ -45,13 +48,16 @@
   <div class="tools" id="tools" hidden>
     <!-- No accept filter and no capture: phones then offer every file app
          (Files, Drive, file managers), not only the camera and gallery. -->
-    <label class="button" for="files">Upload files</label>
     <input id="files" type="file" multiple hidden>
-    <label class="button" for="folder" id="folder-label">Upload folder</label>
     <input id="folder" type="file" webkitdirectory multiple hidden>
-    <label class="button camera" for="camera">Take photo or video</label>
     <input id="camera" type="file" accept="image/*,video/*" capture="environment" hidden>
-    <button id="mkdir" type="button">New folder</button>
+    <button id="t-upload" class="tool" type="button" data-full title="Upload files"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 14V3.5m-4 4 4-4 4 4M4 16.5h12"/></svg><span>Upload files</span></button>
+    <button id="t-folder" class="tool wide" type="button" data-full title="Upload a folder"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M2.5 6V15a1.5 1.5 0 0 0 1.5 1.5h12a1.5 1.5 0 0 0 1.5-1.5V7.5A1.5 1.5 0 0 0 16 6h-6.5L8 4H4A1.5 1.5 0 0 0 2.5 5.5ZM10 14V9m-2.2 2.2L10 9l2.2 2.2"/></svg><span>Upload folder</span></button>
+    <button id="t-camera" class="tool camera" type="button" data-full title="Take a photo or video"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 7.5A1.5 1.5 0 0 1 4.5 6h2l1.5-2h4l1.5 2h2A1.5 1.5 0 0 1 17 7.5v7a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 3 14.5Z"/><circle cx="10" cy="10.8" r="3"/></svg><span>Camera</span></button>
+    <button id="t-mkdir" class="tool wide" type="button" data-full title="New folder"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M2.5 6V15a1.5 1.5 0 0 0 1.5 1.5h12a1.5 1.5 0 0 0 1.5-1.5V7.5A1.5 1.5 0 0 0 16 6h-6.5L8 4H4A1.5 1.5 0 0 0 2.5 5.5ZM10 8.5v5m-2.5-2.5h5"/></svg><span>New folder</span></button>
+    <button id="t-paste" class="tool" type="button" hidden><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M7 4.5H5.5A1.5 1.5 0 0 0 4 6v10a1.5 1.5 0 0 0 1.5 1.5h9A1.5 1.5 0 0 0 16 16V6a1.5 1.5 0 0 0-1.5-1.5H13"/><rect x="7" y="2.5" width="6" height="3.5" rx="1"/></svg><span id="t-paste-label">Paste</span></button>
+    <button id="t-select" class="tool wide" type="button" title="Select several"><svg viewBox="0 0 20 20" aria-hidden="true"><rect x="3" y="3" width="14" height="14" rx="3"/><path d="m6.5 10 2.4 2.4 4.6-4.8"/></svg><span>Select</span></button>
+    <button id="t-more" class="tool narrow" type="button" aria-label="More" aria-haspopup="menu" title="More"><svg viewBox="0 0 20 20" aria-hidden="true"><circle class="fill" cx="4.5" cy="10" r="1.5"/><circle class="fill" cx="10" cy="10" r="1.5"/><circle class="fill" cx="15.5" cy="10" r="1.5"/></svg></button>
   </div>
   <p class="status" id="status" role="status" aria-live="polite"></p>
   <table class="list" id="list">
@@ -61,6 +67,15 @@
   <ul class="grid" id="grid" hidden></ul>
   <p class="empty" id="empty" hidden></p>
 </main>
+
+<div class="selbar" id="selbar" hidden role="toolbar" aria-label="Selected items">
+  <button id="sel-close" class="tool" type="button" aria-label="Stop selecting" title="Stop selecting (Esc)"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 5 10 10M15 5 5 15"/></svg></button>
+  <span class="sel-count" id="sel-count" aria-live="polite"></span>
+  <button id="sel-download" class="tool" type="button" title="Download"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 3v10m-4-4 4 4 4-4M4 16h12"/></svg><span>Download</span></button>
+  <button id="sel-move" class="tool strong" type="button" title="Move to…"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M2.5 6V15a1.5 1.5 0 0 0 1.5 1.5h12a1.5 1.5 0 0 0 1.5-1.5V7.5A1.5 1.5 0 0 0 16 6h-6.5L8 4H4A1.5 1.5 0 0 0 2.5 5.5ZM7 11.2h6m-2.2-2.4 2.4 2.4-2.4 2.4"/></svg><span>Move to…</span></button>
+  <button id="sel-delete" class="tool danger" type="button" title="Delete"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3.5 5.5h13M8 5.5V4a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v1.5M5.5 5.5l.8 10.6A1.5 1.5 0 0 0 7.8 17.5h4.4a1.5 1.5 0 0 0 1.5-1.4l.8-10.6M8.5 8.5v6M11.5 8.5v6"/></svg><span>Delete</span></button>
+  <button id="sel-more" class="tool" type="button" aria-label="More" aria-haspopup="menu" title="More"><svg viewBox="0 0 20 20" aria-hidden="true"><circle class="fill" cx="4.5" cy="10" r="1.5"/><circle class="fill" cx="10" cy="10" r="1.5"/><circle class="fill" cx="15.5" cy="10" r="1.5"/></svg></button>
+</div>
 
 <div class="drop" id="drop" aria-hidden="true"><div>Drop files or folders to upload them here</div></div>
 
@@ -72,6 +87,32 @@
     <button id="conflict-skip" type="button" class="quiet">Skip</button>
     <button id="conflict-keep" type="button">Keep both</button>
     <button id="conflict-replace" type="button" class="primary">Replace</button>
+  </div>
+</dialog>
+
+<dialog class="dialog" id="ask" aria-labelledby="ask-title">
+  <form id="ask-form" method="dialog">
+    <h2 id="ask-title"></h2>
+    <p id="ask-text" hidden></p>
+    <label id="ask-label" for="ask-input" class="ask-label"></label>
+    <input id="ask-input" type="text" autocomplete="off" spellcheck="false" maxlength="255">
+    <div class="dialog-buttons">
+      <button id="ask-cancel" type="button" class="quiet">Cancel</button>
+      <button id="ask-ok" type="submit" class="primary">OK</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog class="dialog picker" id="picker" aria-labelledby="picker-title">
+  <h2 id="picker-title">Move to…</h2>
+  <nav class="trail picker-trail" id="picker-trail" aria-label="Folder"></nav>
+  <ul class="picker-list" id="picker-list"></ul>
+  <div class="dialog-buttons">
+    <button id="picker-new" type="button" class="quiet">New folder</button>
+    <span class="pgap"></span>
+    <button id="picker-cancel" type="button" class="quiet">Cancel</button>
+    <button id="picker-copy" type="button">Copy here</button>
+    <button id="picker-move" type="button" class="primary">Move here</button>
   </div>
 </dialog>
 

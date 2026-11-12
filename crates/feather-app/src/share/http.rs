@@ -1197,7 +1197,7 @@ fn call(
                 .map(|address| quote(address))
                 .collect();
             ok(format!(
-                "{{\"user\":{},\"mode\":\"{}\",\"csrf\":{},\"local\":{},\"addresses\":[{}],\"roots\":[{}]}}",
+                "{{\"user\":{},\"mode\":\"{}\",\"csrf\":{},\"local\":{},\"addresses\":[{}],\"bin\":\"{}\",\"roots\":[{}]}}",
                 quote(if shared.config.open() {
                     ""
                 } else {
@@ -1207,6 +1207,7 @@ fn call(
                 quote(csrf),
                 quote(&local),
                 addresses.join(","),
+                if cfg!(windows) { "Recycle Bin" } else { "trash" },
                 roots.join(",")
             ))
         }
