@@ -1615,10 +1615,9 @@ mod tests {
         assert_eq!(code, 201);
         assert!(body.contains("a (2).txt"), "{body}");
         std::fs::write(shared.join("docs").join("sub").join("a.txt"), b"newer").unwrap();
-        assert_eq!(
-            post("/api/move?root=0&path=docs/sub/a.txt&to_root=1&to=&conflict=replace").0,
-            201
-        );
+        let (code, body) =
+            post("/api/move?root=0&path=docs/sub/a.txt&to_root=1&to=&conflict=replace");
+        assert_eq!(code, 201, "{body}");
         assert_eq!(std::fs::read(second.join("a.txt")).unwrap(), b"newer");
         // Copying beside itself keeps both; moving onto itself can't be.
         assert_eq!(

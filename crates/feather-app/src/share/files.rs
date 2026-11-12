@@ -469,7 +469,10 @@ fn into_trash(trash: &Path, path: &Path) -> bool {
     use std::os::unix::fs::DirBuilderExt as _;
     let (files, info) = (trash.join("files"), trash.join("info"));
     for folder in [trash, files.as_path(), info.as_path()] {
-        let _ = std::fs::DirBuilder::new().mode(0o700).create(folder);
+        let _ = std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(folder);
     }
     let name = path
         .file_name()
