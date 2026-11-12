@@ -14,6 +14,8 @@
   pick, global shortcut, tray, start at sign-in, first-run guide.
 - Sharing over HTTPS and FTPS with sign-in, LAN QR code, Cloudflare/ngrok
   tunnels, photo and video viewing.
+- Date filters: `dm:today`, `dm:lastweek`, `dm:2026-11`, ranges, and a
+  Date modified section in Filters.
 - Linux window (a local page in a browser app window), CLI, per-user .msi
   installer with upgrades, CI on Windows and Linux.
 
@@ -22,8 +24,6 @@
 - **Live updates** from the NTFS change journal (USN): changes appear within
   about a second and whole-drive rebuilds become rare, removing the brief
   memory spike each rebuild causes.
-- **Date filters**: `dm:today`, `dm:lastweek`, `dm:2026-11`, ranges, and a
-  Modified control in Filters.
 - **Folder downloads** from the shared page as a streamed .zip.
 - **Linux release** tarball built by a release workflow next to the .msi.
 
@@ -38,6 +38,7 @@
 
 ## Known gaps
 
+- Date filters cover the modification date only; no calendar picker.
 - On Linux the index refreshes on a timer and has no NTFS fast path.
 - The installer is not code signed, so SmartScreen warns on first run.
 - The UI test harness needs an interactive desktop; it occasionally fails

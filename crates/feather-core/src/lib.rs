@@ -1,5 +1,6 @@
 //! Core index, query, and search types for Feather.
 
+pub mod date;
 pub mod entry;
 pub mod format;
 pub mod index;

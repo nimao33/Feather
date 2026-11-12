@@ -400,8 +400,9 @@ and writes the `.desktop` menu and autostart entries. The index is built with
 
 `Ui::start_search` is the one place that turns UI state into a query:
 
-1. `FilterSet::compose` appends `type:`, `ext:`, `size:`, and `match:` tokens to
-   the search text.
+1. `FilterSet::compose` appends `type:`, `ext:`, `size:`, `match:`, and `dm:`
+   tokens to the search text. The Modified choice is saved as
+   `filter_modified` (`today`, `thisweek`, `2026-01..2026-03`, ...).
 2. `Ui` appends `in:"<scope>"` when the filter bar has a folder selected.
 3. `Query::parse` validates the combined text and produces warnings.
 4. `SearchController::submit` receives the query, result cap, and

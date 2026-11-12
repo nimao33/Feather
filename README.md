@@ -45,7 +45,7 @@ web page.
   dropped by Windows when it needs the RAM. Idle private memory is about
   25 MB for the window and about 15 MB for the helper.
 - **Search syntax**: words, quoted phrases, `!` to exclude, `*` and `?`
-  wildcards, `ext:`, `type:`, `size:`, `match:`, folder paths like
+  wildcards, `ext:`, `type:`, `size:`, `dm:`, `match:`, folder paths like
   `docs\report`, and `in:` scopes (see below).
 - **Sidebar categories**: Everything, Apps, Files, Folders, Documents, Images,
   Video, Audio, Archives, Executables and Code, plus your own folders to look in.
@@ -151,9 +151,17 @@ More detail and the method are in [docs/benchmarks.md](docs/benchmarks.md).
 | `type:folder` / `type:file` | folders or files only |
 | `size:>10mb`, `size:1kb..2kb` | by size |
 | `match:starts report`, `match:ends .pdf` | where words must appear in the name |
+| `dm:today`, `dm:yesterday`, `dm:thisweek`, `dm:lastmonth`, `dm:thisyear` | modified in that period (`this`/`last` + `week`, `month`, `year`) |
+| `dm:last7days`, `dm:30days`, `dm:24hours`, `dm:2weeks` | modified recently; days count today as the first |
+| `dm:2026`, `dm:2026-11`, `dm:2026-11-11` | modified in that year, month, or day |
+| `dm:2026-01-01..2026-03-31`, `dm:2026-06..`, `dm:..2025` | modified in a range, both ends included; either end may be open |
+| `dm:>=2026-06`, `dm:>2026-06`, `dm:<2025`, `dm:<=2025` | from, after, before, or up to the end of a date |
 | `in:"C:\Users"`, `!in:"C:\Windows"` | only inside, or never inside, a folder |
 
-Words are case-insensitive.
+Words are case-insensitive. `date:` is the same as `dm:`. Dates are local
+time; weeks start on the first day of the week set in Windows (Monday on
+Linux). Folders match by their own date modified, as in Everything, and items
+with an unknown date match no date filter. Several `dm:` filters must all match.
 
 ## Build
 
@@ -239,7 +247,6 @@ docs/                 UI guide, index format, benchmarks, roadmap
 
 ## Not done yet
 
-- Date filters are parsed but not applied.
 - The index is rebuilt per drive on changes, not updated entry by entry from
   the USN journal.
 - No file watcher on Linux yet; the index refreshes on a timer there.

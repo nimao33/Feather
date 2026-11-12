@@ -117,3 +117,80 @@ fn rejects_out_of_bounds_name_offset() {
     assert!(VolumeIndex::open(&dir).is_err());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn date_filters_match_synthetic_mtimes() {
+    use feather_core::date::Clock;
+    const DAY: u64 = 86_400 * 10_000_000;
+
+    let dir = test_dir("dates");
+    generate(&dir, 20_001, r"C:\FeatherTest").expect("generate");
+    let index = VolumeIndex::open(&dir).expect("open");
+    // The root carries the generation time; every other entry is a whole
+    // number of days older (its index % 3650), folders included.
+    let now = index.entry(0).mtime;
+    let clock = Clock::fixed(now, 0);
+    let age = |id: u32| (now - index.entry_mtime(id)) / DAY;
+    let matching = |text: &str| -> Vec<u32> {
+        let query = feather_core::Query::parse_at(text, &clock);
+        assert!(
+            query.warnings().is_empty(),
+            "{text}: {:?}",
+            query.warnings()
+        );
+        assert!(query.has_dates() && !query.name_only() && !query.matches_everything());
+        let found: Vec<u32> = index
+            .iter_ids()
+            .filter(|id| {
+                let summary = index.entry_summary(*id);
+                query.matches_name(summary.name_search, summary.size, summary.flags)
+                    && query.matches_date_of(&index, *id)
+            })
+            .collect();
+        // The summary path and the full-entry path agree.
+        let full: Vec<u32> = index
+            .iter_ids()
+            .filter(|id| {
+                let entry = index.entry(*id);
+                query.matches(entry.name_search, &entry)
+            })
+            .collect();
+        assert_eq!(found, full, "{text}");
+        found
+    };
+    let expected = |keep: &dyn Fn(u64) -> bool| -> Vec<u32> {
+        index.iter_ids().filter(|id| keep(age(*id))).collect()
+    };
+
+    let today = matching("dm:today");
+    assert!(!today.is_empty());
+    assert_eq!(today, expected(&|age| age == 0));
+    assert_eq!(matching("dm:last7days"), expected(&|age| age <= 6));
+    assert_eq!(matching("date:last30days"), expected(&|age| age <= 29));
+    assert_eq!(matching("dm:yesterday"), expected(&|age| age == 1));
+    // Folders are filtered by their own mtime.
+    let folders = matching("dm:last7days type:folder");
+    assert!(!folders.is_empty());
+    assert!(folders
+        .iter()
+        .all(|id| index.entry(*id).is_dir() && age(*id) <= 6));
+    // Two date tokens AND together.
+    assert_eq!(
+        matching("dm:last30days dm:<last7days"),
+        expected(&|age| (7..=29).contains(&age))
+    );
+    // A cut-off splits the index in two, without overlap or gap.
+    let before = matching("dm:<lastyear");
+    let after = matching("dm:>=lastyear");
+    assert!(!before.is_empty() && !after.is_empty());
+    assert_eq!(before.len() + after.len(), index.iter_ids().len());
+    assert!(before.iter().all(|id| !after.contains(id)));
+    // Combined with name and extension filters.
+    let pdfs = matching("file ext:pdf dm:last30days");
+    assert!(!pdfs.is_empty());
+    assert!(pdfs
+        .iter()
+        .all(|id| index.entry(*id).name_search.ends_with(".pdf") && age(*id) <= 29));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -128,6 +128,7 @@ impl Scan<'_> {
             if (!self.options.show_hidden && entry.flags & 2 != 0)
                 || (!self.options.show_system && entry.flags & 4 != 0)
                 || !query.matches_name(entry.name_search, entry.size, entry.flags)
+                || !query.matches_date_of(volume, id)
                 || !query.matches_folder_parts(self.filter, entry.parent_frn, entry.name_search)
             {
                 continue;
@@ -416,7 +417,9 @@ pub fn narrow(
             continue;
         };
         let entry = volume.entry_summary(reference.id());
-        if !query.matches_name(entry.name_search, entry.size, entry.flags) {
+        if !query.matches_name(entry.name_search, entry.size, entry.flags)
+            || !query.matches_date_of(volume, reference.id())
+        {
             continue;
         }
         if needs_path

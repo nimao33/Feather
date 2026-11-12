@@ -3970,11 +3970,22 @@ pub fn run_scenarios(index: Arc<IndexSet>, screenshots: &Path) -> Result<(), Str
         min_size: Some(1024 * 1024),
         max_size: None,
         match_mode: MatchMode::StartsWith,
+        modified: crate::filters::Modified::Range {
+            from: "2026-01-01".into(),
+            to: "2026-03-31".into(),
+        },
     };
     let path = screenshots.join("06-filters.png");
     let look = unsafe { ui_ref(hwnd).map(|ui| ui.look()) }.ok_or("window closed")?;
-    crate::filters::capture(hwnd, sample_filters, look, &path)?;
+    crate::filters::capture(hwnd, sample_filters.clone(), look, &path)?;
     report.push_str(&format!("06-filters: screenshot={}\n", path.display()));
+    // The date section, at the bottom, with custom dates showing.
+    let path = screenshots.join("06b-filters-dates.png");
+    crate::filters::capture_at(hwnd, sample_filters, look, &path, 10_000.0)?;
+    report.push_str(&format!(
+        "06b-filters-dates: screenshot={}\n",
+        path.display()
+    ));
 
     unsafe {
         if let Some(ui) = ui_ref(hwnd) {
@@ -3984,6 +3995,7 @@ pub fn run_scenarios(index: Arc<IndexSet>, screenshots: &Path) -> Result<(), Str
                 min_size: None,
                 max_size: None,
                 match_mode: MatchMode::Anywhere,
+                modified: crate::filters::Modified::Any,
             });
             ui.set_query("file");
         }
@@ -4013,6 +4025,45 @@ pub fn run_scenarios(index: Arc<IndexSet>, screenshots: &Path) -> Result<(), Str
         "07-filtered: rows={count} total={total} screenshot={}\n",
         path.display()
     ));
+
+    // A date filter keeps some files and drops others: the synthetic index
+    // dates its entries a whole number of days back from when it was built.
+    let totals = |filters: FilterSet| {
+        unsafe {
+            if let Some(ui) = ui_ref(hwnd) {
+                ui.set_filters(filters);
+                ui.set_query("file");
+            }
+        }
+        pump_until_idle(hwnd, Duration::from_secs(5));
+        unsafe { ui_ref(hwnd).map(|ui| (ui.result_count(), ui.total())) }.unwrap_or((0, 0))
+    };
+    let (_, all_files) = totals(FilterSet::default());
+    let (count, total) = totals(FilterSet {
+        modified: crate::filters::Modified::Today,
+        ..FilterSet::default()
+    });
+    if count == 0 || total >= all_files {
+        return Err(format!(
+            "scenario 07b-modified: expected some of {all_files} files, got {total}"
+        ));
+    }
+    let path = screenshots.join("07b-modified.png");
+    unsafe {
+        if let Some(ui) = ui_ref(hwnd) {
+            ui.capture(&path)?;
+        }
+    }
+    report.push_str(&format!(
+        "07b-modified: rows={count} total={total} of {all_files} screenshot={}\n",
+        path.display()
+    ));
+    // Back to the PDF filter of 07 for the scenarios that follow.
+    totals(FilterSet {
+        kind: KindFilter::Files,
+        extensions: vec!["pdf".into()],
+        ..FilterSet::default()
+    });
 
     let path = screenshots.join("08-settings.png");
     settings::capture(hwnd, Settings::default(), look, &path)?;

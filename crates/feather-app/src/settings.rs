@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 
 use feather_core::{is_absolute_path, normalize_path, MatchMode};
 
-use crate::filters::{parse_extensions, Category, FilterSet, KindFilter, PRESET_CATEGORIES};
+use crate::filters::{
+    parse_extensions, Category, FilterSet, KindFilter, Modified, PRESET_CATEGORIES,
+};
 use crate::text;
 
 #[cfg(windows)]
@@ -777,6 +779,11 @@ impl Settings {
                 .unwrap_or_default()
         );
         let _ = writeln!(text, "filter_match={}", self.filters.match_mode.as_str());
+        let _ = writeln!(
+            text,
+            "filter_modified={}",
+            self.filters.modified.token().unwrap_or_default()
+        );
         let _ = writeln!(text, "size_format={}", self.size_format.as_str());
         let _ = writeln!(text, "details_pane={}", bool_value(self.details_pane));
         let _ = writeln!(text, "custom_theme={}", bool_value(self.custom_theme));
@@ -1116,6 +1123,10 @@ pub fn parse(text: &str) -> LoadedSettings {
                 Some(mode) => settings.filters.match_mode = mode,
                 None => warnings.push(invalid()),
             },
+            "filter_modified" => match Modified::parse(value) {
+                Some(modified) => settings.filters.modified = modified,
+                None => warnings.push(invalid()),
+            },
             "window" => match parse_window(value) {
                 Some(window) => settings.window = Some(window),
                 None => warnings.push(invalid()),
@@ -1278,6 +1289,7 @@ pub const SETTING_KEYS: &[&str] = &[
     "filter_min_size",
     "filter_max_size",
     "filter_match",
+    "filter_modified",
     "window",
     "size_format",
     "details_pane",
@@ -2996,6 +3008,10 @@ mod tests {
                 min_size: Some(1024),
                 max_size: Some(4096),
                 match_mode: MatchMode::EndsWith,
+                modified: Modified::Range {
+                    from: "2026-01".into(),
+                    to: "2026-03-31".into(),
+                },
             },
             excluded_volumes: vec![r"D:".into(), r"E:\Archive".into()],
             excluded_folders: vec![

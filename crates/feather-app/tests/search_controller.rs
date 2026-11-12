@@ -229,3 +229,75 @@ fn volume_mask_and_excluded_paths_are_applied() {
     assert!(paths.iter().all(|path| path.starts_with(r"D:\FeatherTest")));
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Every id the search for `query` returns, spans expanded.
+fn collect(controller: &SearchController, query: Query) -> Vec<feather_core::EntryRef> {
+    let generation = controller.submit(query, RESULT_CAP, SearchOptions::default());
+    let started = Instant::now();
+    let mut ids = Vec::new();
+    while started.elapsed() < Duration::from_secs(20) {
+        match controller.try_recv() {
+            Ok(SearchEvent::Batch {
+                generation: event_generation,
+                ids: batch,
+            }) if event_generation == generation => ids.extend(batch),
+            Ok(SearchEvent::Span {
+                generation: event_generation,
+                volume,
+                first,
+                count,
+            }) if event_generation == generation => {
+                ids.extend((first..first + count).map(|id| feather_core::EntryRef::new(volume, id)))
+            }
+            Ok(SearchEvent::Done {
+                generation: event_generation,
+                ..
+            }) if event_generation == generation => return ids,
+            Ok(_) => {}
+            Err(_) => std::thread::sleep(Duration::from_millis(2)),
+        }
+    }
+    panic!("search did not finish");
+}
+
+#[test]
+fn date_filters_are_applied_by_the_worker_and_when_narrowing() {
+    use feather_core::date::Clock;
+    const DAY: u64 = 86_400 * 10_000_000;
+
+    // Big enough that the worker splits the volume across threads, small
+    // enough that every match fits under the result cap.
+    let dir = test_dir("dates");
+    generate(&dir, 210_001, r"C:\FeatherTest").expect("generate");
+    let index = open_set(&dir);
+    let controller = SearchController::new(Arc::clone(&index));
+    let volume = &index.volumes()[0];
+    let now = volume.entry(0).mtime;
+    let clock = Clock::fixed(now, 0);
+    let recent =
+        |reference: &feather_core::EntryRef| (now - volume.entry_mtime(reference.id())) / DAY <= 6;
+
+    // A date filter alone must not take the list-everything shortcut.
+    let dated = collect(&controller, Query::parse_at("dm:last7days", &clock));
+    let expected: Vec<_> = volume
+        .iter_ids()
+        .map(|id| feather_core::EntryRef::new(0, id))
+        .filter(recent)
+        .collect();
+    assert!(!dated.is_empty() && dated.len() < volume.iter_ids().len());
+    assert_eq!(dated, expected);
+
+    // Narrowing earlier rows applies the date filter too.
+    let files = collect(&controller, Query::parse_at("file0000", &clock));
+    let previous = feather_app::rows::Rows::from_refs(files.clone());
+    let query = Query::parse_at("file0000 dm:last7days", &clock);
+    assert!(query.narrows(&Query::parse_at("file0000", &clock)));
+    let narrowed =
+        feather_app::search::narrow(&index, &previous, &query, RESULT_CAP).expect("under the cap");
+    let expected: Vec<_> = files.iter().copied().filter(recent).collect();
+    assert!(!expected.is_empty());
+    assert_eq!(narrowed.to_vec(), expected);
+    assert_eq!(collect(&controller, query), expected);
+    drop(controller);
+    let _ = std::fs::remove_dir_all(&dir);
+}
