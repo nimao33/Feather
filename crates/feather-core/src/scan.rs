@@ -1428,7 +1428,10 @@ mod tree_tests {
             .collect();
         // Folders are written with the total of everything below them.
         let parents: Vec<u32> = entries.iter().map(|entry| entry.parent).collect();
-        let flags: Vec<u16> = entries.iter().map(|entry| u16::from(entry.is_dir)).collect();
+        let flags: Vec<u16> = entries
+            .iter()
+            .map(|entry| u16::from(entry.is_dir))
+            .collect();
         let mut totals: Vec<u64> = entries.iter().map(|entry| entry.size).collect();
         let items = crate::totals::fold_folder_totals(&parents, &flags, &mut totals);
         for (row, total) in expected.iter_mut().zip(&totals) {

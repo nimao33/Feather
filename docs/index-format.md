@@ -94,8 +94,10 @@ and folders anywhere below it (not counting itself). The root entry holds the
 totals of the whole index. Both are computed by the writer from the parent
 links, never by reading folders again (`feather_core::totals::
 fold_folder_totals`), so they are as fresh as the index: a rebuild updates
-them. Hard links are counted once per name, as they are listed. The live
-update overlay keeps them right by adding each change to every ancestor.
+them. Hard links are counted once per name, as they are listed. Changes made
+on top of an index (a live update overlay) keep them right by applying the
+same rule to every ancestor of a changed entry: a file adds its bytes and one
+item to each folder above it, a folder adds one item.
 
 Because the total lives in `size`, everything that reads sizes sees it:
 sorting by size orders folders by their totals, and `size:` filters match
@@ -105,7 +107,8 @@ folder sizes.
 
 Indexes written before folder totals have no feature bit and folders of size
 0. They open as before: the app shows no size for their folders, and they
-gain totals on their next rebuild.
+gain totals on their next rebuild. Until then `size:` filters see those
+folders as 0 bytes, as they always did.
 
 ## Validation
 

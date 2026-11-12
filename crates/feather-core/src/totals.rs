@@ -32,9 +32,9 @@ pub fn fold_folder_totals(parent: &[u32], flags: &[u16], size: &mut [u64]) -> Ve
         return items;
     }
     let is_dir = |index: usize| flags[index] & 1 != 0;
-    for index in 0..count {
-        if is_dir(index) {
-            size[index] = 0;
+    for (bytes, &flag) in size[..count].iter_mut().zip(&flags[..count]) {
+        if flag & 1 != 0 {
+            *bytes = 0;
         }
     }
 
