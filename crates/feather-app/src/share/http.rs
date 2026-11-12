@@ -64,6 +64,14 @@ const APP_CSS: &str = include_str!("web/app.css");
 const APP_JS: &str = include_str!("web/app.js");
 const LOGIN_JS: &str = include_str!("web/login.js");
 const ICON_SVG: &str = include_str!("web/icon.svg");
+const RECONNECT_HTML: &str = include_str!("web/reconnect.html");
+const RECONNECT_JS: &str = include_str!("web/reconnect.js");
+const SERVICE_WORKER: &str = include_str!("web/sw.js");
+const MANIFEST: &str = include_str!("web/manifest.webmanifest");
+const ICON_192: &[u8] = include_bytes!("web/icon-192.png");
+const ICON_512: &[u8] = include_bytes!("web/icon-512.png");
+const ICON_MASKABLE: &[u8] = include_bytes!("web/icon-maskable.png");
+const APPLE_TOUCH_ICON: &[u8] = include_bytes!("web/apple-touch-icon.png");
 
 /// A page file. The browser test server can read them from
 /// `FEATHER_WEB_DIR` instead, so changes show without a rebuild.
@@ -87,8 +95,24 @@ Cross-Origin-Opener-Policy: same-origin\r\n\
 Cross-Origin-Resource-Policy: same-origin\r\n\
 Permissions-Policy: camera=(), microphone=(), geolocation=(), interest-cohort=()\r\n\
 Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; \
-img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; \
-base-uri 'none'\r\n\
+img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'; manifest-src 'self'; \
+worker-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'\r\n\
+Server: Feather\r\n";
+
+/// The reconnect page, shown by the installed app when its address stops
+/// answering: it may ask other addresses of this Feather if they answer
+/// (`/api/ping` only), and use the camera to read the QR code in Settings.
+/// It never holds or sends anything from the share.
+const RECONNECT_HEADERS: &str = "Strict-Transport-Security: max-age=31536000\r\n\
+X-Content-Type-Options: nosniff\r\n\
+X-Frame-Options: DENY\r\n\
+Referrer-Policy: no-referrer\r\n\
+Cross-Origin-Opener-Policy: same-origin\r\n\
+Cross-Origin-Resource-Policy: same-origin\r\n\
+Permissions-Policy: camera=(self), microphone=(), geolocation=(), interest-cohort=()\r\n\
+Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; \
+img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' https:; manifest-src 'self'; \
+form-action 'none'; frame-ancestors 'none'; base-uri 'none'\r\n\
 Server: Feather\r\n";
 
 pub fn spawn(shared: Arc<Shared>, listener: TcpListener) -> JoinHandle<()> {
@@ -702,27 +726,58 @@ fn handle(shared: &Shared, conn: &mut Conn, request: &Request, client: IpAddr) -
     };
     let e2e = shared.e2e.is_some();
     match (request.method.as_str(), request.path.as_str()) {
-        ("GET", "/app.css") => static_file(
+        ("GET", "/app.css") => static_bytes(
             conn,
             request,
             "text/css; charset=utf-8",
-            asset("app.css", APP_CSS),
+            asset("app.css", APP_CSS).as_bytes(),
         ),
-        ("GET", "/app.js") => static_file(
+        ("GET", "/app.js") => static_bytes(
             conn,
             request,
             "text/javascript; charset=utf-8",
-            asset("app.js", APP_JS),
+            asset("app.js", APP_JS).as_bytes(),
         ),
-        ("GET", "/login.js") => static_file(
+        ("GET", "/login.js") => static_bytes(
             conn,
             request,
             "text/javascript; charset=utf-8",
-            asset("login.js", LOGIN_JS),
+            asset("login.js", LOGIN_JS).as_bytes(),
         ),
-        ("GET", "/icon.svg" | "/favicon.ico") => {
-            static_file(conn, request, "image/svg+xml", asset("icon.svg", ICON_SVG))
+        ("GET", "/icon.svg" | "/favicon.ico") => static_bytes(
+            conn,
+            request,
+            "image/svg+xml",
+            asset("icon.svg", ICON_SVG).as_bytes(),
+        ),
+        ("GET", "/icon-192.png") => static_bytes(conn, request, "image/png", ICON_192),
+        ("GET", "/icon-512.png") => static_bytes(conn, request, "image/png", ICON_512),
+        ("GET", "/icon-maskable.png") => static_bytes(conn, request, "image/png", ICON_MASKABLE),
+        ("GET", "/apple-touch-icon.png" | "/apple-touch-icon-precomposed.png") => {
+            static_bytes(conn, request, "image/png", APPLE_TOUCH_ICON)
         }
+        ("GET", "/manifest.webmanifest") => static_bytes(
+            conn,
+            request,
+            "application/manifest+json",
+            asset("manifest.webmanifest", MANIFEST).as_bytes(),
+        ),
+        ("GET", "/sw.js") => static_bytes(
+            conn,
+            request,
+            "text/javascript; charset=utf-8",
+            asset("sw.js", SERVICE_WORKER).as_bytes(),
+        ),
+        ("GET", "/reconnect.js") => static_bytes(
+            conn,
+            request,
+            "text/javascript; charset=utf-8",
+            asset("reconnect.js", RECONNECT_JS).as_bytes(),
+        ),
+        ("GET", "/reconnect") => reconnect_page(conn),
+        // Whether this is a Feather that answers, for the installed app
+        // looking for its other addresses. Says nothing else, to anyone.
+        ("GET" | "OPTIONS", "/api/ping") => ping(conn, request),
         ("GET", "/login") => {
             if session.is_some() {
                 redirect(conn, "/", &[])?;
@@ -834,6 +889,16 @@ pub(crate) fn static_file(
     content_type: &str,
     body: &'static str,
 ) -> io::Result<bool> {
+    static_bytes(conn, request, content_type, body.as_bytes())
+}
+
+/// Like `static_file`, for pictures.
+fn static_bytes(
+    conn: &mut Conn,
+    request: &Request,
+    content_type: &str,
+    body: &'static [u8],
+) -> io::Result<bool> {
     static TAGS: OnceLock<std::sync::Mutex<std::collections::HashMap<usize, String>>> =
         OnceLock::new();
     let tags = TAGS.get_or_init(Default::default);
@@ -842,7 +907,7 @@ pub(crate) fn static_file(
         .unwrap()
         .entry(body.as_ptr() as usize)
         .or_insert_with(|| {
-            let digest = ring::digest::digest(&ring::digest::SHA256, body.as_bytes());
+            let digest = ring::digest::digest(&ring::digest::SHA256, body);
             format!("\"{}\"", auth::hex(&digest.as_ref()[..12]))
         })
         .clone();
@@ -855,7 +920,47 @@ pub(crate) fn static_file(
         conn.wire.flush()?;
         return Ok(true);
     }
-    send(conn, 200, content_type, body.as_bytes(), &cache, false)?;
+    send(conn, 200, content_type, body, &cache, false)?;
+    Ok(true)
+}
+
+/// The installed app's page for when its address stops answering.
+fn reconnect_page(conn: &mut Conn) -> io::Result<bool> {
+    let body = asset("reconnect.html", RECONNECT_HTML);
+    let text = format!(
+        "HTTP/1.1 200 OK\r\n{RECONNECT_HEADERS}Content-Type: text/html; charset=utf-8\r\n\
+         Content-Length: {}\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\
+         Keep-Alive: timeout=15\r\n\r\n",
+        body.len()
+    );
+    conn.wire.write_all(text.as_bytes())?;
+    conn.wire.write_all(body.as_bytes())?;
+    conn.wire.flush()?;
+    Ok(true)
+}
+
+/// `{"app":"feather"}` for anyone, from any page, so the installed app can
+/// tell which of the addresses it remembers answer. Private network access
+/// preflights are allowed, since the local address is usually private.
+fn ping(conn: &mut Conn, request: &Request) -> io::Result<bool> {
+    let mut headers = vec![("Access-Control-Allow-Origin", "*".to_string())];
+    if request.method == "OPTIONS" {
+        headers.push(("Access-Control-Allow-Methods", "GET".to_string()));
+        headers.push(("Access-Control-Max-Age", "600".to_string()));
+        if request.header("access-control-request-private-network") == Some("true") {
+            headers.push(("Access-Control-Allow-Private-Network", "true".to_string()));
+        }
+        send(conn, 204, "text/plain", b"", &headers, false)?;
+    } else {
+        send(
+            conn,
+            200,
+            "application/json; charset=utf-8",
+            b"{\"app\":\"feather\"}",
+            &headers,
+            false,
+        )?;
+    }
     Ok(true)
 }
 
@@ -1080,8 +1185,19 @@ fn call(
                     )
                 }
             };
+            // Every web address of this Feather, for the installed app to
+            // try when the one it was opened at stops answering.
+            let addresses: Vec<String> = shared
+                .status
+                .lock()
+                .unwrap()
+                .addresses
+                .iter()
+                .filter(|address| address.starts_with("https://"))
+                .map(|address| quote(address))
+                .collect();
             ok(format!(
-                "{{\"user\":{},\"mode\":\"{}\",\"csrf\":{},\"local\":{},\"roots\":[{}]}}",
+                "{{\"user\":{},\"mode\":\"{}\",\"csrf\":{},\"local\":{},\"addresses\":[{}],\"roots\":[{}]}}",
                 quote(if shared.config.open() {
                     ""
                 } else {
@@ -1090,6 +1206,7 @@ fn call(
                 mode_name(mode),
                 quote(csrf),
                 quote(&local),
+                addresses.join(","),
                 roots.join(",")
             ))
         }

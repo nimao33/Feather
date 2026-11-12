@@ -144,6 +144,8 @@ pub(crate) struct Shared {
     /// Serves plain HTTP instead of HTTPS. Only tests set it, to drive the
     /// page from a browser on 127.0.0.1.
     pub plain: bool,
+    /// The addresses people can open, for the page to remember.
+    pub status: Arc<Mutex<Status>>,
 }
 
 impl Shared {
@@ -257,6 +259,7 @@ impl Sharing {
             handshakes: auth::Handshakes::default(),
             open_csrf: auth::token(24),
             plain: plain_for_tests,
+            status: Arc::clone(&status),
         });
         let mut sharing = Self {
             shared: Arc::clone(&shared),
@@ -762,6 +765,79 @@ mod tests {
             b"",
         );
         assert_eq!((code, body.len()), (304, 0));
+        drop(sharing);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The installed app's files and its ping are there for anyone, and the
+    /// ping says only that this is Feather.
+    #[test]
+    fn the_installed_app_can_find_feather_again() {
+        let (base, shared, state) = sample_share("pwa");
+        let port = free_port();
+        let mut config = Config::from_settings(&Settings::default());
+        config.http = HttpMode::Download;
+        config.access = ShareAccess::Local;
+        config.http_port = port;
+        config.user = "tester".into();
+        config.password_hash = auth::hash_password("abcd").unwrap();
+        config.folders = vec![shared.to_string_lossy().to_string()];
+        let sharing = Sharing::start_in(config, Arc::new(IndexSet::empty()), &state);
+        let tls_config = client(&std::fs::read(state.join("server.cer")).unwrap());
+        let host = format!("Host: localhost:{port}\r\nConnection: close\r\n");
+        let (code, head, body) = https(
+            &tls_config,
+            port,
+            &format!("GET /api/ping HTTP/1.1\r\n{host}Origin: https://other.example\r\n\r\n"),
+            b"",
+        );
+        assert_eq!(code, 200);
+        assert!(head.contains("Access-Control-Allow-Origin: *"));
+        assert!(!head.contains("Set-Cookie"));
+        assert_eq!(body, b"{\"app\":\"feather\"}");
+        let (code, head, _) = https(
+            &tls_config,
+            port,
+            &format!(
+                "OPTIONS /api/ping HTTP/1.1\r\n{host}Origin: https://other.example\r\n\
+                 Access-Control-Request-Method: GET\r\nAccess-Control-Request-Private-Network: true\r\n\r\n"
+            ),
+            b"",
+        );
+        assert_eq!(code, 204);
+        assert!(head.contains("Access-Control-Allow-Private-Network: true"));
+        // Nothing else answers other sites.
+        let (code, head, _) = https(
+            &tls_config,
+            port,
+            &format!("GET /api/info HTTP/1.1\r\n{host}Origin: https://other.example\r\n\r\n"),
+            b"",
+        );
+        assert_eq!(code, 401);
+        assert!(!head.contains("Access-Control-Allow-Origin"));
+        for (path, kind) in [
+            ("/manifest.webmanifest", "application/manifest+json"),
+            ("/sw.js", "text/javascript"),
+            ("/reconnect", "text/html"),
+            ("/reconnect.js", "text/javascript"),
+            ("/icon-192.png", "image/png"),
+            ("/icon-512.png", "image/png"),
+            ("/icon-maskable.png", "image/png"),
+            ("/apple-touch-icon.png", "image/png"),
+        ] {
+            let (code, head, body) = https(
+                &tls_config,
+                port,
+                &format!("GET {path} HTTP/1.1\r\n{host}\r\n"),
+                b"",
+            );
+            assert_eq!(code, 200, "{path}");
+            assert!(
+                head.contains(&format!("Content-Type: {kind}")),
+                "{path}: {head}"
+            );
+            assert!(!body.is_empty(), "{path}");
+        }
         drop(sharing);
         let _ = std::fs::remove_dir_all(&base);
     }

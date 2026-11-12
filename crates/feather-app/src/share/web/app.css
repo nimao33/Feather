@@ -438,3 +438,18 @@ body.viewing { overflow: hidden; }
   .pbtn { width: 40px; height: 40px; }
   .ptime { font-size: 12px; }
 }
+
+/* The installed app's reconnect page */
+.reconnect .card { max-width: 420px; }
+.choices { display: grid; gap: 8px; margin: 0 0 14px; }
+.choices button { height: auto; min-height: 52px; padding: 8px 14px; flex-direction: column; align-items: flex-start; gap: 0; text-align: left; }
+.choices button span { color: var(--text2); font-size: 13px; overflow-wrap: anywhere; }
+.choices button.primary span { color: inherit; opacity: 0.85; }
+.reconnect-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 18px; }
+.reconnect-actions [hidden], .scanner[hidden] { display: none; }
+.scanner { display: grid; gap: 8px; margin: 0 0 18px; }
+.scanner video { width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 12px; background: #000; }
+.manual { display: grid; gap: 6px; }
+.manual label { font-size: 13.5px; color: var(--text2); }
+.manual input { height: 40px; padding: 0 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--ground); }
+.manual button { justify-content: center; }

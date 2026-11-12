@@ -1313,6 +1313,29 @@ function offerLocal() {
   box.hidden = false;
 }
 
+/**
+ * The installed app keeps its page files, and remembers every address of
+ * this Feather, so when this one stops answering (a tunnel's new address,
+ * or leaving the Wi-Fi) its reconnect page can look for the others.
+ */
+function rememberAddresses(info) {
+  const KEY = 'feather-addresses';
+  try {
+    const seen = JSON.parse(localStorage.getItem(KEY) || '[]').filter((item) => item && typeof item.url === 'string');
+    const fresh = [location.origin, info.local, ...(info.addresses || [])]
+      .filter(Boolean)
+      .map((url) => { try { return new URL(url).origin; } catch (_) { return null; } })
+      .filter((url) => url && url !== 'null');
+    const now = Date.now();
+    const merged = [...new Set(fresh)].map((url) => ({ url, seen: now }));
+    for (const item of seen) if (!merged.some((known) => known.url === item.url)) merged.push(item);
+    localStorage.setItem(KEY, JSON.stringify(merged.slice(0, 12)));
+  } catch (_) { /* private mode */ }
+  if ('serviceWorker' in navigator && window.isSecureContext) {
+    navigator.serviceWorker.register('/sw.js').catch(() => { /* e.g. a certificate the browser doesn't trust */ });
+  }
+}
+
 async function start() {
   try {
     state.info = await call('/api/info');
@@ -1320,6 +1343,7 @@ async function start() {
     status(error.message, true);
     return;
   }
+  rememberAddresses(state.info);
   $('user').textContent = state.info.user;
   // Without a password there is nothing to sign out of.
   $('logout').hidden = !state.info.user;
