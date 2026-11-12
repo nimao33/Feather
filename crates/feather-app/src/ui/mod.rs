@@ -14,6 +14,7 @@ mod icons;
 pub(crate) mod indexer;
 mod keyhook;
 mod layout;
+mod live;
 mod memory;
 mod model;
 mod paint;
@@ -233,6 +234,22 @@ pub struct Ui {
     last_build: Option<Instant>,
     build_took: Duration,
     build_started: Instant,
+    /// Follows the change journals of whole NTFS drives.
+    live: Option<live::Live>,
+    /// The places `live` follows; the watcher leaves them alone.
+    live_roots: Vec<String>,
+    /// Live updates could not get admin rights this session.
+    live_off: bool,
+    /// The newest live snapshot, waiting for the running swap to finish.
+    live_pending: Option<Arc<IndexSet>>,
+    /// A live snapshot was taken in while hidden; search it when shown.
+    live_stale: bool,
+    /// The live overlay is large: fold it into a new base when idle.
+    fold_wanted: bool,
+    /// Places to read again as soon as nothing else is being built.
+    pending_rebuild: Vec<String>,
+    /// The places the watcher watches, in its order.
+    watched_roots: Vec<String>,
 }
 
 /// A freshly built index and its first search, waiting to be shown.
@@ -243,6 +260,9 @@ struct Swap {
     /// The selected item's path, to select it again in the new results.
     keep: Option<String>,
     scroll: f64,
+    /// A new library on disk (a build or a fold), as opposed to a live
+    /// snapshot of the one in use.
+    rebuilt: bool,
 }
 
 impl Ui {
@@ -354,6 +374,14 @@ impl Ui {
             last_build: None,
             build_took: Duration::from_secs(3),
             build_started: Instant::now(),
+            live: None,
+            live_roots: Vec::new(),
+            live_off: false,
+            live_pending: None,
+            live_stale: false,
+            fold_wanted: false,
+            pending_rebuild: Vec::new(),
+            watched_roots: Vec::new(),
         };
         ui.refresh_theme(false);
         ui.rebuild_nav();
@@ -720,15 +748,25 @@ impl Ui {
     // ----- Indexing -------------------------------------------------------------
 
     /// Watches the searched places for new, deleted, and renamed items.
+    /// Places followed through their change journal are not watched.
     fn start_watcher(&mut self) {
         self.watcher = None;
+        self.watched_roots.clear();
         if !self.persist || self.settings.index_roots.is_empty() {
             return;
         }
         let Some(library) = &self.library else {
             return;
         };
-        let roots: Vec<PathBuf> = indexer::outermost_roots(&self.settings.index_roots)
+        self.watched_roots = indexer::outermost_roots(&self.settings.index_roots)
+            .into_iter()
+            .filter(|root| !self.live_roots.contains(root))
+            .collect();
+        if self.watched_roots.is_empty() {
+            return;
+        }
+        let roots: Vec<PathBuf> = self
+            .watched_roots
             .iter()
             .map(|root| indexer::root_path(root))
             .collect();
@@ -800,15 +838,164 @@ impl Ui {
             self.seen_changes = count;
             self.changes_since = None;
             // Only the drives and folders that changed are read again.
-            let roots = indexer::outermost_roots(&self.settings.index_roots);
             let changed: Vec<String> = watcher
                 .changes
                 .take_dirty()
                 .into_iter()
-                .filter_map(|index| roots.get(index).cloned())
+                .filter_map(|index| self.watched_roots.get(index).cloned())
                 .collect();
-            self.start_indexing_of(&changed);
+            if !changed.is_empty() {
+                self.start_indexing_of(&changed);
+            }
         }
+    }
+
+    /// At startup: whole NTFS drives whose index recorded a journal
+    /// position catch up from the journal; everything else is read again.
+    fn start_live_or_index(&mut self) {
+        self.restart_live();
+        let roots = indexer::outermost_roots(&self.settings.index_roots);
+        let rest: Vec<String> = roots
+            .iter()
+            .filter(|root| !self.live_roots.contains(root))
+            .cloned()
+            .collect();
+        if rest.len() == roots.len() {
+            self.start_indexing();
+        } else if !rest.is_empty() {
+            self.start_indexing_of(&rest);
+        }
+    }
+
+    /// Follows the change journals of the index in use, for the searched
+    /// places that are whole NTFS drives indexed with a journal position.
+    /// Only with "Live" updates; then restarts the watcher for the rest.
+    fn restart_live(&mut self) {
+        self.live = None;
+        self.live_pending = None;
+        self.live_roots.clear();
+        self.fold_wanted = false;
+        let wanted = self.persist
+            && !self.live_off
+            && self.settings.auto_update == crate::settings::AutoUpdate::Live;
+        if let (true, Some(library)) = (wanted, &self.library) {
+            let mut tracked = Vec::new();
+            for root in indexer::outermost_roots(&self.settings.index_roots) {
+                let path = indexer::root_path(&root).to_string_lossy().to_string();
+                let bytes = path.as_bytes();
+                if bytes.len() != 3 || bytes[1] != b':' {
+                    continue;
+                }
+                let key = feather_core::normalize_path(&path);
+                let found = self
+                    .index
+                    .volumes()
+                    .iter()
+                    .enumerate()
+                    .find(|(_, volume)| feather_core::normalize_path(&volume.prefix) == key);
+                if let Some(cursor) = found.and_then(|(_, volume)| volume.journal()) {
+                    tracked.push(live::Tracked {
+                        volume: found.map(|(index, _)| index).unwrap_or_default(),
+                        root: root.clone(),
+                        drive: path[..2].to_string(),
+                        cursor,
+                    });
+                }
+            }
+            if !tracked.is_empty() {
+                // What the index leaves out, as the build left it out.
+                let mut excluded = self.settings.scan_excluded_paths.clone();
+                if let Some(parent) = library.parent() {
+                    excluded.push(parent.to_string_lossy().to_string());
+                }
+                let rules =
+                    feather_core::live::Rules::new(&self.settings.scan_excluded_names, &excluded);
+                self.live_roots = tracked.iter().map(|tracked| tracked.root.clone()).collect();
+                self.live = Some(live::Live::start(
+                    Arc::clone(&self.index),
+                    tracked,
+                    rules,
+                    self.allow_elevation,
+                ));
+            }
+        }
+        self.start_watcher();
+    }
+
+    /// Takes in what the journals said, shows new snapshots, and starts a
+    /// rebuild or a fold when one is due and nothing else is running.
+    fn poll_live(&mut self) {
+        if let Some(live) = &self.live {
+            let events: Vec<live::LiveEvent> = std::iter::from_fn(|| live.try_event()).collect();
+            for event in events {
+                match event {
+                    live::LiveEvent::Snapshot(set) => self.live_pending = Some(set),
+                    live::LiveEvent::Rebuild(roots) => {
+                        self.live_roots.retain(|root| !roots.contains(root));
+                        self.pending_rebuild.extend(roots);
+                    }
+                    live::LiveEvent::Unavailable(roots) => {
+                        // Declined: watch and rebuild for the rest of the
+                        // session, as without live updates.
+                        self.live_off = true;
+                        self.live_roots.retain(|root| !roots.contains(root));
+                        self.pending_rebuild.extend(roots);
+                        self.start_watcher();
+                    }
+                    live::LiveEvent::Fold => self.fold_wanted = true,
+                }
+            }
+        }
+        if self.swap.is_none() {
+            if let Some(set) = self.live_pending.take() {
+                self.install_snapshot(set);
+            } else if self.live_stale && self.is_shown() {
+                self.live_stale = false;
+                self.install_snapshot(Arc::clone(&self.index));
+            }
+        }
+        if self.indexer.is_some() || self.swap.is_some() {
+            return;
+        }
+        if !self.pending_rebuild.is_empty() {
+            let roots = std::mem::take(&mut self.pending_rebuild);
+            self.start_indexing_of(&roots);
+        } else if self.fold_wanted {
+            self.fold_wanted = false;
+            if let Some(library) = self.library.clone() {
+                let folder = Indexer::fold(&library, Arc::clone(&self.index));
+                self.indexing_root = folder.roots.first().cloned().unwrap_or_default();
+                self.indexer = Some(folder);
+                self.build_started = Instant::now();
+                self.invalidate();
+            }
+        }
+    }
+
+    /// Searches a live snapshot of the index in use and shows it when the
+    /// results are in, like a new build. While the window is hidden it is
+    /// taken in without searching; the search runs when it shows again.
+    fn install_snapshot(&mut self, set: Arc<IndexSet>) {
+        if !self.is_shown() {
+            self.index = set;
+            if let Some(sharing) = &self.sharing {
+                sharing.set_index(Arc::clone(&self.index));
+            }
+            self.live_stale = true;
+            return;
+        }
+        let controller = SearchController::new(Arc::clone(&set));
+        let mut model = UiModel::default();
+        let text = self.search_text();
+        self.submit_to(&controller, &mut model, &text, &set);
+        self.swap = Some(Swap {
+            index: set,
+            controller,
+            model,
+            keep: self.selected.and_then(|row| self.path_of(row)),
+            scroll: self.scroll,
+            rebuilt: false,
+        });
     }
 
     /// Rebuilds the index from `index_roots` on a background thread. The
@@ -907,6 +1094,7 @@ impl Ui {
             model,
             keep: self.selected.and_then(|row| self.path_of(row)),
             scroll: self.scroll,
+            rebuilt: true,
         });
         if failures.is_empty() {
             if self.notice.starts_with("Could not read") {
@@ -1029,9 +1217,16 @@ impl Ui {
         self.tick();
         self.rebuild_nav();
         self.layout();
-        // The old index is closed now; delete its files.
-        if let Some(library) = &self.library {
-            indexer::cleanup(library);
+        if swap.rebuilt {
+            // The old index is closed now; delete its files, unless a
+            // build is writing its own next to them.
+            if let Some(library) = &self.library {
+                if self.indexer.is_none() {
+                    indexer::cleanup(library);
+                }
+            }
+            // Follow the journals on from the new index.
+            self.restart_live();
         }
         self.invalidate();
     }
@@ -1527,6 +1722,7 @@ impl Ui {
                 self.poll_sharing();
                 self.poll_indexer();
                 self.poll_swap();
+                self.poll_live();
                 self.maybe_refresh();
                 let mut changed = false;
                 while let Ok(event) = self.controller.try_recv() {
@@ -3743,9 +3939,9 @@ pub fn run_ui(index: Arc<IndexSet>, library: PathBuf, background: bool) -> i32 {
                 windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(hwnd, WM_RUN_SETUP, 0, 0);
             } else if !ui.settings.index_roots.is_empty() {
                 // Catch up on whatever changed while Feather was closed, and
-                // keep up from now on.
-                ui.start_watcher();
-                ui.start_indexing();
+                // keep up from now on: from the change journal where the
+                // index recorded its place in it, by reading again elsewhere.
+                ui.start_live_or_index();
             }
         }
     }

@@ -263,7 +263,7 @@ impl Rules {
 
     fn skips_path(&self, path: &str) -> bool {
         let path = crate::path::normalize_path(path);
-        self.paths.iter().any(|skip| *skip == path)
+        self.paths.contains(&path)
     }
 }
 

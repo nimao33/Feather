@@ -115,14 +115,19 @@ struct Scan<'a> {
 impl Scan<'_> {
     /// The matches among `ids`, in order, at most `limit` of them; `None`
     /// when the search was cancelled.
-    fn run(&self, ids: std::ops::Range<u32>, limit: usize) -> Option<Vec<EntryRef>> {
+    fn run(&self, ids: impl Iterator<Item = u32>, limit: usize) -> Option<Vec<EntryRef>> {
         let volume = &self.index.volumes()[self.volume_index];
         let query = self.query;
         let mut paths = feather_core::PathCheck::new(query);
         let mut found = Vec::new();
-        for id in ids {
-            if id & CHECK_MASK == 0 && (self.cancelled)() {
+        // Live changes: base entries deleted since are skipped.
+        let changed = volume.has_changes();
+        for (step, id) in ids.enumerate() {
+            if step as u32 & CHECK_MASK == 0 && (self.cancelled)() {
                 return None;
+            }
+            if changed && volume.is_removed(id) {
+                continue;
             }
             let entry = volume.entry_summary(id);
             if (!self.options.show_hidden && entry.flags & 2 != 0)
@@ -220,29 +225,32 @@ impl SearchController {
                         continue;
                     };
                     let needs_path = scoped || excluded;
-                    // Everything on this volume matches: send it as one run.
+                    // Everything on this volume matches: send it as runs,
+                    // one for an unchanged volume. Live changes split it
+                    // around deleted entries and put added ones in place.
                     if !needs_path && show_hidden && show_system && query.matches_everything() {
-                        let ids = volume.iter_ids();
-                        let left = cap.saturating_sub(total as usize);
-                        let count = (ids.len()).min(left) as u32;
                         if !batch.is_empty() {
                             let _ = sender.send(SearchEvent::Batch {
                                 generation: request.generation,
                                 ids: std::mem::take(&mut batch),
                             });
                         }
-                        if count > 0 {
-                            let _ = sender.send(SearchEvent::Span {
-                                generation: request.generation,
-                                volume: volume_index,
-                                first: ids.start,
-                                count,
-                            });
-                        }
-                        total += u64::from(count);
-                        if total as usize >= cap && count as usize != ids.len() {
-                            capped = true;
-                            break 'volumes;
+                        for (first, run) in volume.live_runs() {
+                            let left = cap.saturating_sub(total as usize);
+                            let count = run.min(left as u32);
+                            if count > 0 {
+                                let _ = sender.send(SearchEvent::Span {
+                                    generation: request.generation,
+                                    volume: volume_index,
+                                    first,
+                                    count,
+                                });
+                            }
+                            total += u64::from(count);
+                            if count < run {
+                                capped = true;
+                                break 'volumes;
+                            }
                         }
                         continue;
                     }
@@ -266,7 +274,7 @@ impl SearchController {
                     };
                     // Big volumes are split across cores; each part keeps its
                     // matches in order and the parts are sent in order.
-                    let ids = volume.iter_ids();
+                    let ids = volume.base_ids();
                     let threads = if ids.len() >= PARALLEL_MIN {
                         workers
                     } else {
@@ -305,6 +313,22 @@ impl SearchController {
                     if parts.iter().any(Option::is_none) {
                         aborted = true;
                         break 'volumes;
+                    }
+                    // Entries added since the base was written, merged
+                    // into the base's matches in name order.
+                    let added = volume.overlay_ids();
+                    if !added.is_empty() {
+                        let Some(extra) = scan.run(added.iter().copied(), left) else {
+                            aborted = true;
+                            break 'volumes;
+                        };
+                        if !extra.is_empty() {
+                            let found: Vec<EntryRef> = parts
+                                .iter_mut()
+                                .flat_map(|part| part.take().unwrap_or_default())
+                                .collect();
+                            parts = vec![Some(merge_by_name(volume, found, extra))];
+                        }
                     }
                     for part in parts.iter_mut() {
                         let mut found = part.take().unwrap_or_default();
@@ -391,6 +415,29 @@ impl SearchController {
     }
 }
 
+/// Merges two lists of one volume's entries, each in name order, into one.
+fn merge_by_name(
+    volume: &feather_core::VolumeIndex,
+    left: Vec<EntryRef>,
+    right: Vec<EntryRef>,
+) -> Vec<EntryRef> {
+    let mut merged = Vec::with_capacity(left.len() + right.len());
+    let mut right = right.into_iter().peekable();
+    for entry in left {
+        while let Some(&other) = right.peek() {
+            if volume.compare_names(other.id(), entry.id()).is_lt() {
+                merged.push(other);
+                right.next();
+            } else {
+                break;
+            }
+        }
+        merged.push(entry);
+    }
+    merged.extend(right);
+    merged
+}
+
 /// The rows of `previous` that `query` matches, in the same order, or
 /// `None` when more than `cap` do. Only valid when `query` narrows the query
 /// `previous` came from, with the same options: then nothing outside it can
@@ -415,6 +462,9 @@ pub fn narrow(
         let Some(volume) = volumes.get(reference.volume()) else {
             continue;
         };
+        if volume.is_removed(reference.id()) {
+            continue;
+        }
         let entry = volume.entry_summary(reference.id());
         if !query.matches_name(entry.name_search, entry.size, entry.flags) {
             continue;
