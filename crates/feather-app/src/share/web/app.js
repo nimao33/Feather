@@ -1958,8 +1958,8 @@ async function transfer(items, mode, destination) {
       }
       moved += 1;
     } catch (error) {
+      await refresh();
       status(item.name + ': ' + error.message, true);
-      refresh();
       return false;
     }
   }
@@ -2181,35 +2181,49 @@ async function upload(items) {
   let always = null;
   let sent = 0;
   let skipped = 0;
+  const failed = [];
+  // Names already in this folder, so a taken name is asked about before
+  // its bytes are sent rather than after.
+  const taken = new Map(state.query ? [] : state.entries.map((entry) => [entry.name.toLowerCase(), entry]));
+  const decide = async (item, isDir, index) => {
+    if (always) return always;
+    const answer = await askConflict(item.file.name, isDir, index + 1 < items.length);
+    if (answer.all) always = answer.choice;
+    return answer.choice;
+  };
   for (const [index, item] of items.entries()) {
     const label = items.length > 1 ? (index + 1) + ' of ' + items.length + ': ' : '';
-    status('Uploading ' + label + item.file.name + '…');
     const params = { root, path, name: item.file.name, sub: item.sub || '', conflict: always && always !== 'skip' ? always : 'ask' };
     try {
+      const existing = item.sub ? null : taken.get(item.file.name.toLowerCase());
+      if (existing && params.conflict === 'ask') {
+        params.conflict = await decide(item, existing.dir, index);
+        if (params.conflict === 'skip') { skipped += 1; continue; }
+      }
+      status('Uploading ' + label + item.file.name + '…');
       try {
         await send(item.file, params);
       } catch (error) {
         if (!(error.status === 409 && error.data && error.data.conflict)) throw error;
-        let choice = always;
-        if (!choice) {
-          const answer = await askConflict(item.file.name, error.data.dir, index + 1 < items.length);
-          choice = answer.choice;
-          if (answer.all) always = choice;
-        }
+        const choice = await decide(item, error.data.dir, index);
         if (choice === 'skip') { skipped += 1; continue; }
         params.conflict = choice;
         await send(item.file, params);
       }
       sent += 1;
     } catch (error) {
-      status(item.file.name + ': ' + error.message, true);
-      if (state.root === root && state.path === path) refresh();
-      return;
+      failed.push(item.file.name + ': ' + error.message);
     }
   }
   if (state.root === root && state.path === path && !state.query) await refresh();
   const what = sent === 1 ? 'Uploaded 1 file.' : 'Uploaded ' + sent + ' files.';
-  status(skipped ? what + ' Skipped ' + skipped + '.' : what);
+  const summary = skipped ? what + ' Skipped ' + skipped + '.' : what;
+  if (failed.length) {
+    const more = failed.length > 1 ? ' (and ' + (failed.length - 1) + ' more failed)' : '';
+    status(failed[0] + more + '. ' + summary, true);
+  } else {
+    status(summary);
+  }
 }
 
 /** Files chosen in a picker; a folder picker gives each its folder too. */
@@ -2342,8 +2356,8 @@ async function deleteItems(items) {
       }
       gone += 1;
     } catch (error) {
+      await refresh();
       status(item.name + ': ' + error.message, true);
-      refresh();
       return;
     }
   }

@@ -1,3 +1,9 @@
+/* Anything marked hidden stays hidden, whatever display its class sets
+   (the folder toolbar on search results, Sign out without a password). */
+[hidden] {
+  display: none !important;
+}
+
 :root {
   --ground: #181614;
   --panel: #23201d;

@@ -2394,6 +2394,9 @@ fn receive(
     result
 }
 
+/// The largest refused upload body still read before answering.
+const DRAIN_LIMIT: u64 = 64 * 1024 * 1024;
+
 fn upload_plain(
     shared: &Shared,
     conn: &mut Conn,
@@ -2412,6 +2415,16 @@ fn upload_plain(
     let target = match upload_target(shared, params) {
         Ok(target) => target,
         Err((status, body)) => {
+            // Closing with the body unread makes Windows reset the
+            // connection, and the browser then never sees this answer (a
+            // name already taken showed as "Failed to fetch"). Read and
+            // drop a body of a reasonable size first; the page asks about
+            // taken names before sending, so big ones rarely get here.
+            if request.length <= DRAIN_LIMIT {
+                conn.read_body(request.length, &mut |_| Ok(()))?;
+                json(conn, status, &body)?;
+                return Ok(true);
+            }
             json(conn, status, &body)?;
             return Ok(false);
         }
