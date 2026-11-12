@@ -36,6 +36,18 @@ pub const FOLD_AT: usize = 50_000;
 /// A non-empty overlay older than this is folded too, so the stored
 /// journal position never falls far behind the journal itself.
 pub const FOLD_AFTER: Duration = Duration::from_secs(6 * 60 * 60);
+/// An overlay of at least `FOLD_IDLE_MIN` is folded once the journals have
+/// been quiet for `IDLE`: the drive is idle, so writing a new base costs
+/// nothing noticeable, and the next start has less to catch up on.
+pub const IDLE: Duration = Duration::from_secs(10 * 60);
+pub const FOLD_IDLE_MIN: usize = 5_000;
+
+/// Whether an overlay of `size` (`empty`: nothing visible) is worth
+/// folding, `running` after following started and `quiet` after the last
+/// visible change.
+pub fn fold_due(size: usize, empty: bool, running: Duration, quiet: Duration) -> bool {
+    size >= FOLD_AT || (!empty && running >= FOLD_AFTER) || (size >= FOLD_IDLE_MIN && quiet >= IDLE)
+}
 /// A folder moved in from outside the index is listed from the disk up to
 /// this many items; a bigger one rebuilds the drive instead.
 const WALK_LIMIT: usize = 100_000;
@@ -54,6 +66,9 @@ pub struct Tracked {
     pub drive: String,
     /// Where its index left the journal.
     pub cursor: JournalCursor,
+    /// Changes already followed on this same base (by a follower before a
+    /// restart): reading goes on from their cursor instead of replaying.
+    pub carry: Option<Overlay>,
 }
 
 pub enum LiveEvent {
@@ -183,7 +198,12 @@ struct Follower {
     read: ReadJournal,
     list: ListDir,
     started: Instant,
+    /// When a round last changed something visible.
+    last_change: Instant,
     fold_asked: bool,
+    /// Publish a snapshot after the first round even without news: changes
+    /// carried over are not in the index the UI was given.
+    publish: bool,
 }
 
 impl Follower {
@@ -199,12 +219,21 @@ impl Follower {
             .into_iter()
             .filter(|tracked| tracked.volume < overlays.len())
             .collect();
-        for tracked in &tracked {
-            overlays[tracked.volume] = Some(Overlay::new(
-                &base.volumes()[tracked.volume],
-                tracked.cursor,
-            ));
-        }
+        let publish = tracked.iter().any(|tracked| {
+            tracked
+                .carry
+                .as_ref()
+                .is_some_and(|overlay| !overlay.is_empty())
+        });
+        let tracked: Vec<Tracked> = tracked
+            .into_iter()
+            .map(|mut tracked| {
+                overlays[tracked.volume] = Some(tracked.carry.take().unwrap_or_else(|| {
+                    Overlay::new(&base.volumes()[tracked.volume], tracked.cursor)
+                }));
+                tracked
+            })
+            .collect();
         Self {
             base,
             tracked,
@@ -213,7 +242,9 @@ impl Follower {
             read,
             list,
             started: Instant::now(),
+            last_change: Instant::now(),
             fold_asked: false,
+            publish,
         }
     }
 
@@ -239,7 +270,7 @@ impl Follower {
                 }
             }
         }
-        if changed {
+        if changed || std::mem::take(&mut self.publish) {
             let _ = sender.send(LiveEvent::Snapshot(Arc::new(self.snapshot())));
         }
         if !rebuild.is_empty() {
@@ -248,11 +279,18 @@ impl Follower {
         if !unavailable.is_empty() {
             let _ = sender.send(LiveEvent::Unavailable(unavailable));
         }
-        let large = self.overlays.iter().flatten().any(|overlay| {
-            overlay.size() >= FOLD_AT
-                || (!overlay.is_empty() && self.started.elapsed() >= FOLD_AFTER)
+        if changed {
+            self.last_change = Instant::now();
+        }
+        let due = self.overlays.iter().flatten().any(|overlay| {
+            fold_due(
+                overlay.size(),
+                overlay.is_empty(),
+                self.started.elapsed(),
+                self.last_change.elapsed(),
+            )
         });
-        if large && !self.fold_asked {
+        if due && !self.fold_asked {
             self.fold_asked = true;
             let _ = sender.send(LiveEvent::Fold);
         }
@@ -384,6 +422,7 @@ mod tests {
             root: "C:\\".into(),
             drive: "C:".into(),
             cursor: CURSOR,
+            carry: None,
         }]
     }
 
@@ -586,5 +625,69 @@ mod tests {
         assert!(live.try_event().is_none(), "asked once");
         drop(live);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn changes_already_followed_carry_over_a_restart() {
+        let (dir, set) = library();
+        let volume = &set.volumes()[0];
+        let mut carried = Overlay::new(volume, CURSOR);
+        carried.apply(
+            volume,
+            &[upsert(500, DOCS, "kept.txt", false, true)],
+            &Rules::default(),
+        );
+        let moved_on = JournalCursor {
+            journal_id: 9,
+            next_usn: 777,
+        };
+        carried.set_cursor(moved_on);
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&asked);
+        let read: ReadJournal = Box::new(move |_, cursor| {
+            seen.lock().unwrap().push(cursor.next_usn);
+            Ok(Batch {
+                cursor,
+                changes: Vec::new(),
+                more: false,
+            })
+        });
+        let mut tracked = tracked();
+        tracked[0].carry = Some(carried);
+        let live = Live::with_sources(
+            Arc::clone(&set),
+            tracked,
+            Rules::default(),
+            read,
+            Box::new(|_| Ok(Vec::new())),
+            Duration::from_millis(10),
+        );
+        // Published although the journal was quiet: the index the UI holds
+        // does not have the carried changes.
+        let LiveEvent::Snapshot(snapshot) = next(&live) else {
+            panic!("expected a snapshot");
+        };
+        let kept = snapshot.volumes()[0].lookup_frn(500).expect("carried");
+        assert_eq!(
+            snapshot.volumes()[0].resolve_path(kept).as_deref(),
+            Some(r"C:\docs\kept.txt")
+        );
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(live.try_event().is_none(), "published once");
+        drop(live);
+        // Read on from where the carried changes ended, not the base.
+        assert_eq!(asked.lock().unwrap()[0], 777);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn folding_is_due_when_large_old_or_idle() {
+        let minute = Duration::from_secs(60);
+        assert!(!fold_due(0, true, FOLD_AFTER * 2, IDLE * 2));
+        assert!(!fold_due(10, false, minute, minute));
+        assert!(fold_due(FOLD_AT, false, minute, Duration::ZERO));
+        assert!(fold_due(10, false, FOLD_AFTER, Duration::ZERO));
+        // Idle: only when there is enough to be worth a new base.
+        assert!(!fold_due(FOLD_IDLE_MIN - 1, false, minute, IDLE * 3));
+        assert!(fold_due(FOLD_IDLE_MIN, false, minute, IDLE));
+        assert!(!fold_due(FOLD_IDLE_MIN, false, minute, IDLE - minute));
     }
 }

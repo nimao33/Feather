@@ -497,11 +497,11 @@ impl Overlay {
         let root_frn = base.entry(0).frn;
         let mut report = ApplyReport::default();
         let mut pending: Vec<&EntryState> = Vec::new();
-        let mut prune = false;
+        let mut prune = Prune::Nothing;
         for change in changes {
             match change {
                 Change::Remove(frn) if *frn != root_frn => {
-                    prune |= self.remove(base, *frn, &mut report);
+                    prune = prune.max(self.remove(base, *frn, &mut report));
                 }
                 Change::Upsert(state) if state.frn != root_frn && state.parent_frn != state.frn => {
                     pending.push(state)
@@ -518,7 +518,9 @@ impl Overlay {
                 match self.upsert(base, state, rules, &mut report) {
                     Upsert::Done => {}
                     Upsert::NoParent => waiting.push(state),
-                    Upsert::Excluded => prune |= self.remove(base, state.frn, &mut report),
+                    Upsert::Excluded => {
+                        prune = prune.max(self.remove(base, state.frn, &mut report))
+                    }
                 }
             }
             pending = waiting;
@@ -528,10 +530,10 @@ impl Overlay {
         }
         // Whatever still has no parent left the indexed tree.
         for state in pending {
-            prune |= self.remove(base, state.frn, &mut report);
+            prune = prune.max(self.remove(base, state.frn, &mut report));
         }
-        if prune {
-            self.prune_orphans(base);
+        if prune != Prune::Nothing {
+            self.prune_orphans(base, prune == Prune::Everything);
         }
         if report.changed {
             self.resort();
@@ -585,9 +587,9 @@ impl Overlay {
         }
     }
 
-    /// Removes the live entry with reference `frn`. True when it was a
-    /// folder that may have had contents, which must go too.
-    fn remove(&mut self, base: &Base, frn: u64, report: &mut ApplyReport) -> bool {
+    /// Removes the live entry with reference `frn`, and says what may have
+    /// been orphaned with it: a folder's contents must go too.
+    fn remove(&mut self, base: &Base, frn: u64, report: &mut ApplyReport) -> Prune {
         let found = {
             let view = self.view(base);
             view.lookup_frn(frn).map(|id| {
@@ -601,7 +603,7 @@ impl Overlay {
             })
         };
         let Some((id, parent, is_dir, contribution)) = found else {
-            return false;
+            return Prune::Nothing;
         };
         self.adjust_folders(base, parent, (-contribution.0, -contribution.1));
         self.folder_deltas.remove(&frn);
@@ -613,18 +615,27 @@ impl Overlay {
             self.kill(id);
         }
         if !is_dir {
-            return false;
+            return Prune::Nothing;
         }
         // Its contents may sit in the base (under the same reference, even
         // when the folder itself had moved into the overlay) or be new.
-        let in_base = base
+        // Base entries only ever have base folders as parents, so a folder
+        // the base does not know can only orphan overlay entries, and the
+        // pass over the whole base is skipped.
+        if base
             .lookup_frn(frn)
-            .is_some_and(|base_id| self.base_has_children(base, base_id));
-        in_base
-            || self
-                .added
-                .iter()
-                .any(|added| added.live && added.parent_frn == frn)
+            .is_some_and(|base_id| self.base_has_children(base, base_id))
+        {
+            Prune::Everything
+        } else if self
+            .added
+            .iter()
+            .any(|added| added.live && added.parent_frn == frn)
+        {
+            Prune::Overlay
+        } else {
+            Prune::Nothing
+        }
     }
 
     fn base_has_children(&mut self, base: &Base, id: u32) -> bool {
@@ -766,8 +777,9 @@ impl Overlay {
     }
 
     /// Removes every live entry that no longer reaches the root: the
-    /// contents of deleted folders, which the journal does not list.
-    fn prune_orphans(&mut self, base: &Base) {
+    /// contents of deleted folders, which the journal does not list. Base
+    /// entries are checked only when `with_base`.
+    fn prune_orphans(&mut self, base: &Base, with_base: bool) {
         let root_frn = base.entry(0).frn;
         let mut known: HashMap<u64, bool> = HashMap::new();
         known.insert(root_frn, true);
@@ -798,7 +810,8 @@ impl Overlay {
             answer
         };
         let mut orphans = Vec::new();
-        for id in 1..self.base_count {
+        let base_ids = if with_base { 1..self.base_count } else { 0..0 };
+        for id in base_ids {
             if bit(&self.removed, id) {
                 continue;
             }
@@ -845,6 +858,16 @@ impl Overlay {
                 .then_with(|| a.cmp(&b))
         });
     }
+}
+
+/// What removing an entry may have orphaned, least first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Prune {
+    Nothing,
+    /// Only entries the overlay added.
+    Overlay,
+    /// Base entries too.
+    Everything,
 }
 
 enum Upsert {
@@ -1207,6 +1230,96 @@ mod tests {
     }
 
     #[test]
+    fn deleting_a_new_folder_removes_its_new_contents_only() {
+        let dir = temp_dir("delete-new-folder");
+        let base = volume(&dir);
+        let mut overlay = Overlay::new(&base, CURSOR);
+        // A temp folder tree appears, a base file moves into it, then the
+        // tree is deleted: only what was inside goes.
+        overlay.apply(
+            &base,
+            &[
+                folder(950, DOCS, "tmp", true),
+                folder(951, 950, "inner", true),
+                file(952, 951, "x.tmp", 1),
+                file(CAT, 950, "cat.jpg", 30),
+            ],
+            &rules(),
+        );
+        assert_eq!(with(&base, &overlay).item_count(), base.item_count() + 3);
+        assert_eq!(overlay.folder_delta(DOCS), (31, 4));
+        assert_eq!(overlay.folder_delta(PHOTOS), (-30, -1));
+        overlay.apply(&base, &[Change::Remove(950)], &rules());
+        let live = with(&base, &overlay);
+        for frn in [950, 951, 952, CAT] {
+            assert!(live.lookup_frn(frn).is_none(), "{frn} should be gone");
+        }
+        assert_eq!(live.item_count(), base.item_count() - 1);
+        assert!(
+            live.lookup_frn(DEEP).is_some(),
+            "the rest of the base stays"
+        );
+        assert_eq!(overlay.folder_delta(DOCS), (0, 0));
+        assert_eq!(overlay.folder_delta(ROOT), (-30, -1));
+        // The same folder name can come back as a new folder.
+        overlay.apply(&base, &[folder(960, DOCS, "tmp", true)], &rules());
+        let live = with(&base, &overlay);
+        assert_eq!(
+            live.find_folder("C:\\Feather\\docs\\tmp"),
+            live.lookup_frn(960)
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn overlay_entries_have_details_and_sort_among_the_base() {
+        let dir = temp_dir("details");
+        volume(&dir);
+        let set = IndexSet::open(&dir).expect("set");
+        let mut overlay = Overlay::new(&set.volumes()[0], CURSOR);
+        overlay.apply(
+            &set.volumes()[0],
+            &[Change::Upsert(EntryState {
+                frn: 970,
+                parent_frn: PHOTOS,
+                name: "Dog.PNG".into(),
+                size: Some(1234),
+                mtime: 5555,
+                flags: 2,
+                created: true,
+            })],
+            &rules(),
+        );
+        let live = set.with_overlays(&[Some(Arc::new(overlay))]);
+        let volume = &live.volumes()[0];
+        let id = volume.lookup_frn(970).unwrap();
+        let reference = crate::EntryRef::new(0, id);
+        assert_eq!(reference.id(), id);
+        let entry = live.entry(reference);
+        assert_eq!(
+            (
+                entry.size,
+                entry.mtime,
+                entry.flags,
+                entry.frn,
+                entry.parent_frn
+            ),
+            (1234, 5555, 2, 970, PHOTOS)
+        );
+        assert_eq!(String::from_utf16_lossy(entry.name_display), "Dog.PNG");
+        assert_eq!(entry.name_search, "dog.png");
+        // In name order: after "docs", before "old.log".
+        let names: Vec<&str> = volume
+            .iter_ids()
+            .map(|id| volume.entry(id).name_search)
+            .collect();
+        let at = names.iter().position(|name| *name == "dog.png").unwrap();
+        assert_eq!(names[at - 1], "docs");
+        assert_eq!(names[at + 1], "old.log");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn renaming_a_folder_moves_its_contents_along() {
         let dir = temp_dir("rename-folder");
         let base = volume(&dir);
@@ -1472,6 +1585,11 @@ mod tests {
         assert_eq!(listing(&folded), listing(&live));
         assert_eq!(folded.item_count(), live.item_count());
         assert_eq!(folded.journal().map(|cursor| cursor.next_usn), Some(5000));
+        // A new generation: an overlay of the old base does not carry over
+        // to it, though it does to the same files opened again.
+        assert!(!folded.same_base(&live));
+        assert!(VolumeIndex::open(&dir).expect("again").same_base(&live));
+        assert!(live.same_base(&base));
         // Sorted, so folder lookups by binary search still work.
         let names: Vec<&str> = folded
             .iter_ids()

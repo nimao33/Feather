@@ -522,6 +522,38 @@ impl VolumeIndex {
         &self.base
     }
 
+    /// True when `other` holds the same base generation: the same mapped
+    /// files, or a copy of them carried into a newer library. An overlay
+    /// made for one then fits the other, since its ids depend only on the
+    /// base. Bases written by different reads of a drive differ at least
+    /// in where the change journal stood.
+    pub fn same_base(&self, other: &VolumeIndex) -> bool {
+        if Arc::ptr_eq(&self.base, &other.base) {
+            return true;
+        }
+        let (a, b) = (&self.base.manifest, &other.base.manifest);
+        self.base.journal.is_some()
+            && self.base.journal == other.base.journal
+            && self.base.prefix == other.base.prefix
+            && (
+                a.generation,
+                a.entry_count,
+                a.meta_len,
+                a.search_len,
+                a.display_len,
+                a.frn_len,
+                a.seq,
+            ) == (
+                b.generation,
+                b.entry_count,
+                b.meta_len,
+                b.search_len,
+                b.display_len,
+                b.frn_len,
+                b.seq,
+            )
+    }
+
     pub fn overlay(&self) -> Option<&Arc<Overlay>> {
         self.overlay.as_ref()
     }
@@ -554,13 +586,12 @@ impl VolumeIndex {
         1..self.base.count()
     }
 
-    /// Every live entry but the root: the base in name order, then the
-    /// entries the overlay added, in name order.
+    /// Every live entry but the root, in name order: entries the overlay
+    /// added sit where their names sort among the base's.
     pub fn iter_ids(&self) -> impl Iterator<Item = u32> + '_ {
-        let view = self.view();
-        self.base_ids()
-            .filter(move |&id| view.overlay.is_none() || !view.is_removed(id))
-            .chain(self.overlay_ids().iter().copied())
+        self.live_runs()
+            .into_iter()
+            .flat_map(|(first, count)| first..first + count)
     }
 
     /// The overlay's live entries, sorted by name.

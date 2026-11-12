@@ -853,7 +853,7 @@ impl Ui {
     /// At startup: whole NTFS drives whose index recorded a journal
     /// position catch up from the journal; everything else is read again.
     fn start_live_or_index(&mut self) {
-        self.restart_live();
+        self.restart_live(None);
         let roots = indexer::outermost_roots(&self.settings.index_roots);
         let rest: Vec<String> = roots
             .iter()
@@ -870,7 +870,9 @@ impl Ui {
     /// Follows the change journals of the index in use, for the searched
     /// places that are whole NTFS drives indexed with a journal position.
     /// Only with "Live" updates; then restarts the watcher for the rest.
-    fn restart_live(&mut self) {
+    /// Changes `previous` (the index shown before) already holds for a
+    /// drive whose base is unchanged are kept rather than read again.
+    fn restart_live(&mut self, previous: Option<Arc<IndexSet>>) {
         self.live = None;
         self.live_pending = None;
         self.live_roots.clear();
@@ -893,14 +895,29 @@ impl Ui {
                     .iter()
                     .enumerate()
                     .find(|(_, volume)| feather_core::normalize_path(&volume.prefix) == key);
-                if let Some(cursor) = found.and_then(|(_, volume)| volume.journal()) {
-                    tracked.push(live::Tracked {
-                        volume: found.map(|(index, _)| index).unwrap_or_default(),
-                        root: root.clone(),
-                        drive: path[..2].to_string(),
-                        cursor,
-                    });
-                }
+                let Some((volume_index, volume)) = found else {
+                    continue;
+                };
+                let Some(cursor) = volume.journal() else {
+                    continue;
+                };
+                let carry = previous
+                    .as_ref()
+                    .and_then(|previous| {
+                        previous
+                            .volumes()
+                            .iter()
+                            .find(|old| old.same_base(volume))
+                            .and_then(|old| old.overlay())
+                    })
+                    .map(|overlay| (**overlay).clone());
+                tracked.push(live::Tracked {
+                    volume: volume_index,
+                    root: root.clone(),
+                    drive: path[..2].to_string(),
+                    cursor,
+                    carry,
+                });
             }
             if !tracked.is_empty() {
                 // What the index leaves out, as the build left it out.
@@ -1183,7 +1200,8 @@ impl Ui {
         let Some(swap) = self.swap.take() else {
             return;
         };
-        self.index = swap.index;
+        let previous = std::mem::replace(&mut self.index, swap.index);
+        let previous = swap.rebuilt.then_some(previous);
         if let Some(sharing) = &self.sharing {
             sharing.set_index(Arc::clone(&self.index));
         }
@@ -1217,7 +1235,11 @@ impl Ui {
         self.tick();
         self.rebuild_nav();
         self.layout();
-        if swap.rebuilt {
+        if let Some(previous) = previous {
+            // Follow the journals on from the new index, keeping what was
+            // followed on bases it carried over. This lets go of the old
+            // index, which the follower held too.
+            self.restart_live(Some(previous));
             // The old index is closed now; delete its files, unless a
             // build is writing its own next to them.
             if let Some(library) = &self.library {
@@ -1225,8 +1247,6 @@ impl Ui {
                     indexer::cleanup(library);
                 }
             }
-            // Follow the journals on from the new index.
-            self.restart_live();
         }
         self.invalidate();
     }
@@ -1265,7 +1285,7 @@ impl Ui {
                 self.refresh_theme(true);
                 self.save_settings();
                 if !self.settings.index_roots.is_empty() {
-                    self.start_watcher();
+                    self.restart_live(None);
                     self.start_indexing();
                 }
             }
@@ -2059,6 +2079,11 @@ impl Ui {
         initial.desktop_shortcut = links[1].1;
         let before = self.settings.clone();
         let old_roots = self.settings.index_roots.clone();
+        let old_live = (
+            self.settings.auto_update,
+            self.settings.scan_excluded_names.clone(),
+            self.settings.scan_excluded_paths.clone(),
+        );
         let (sharing_lines, sharing_address) = self.sharing_lines();
         // The shortcut box must be able to receive the current shortcut.
         let had_hotkey = self.hotkey_on;
@@ -2134,8 +2159,16 @@ impl Ui {
                     wallpaper::cleanup(&self.settings.background_image);
                 }
                 self.update_sharing();
+                let new_live = (
+                    self.settings.auto_update,
+                    self.settings.scan_excluded_names.clone(),
+                    self.settings.scan_excluded_paths.clone(),
+                );
+                if self.settings.index_roots != old_roots || new_live != old_live {
+                    // Live updates start or stop with the "Live" setting.
+                    self.restart_live(Some(Arc::clone(&self.index)));
+                }
                 if self.settings.index_roots != old_roots {
-                    self.start_watcher();
                     self.start_indexing();
                 }
             }

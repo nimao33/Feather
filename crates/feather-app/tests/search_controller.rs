@@ -229,3 +229,114 @@ fn volume_mask_and_excluded_paths_are_applied() {
     assert!(paths.iter().all(|path| path.starts_with(r"D:\FeatherTest")));
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Every row a search sends, spans spelled out, once it is done.
+fn collect(controller: &SearchController, generation: u64) -> (Vec<feather_core::EntryRef>, u64) {
+    let started = Instant::now();
+    let mut ids = Vec::new();
+    while started.elapsed() < Duration::from_secs(20) {
+        match controller.try_recv() {
+            Ok(SearchEvent::Batch {
+                generation: event,
+                ids: batch,
+            }) if event == generation => ids.extend(batch),
+            Ok(SearchEvent::Span {
+                generation: event,
+                volume,
+                first,
+                count,
+            }) if event == generation => {
+                ids.extend((first..first + count).map(|id| feather_core::EntryRef::new(volume, id)))
+            }
+            Ok(SearchEvent::Done {
+                generation: event,
+                total,
+                ..
+            }) if event == generation => return (ids, total),
+            Ok(_) => {}
+            Err(_) => std::thread::sleep(Duration::from_millis(2)),
+        }
+    }
+    panic!("search did not finish");
+}
+
+#[test]
+fn live_changes_are_searched_in_name_order() {
+    use feather_core::live::{Change, EntryState, JournalCursor, Overlay, Rules};
+    let dir = test_dir("live");
+    // Big enough to be scanned in parallel parts.
+    generate(&dir, 250_000, r"C:\FeatherTest").expect("generate");
+    let base = open_set(&dir);
+    let volume = &base.volumes()[0];
+    let root_frn = volume.entry(0).frn;
+    let named = |name: &str| {
+        volume
+            .iter_ids()
+            .find(|&id| volume.entry(id).name_search == name)
+            .expect(name)
+    };
+    let gone = named("file0000005.log");
+    let gone_frn = volume.entry(gone).frn;
+    let renamed_frn = volume.entry(named("file0000006.bin")).frn;
+    let file = |frn: u64, name: &str| {
+        Change::Upsert(EntryState {
+            frn,
+            parent_frn: root_frn,
+            name: name.into(),
+            size: Some(1),
+            mtime: 1,
+            flags: 0,
+            created: true,
+        })
+    };
+    let mut overlay = Overlay::new(volume, JournalCursor::default());
+    let report = overlay.apply(
+        volume,
+        &[
+            Change::Remove(gone_frn),
+            file(u64::MAX - 1, "file0000005 copy.txt"),
+            file(renamed_frn, "file0000005b.txt"),
+            file(u64::MAX - 2, "aaa-first.txt"),
+        ],
+        &Rules::default(),
+    );
+    assert!(report.changed);
+    let live = Arc::new(base.with_overlays(&[Some(Arc::new(overlay))]));
+    let controller = SearchController::new(Arc::clone(&live));
+    let name_of = |reference: feather_core::EntryRef| live.entry(reference).name_search.to_string();
+
+    let generation = controller.submit(
+        Query::parse("file0000005"),
+        RESULT_CAP,
+        SearchOptions::default(),
+    );
+    let (ids, total) = collect(&controller, generation);
+    let names: Vec<String> = ids.iter().map(|&id| name_of(id)).collect();
+    assert_eq!(total, names.len() as u64);
+    assert!(!names.contains(&"file0000005.log".to_string()));
+    let at = |name: &str| names.iter().position(|found| found == name).expect(name);
+    assert!(at("file0000005 copy.txt") < at("file0000005b.txt"));
+    let mut sorted = names.clone();
+    sorted.sort();
+    assert_eq!(names, sorted, "overlay matches sit in name order");
+    let path = live
+        .resolve_path(ids[at("file0000005b.txt")])
+        .expect("path");
+    assert!(
+        path.starts_with("C:") && path.ends_with("file0000005b.txt"),
+        "{path}"
+    );
+
+    // Matching everything: runs around the deleted entry, new ones in place.
+    let generation = controller.submit(Query::parse(""), RESULT_CAP * 10, SearchOptions::default());
+    let (ids, total) = collect(&controller, generation);
+    assert_eq!(total, live.item_count());
+    assert_eq!(ids.len() as u64, live.item_count());
+    assert_eq!(name_of(ids[0]), "aaa-first.txt");
+    assert!(ids.iter().all(|&id| !live.volumes()[0].is_removed(id.id())));
+    assert!(ids.windows(2).all(|pair| live.volumes()[0]
+        .compare_names(pair[0].id(), pair[1].id())
+        .is_lt()));
+    drop(controller);
+    let _ = std::fs::remove_dir_all(&dir);
+}

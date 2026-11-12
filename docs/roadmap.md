@@ -48,10 +48,11 @@ This repository follows `../build-plan-feather.md`.
 
 - Fast indexing reads `$MFT` and needs admin rights: one UAC prompt per
   session starts the admin helper. A SYSTEM service would remove the prompt.
-- Updates are whole rebuilds triggered by a folder watcher (about 3 seconds
-  for a 2.5-million-file drive), not USN-journal deltas, so a new file shows
-  up within about a minute rather than instantly, and size or date changes
-  alone do not trigger an update.
+- Whole NTFS drives follow the USN journal in Live mode (changes show within
+  about a second, see `docs/index-format.md`). Folders, shares, and the timed
+  modes still use whole rebuilds triggered by the folder watcher, so there a
+  new file shows up within about a minute and size or date changes alone do
+  not trigger an update.
 - Settings do not include start at login or an index-location picker yet.
 - The screenshot harness shows a visible window. On a locked or session-0
   desktop it will produce a blank or fail; it is a developer/desktop tool.
