@@ -429,22 +429,54 @@ pub fn recycle(path: &Path) -> Result<(), String> {
 
 /// Moves a file or folder to the desktop's trash (the freedesktop.org
 /// trash in `~/.local/share/Trash`), so a visitor's delete can be undone.
-/// Something on another drive can't be moved there; the page then asks
-/// whether to delete it for good.
+/// Something on another drive goes to that drive's own trash; when
+/// neither can take it, the page asks whether to delete it for good.
 #[cfg(not(windows))]
 pub fn recycle(path: &Path) -> Result<(), String> {
+    // The home trash, then the drive's own `.Trash-<uid>` for something on
+    // another drive, which can't be moved home.
+    let mut trashes: Vec<PathBuf> = trash_folder().into_iter().collect();
+    trashes.extend(drive_trash(path));
+    for trash in trashes {
+        if into_trash(&trash, path) {
+            return Ok(());
+        }
+    }
+    Err("It can't be moved to the trash on the computer running Feather.".into())
+}
+
+/// The trash at the top of the drive holding `path` (freedesktop.org's
+/// `$topdir/.Trash-$uid`).
+#[cfg(not(windows))]
+fn drive_trash(path: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt as _;
+    let device = std::fs::symlink_metadata(path).ok()?.dev();
+    let uid = std::fs::metadata("/proc/self").ok()?.uid();
+    let mut top = path.parent()?;
+    while let Some(parent) = top.parent() {
+        match std::fs::metadata(parent) {
+            Ok(metadata) if metadata.dev() == device => top = parent,
+            _ => break,
+        }
+    }
+    Some(top.join(format!(".Trash-{uid}")))
+}
+
+/// Moves `path` into `trash` with its note; false when it can't go there.
+#[cfg(not(windows))]
+fn into_trash(trash: &Path, path: &Path) -> bool {
     use std::io::Write as _;
     use std::os::unix::fs::DirBuilderExt as _;
-    const NO_TRASH: &str = "It can't be moved to the trash on the computer running Feather.";
-    let trash = trash_folder().ok_or(NO_TRASH)?;
     let (files, info) = (trash.join("files"), trash.join("info"));
-    for folder in [&trash, &files, &info] {
+    for folder in [trash, files.as_path(), info.as_path()] {
         let _ = std::fs::DirBuilder::new().mode(0o700).create(folder);
     }
     let name = path
         .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .ok_or(NO_TRASH)?;
+        .map(|name| name.to_string_lossy().into_owned());
+    let Some(name) = name else {
+        return false;
+    };
     let (stem, extension) = match name.rfind('.') {
         Some(dot) if dot > 0 => (&name[..dot], &name[dot..]),
         _ => (name.as_str(), ""),
@@ -479,12 +511,12 @@ DeletionDate={}
         );
         drop(file);
         if written.is_ok() && std::fs::rename(path, files.join(&candidate)).is_ok() {
-            return Ok(());
+            return true;
         }
         let _ = std::fs::remove_file(&note);
-        return Err(NO_TRASH.into());
+        return false;
     }
-    Err(NO_TRASH.into())
+    false
 }
 
 /// The user's trash folder.

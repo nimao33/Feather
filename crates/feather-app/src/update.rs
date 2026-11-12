@@ -223,7 +223,9 @@ mod tests {
     fn github_names_the_newest_release() {
         let release = latest().unwrap();
         assert!(!release.version.is_empty());
-        assert!(release.download.starts_with("https://github.com/nimao33/Feather/"));
+        assert!(release
+            .download
+            .starts_with("https://github.com/nimao33/Feather/"));
         println!("{release:?}");
     }
 

@@ -1170,7 +1170,9 @@ pub fn fold(volume: &VolumeIndex, out: &Path) -> io::Result<u32> {
     Ok(written)
 }
 
-#[cfg(test)]
+// Live updates follow the NTFS change journal, so only Windows runs them,
+// and the paths here are Windows paths.
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
     use crate::scan::{write_tree, Entries, ScanReport, Tree};
