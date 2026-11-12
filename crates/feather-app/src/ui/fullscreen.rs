@@ -11,7 +11,8 @@ use windows_sys::Win32::UI::Shell::{
     QUNS_RUNNING_D3D_FULL_SCREEN,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetClassNameW, GetForegroundWindow, GetWindowRect, IsWindowVisible,
+    GetClassNameW, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, IsWindowVisible,
+    IsZoomed, GWL_STYLE, WS_CAPTION, WS_THICKFRAME,
 };
 
 /// True when the window in front fills its whole monitor (a game, a video
@@ -36,6 +37,13 @@ pub fn app_in_front(own: HWND) -> bool {
         return false;
     }
     if is_shell(front) {
+        return false;
+    }
+    // A maximized window overhangs its monitor by its border, so with the
+    // taskbar hidden or on another monitor it would look full screen. Real
+    // full-screen apps are neither maximized nor framed with a title bar.
+    let style = unsafe { GetWindowLongPtrW(front, GWL_STYLE) } as u32;
+    if unsafe { IsZoomed(front) } != 0 || !looks_borderless(style) {
         return false;
     }
     let mut window = RECT {
@@ -70,6 +78,12 @@ fn is_shell(hwnd: HWND) -> bool {
     )
 }
 
+/// True for a window style without a title bar or sizing border, as games
+/// and full-screen players use.
+fn looks_borderless(style: u32) -> bool {
+    style & WS_CAPTION != WS_CAPTION && style & WS_THICKFRAME == 0
+}
+
 /// True when `window` covers all of `monitor`.
 fn covers(window: &RECT, monitor: &RECT) -> bool {
     window.left <= monitor.left
@@ -89,6 +103,19 @@ mod tests {
             right,
             bottom,
         }
+    }
+
+    #[test]
+    fn framed_windows_are_not_full_screen_apps() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
+        };
+        // A browser or editor: title bar and sizing border.
+        assert!(!looks_borderless(WS_OVERLAPPEDWINDOW | WS_VISIBLE));
+        // A borderless full-screen game.
+        assert!(looks_borderless(WS_POPUP | WS_VISIBLE));
+        // A fixed-size window with a title bar.
+        assert!(!looks_borderless(WS_CAPTION | WS_VISIBLE));
     }
 
     #[test]

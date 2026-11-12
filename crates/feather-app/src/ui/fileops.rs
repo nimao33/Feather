@@ -26,8 +26,8 @@ use windows::Win32::UI::Shell::{
     DragQueryFileW, FileOperation, IFileOperation, IFileOperationProgressSink, IShellItem,
     IShellItemArray, SHCreateItemFromParsingName, SHCreateShellItemArrayFromIDLists,
     SHGetSetSettings, SHParseDisplayName, FILEOPERATION_FLAGS, FOFX_RECYCLEONDELETE, FOF_ALLOWUNDO,
-    FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_RENAMEONCOLLISION, FOF_SILENT, HDROP, SHELLSTATEA,
-    SSF_NOCONFIRMRECYCLE,
+    FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_RENAMEONCOLLISION, FOF_SILENT, FOF_WANTNUKEWARNING,
+    HDROP, SHELLSTATEA, SSF_NOCONFIRMRECYCLE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     MessageBoxW, IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_YESNO,
@@ -360,8 +360,11 @@ impl Shell {
 
     /// Moves items to the Recycle Bin. Asks first only when the person
     /// kept Explorer's "Display delete confirmation dialog" setting on.
+    /// Where there is no Recycle Bin (network shares, many USB drives) or an
+    /// item is too big for it, Windows warns that it will be deleted for
+    /// good, even with confirmations off, as Explorer does.
     pub fn recycle(&self, paths: &[String]) -> Result<Outcome, String> {
-        let mut flags = FOF_ALLOWUNDO.0 | FOFX_RECYCLEONDELETE.0;
+        let mut flags = FOF_ALLOWUNDO.0 | FOFX_RECYCLEONDELETE.0 | FOF_WANTNUKEWARNING.0;
         if !confirms_recycling() {
             flags |= FOF_NOCONFIRMATION.0;
         }
