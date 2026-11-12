@@ -651,6 +651,7 @@ fn search(app: &App, params: &Params) -> String {
             if (!settings.show_hidden && entry.flags & 2 != 0)
                 || (!settings.show_system && entry.flags & 4 != 0)
                 || !query.matches_name(entry.name_search, entry.size, entry.flags)
+                || !query.matches_date_of(volume, id)
                 || !query.matches_folder_parts(&filter, entry.parent_frn, entry.name_search)
             {
                 continue;

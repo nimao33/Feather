@@ -96,7 +96,7 @@ error and the caller rebuilds.
   them after the name sort; they are stable within one index generation but are
   not the NTFS file IDs that the MFT reader will produce.
 - Search supports literal terms, quoted phrases, `!` negation, `*`/`?`
-  wildcards, `ext:`, `type:`, `size:`, and `in:`/`path:`/`folder:` scopes. Date
-  filters are parsed but currently produce a warning.
+  wildcards, `ext:`, `type:`, `size:`, `dm:`/`date:` (modification date, read
+  from the mtime only when a query has one), and `in:`/`path:`/`folder:` scopes.
 - The UI caps loaded rows at 50,000. Empty-query listing is therefore the first
   50,000 rows, not every entry.

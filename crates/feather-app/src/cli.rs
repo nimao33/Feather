@@ -1007,6 +1007,7 @@ fn scan_count(set: &IndexSet, query: &Query, limit: usize) -> (u64, bool) {
         for id in volume.iter_ids() {
             let entry = volume.entry_summary(id);
             if !query.matches_name(entry.name_search, entry.size, entry.flags)
+                || !query.matches_date_of(volume, id)
                 || !query.matches_folder_parts(&filter, entry.parent_frn, entry.name_search)
             {
                 continue;

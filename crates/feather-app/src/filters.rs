@@ -181,6 +181,122 @@ impl Category {
     }
 }
 
+/// When items were last modified, as chosen in the Filters window. It is
+/// written into the query as a `dm:` token, so the parser stays the single
+/// place dates are understood.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum Modified {
+    #[default]
+    Any,
+    Today,
+    ThisWeek,
+    ThisMonth,
+    ThisYear,
+    /// Custom bounds, each a date like `2026-11-11`, `2026-11`, or `2026`
+    /// (or a word like `lastweek`); blank leaves that side open. `to`
+    /// includes its whole period: `2026-03` runs to the end of March.
+    Range {
+        from: String,
+        to: String,
+    },
+}
+
+impl Modified {
+    /// The choices in the Filters window, in order; `Range` comes last.
+    pub const PRESETS: [Modified; 5] = [
+        Modified::Any,
+        Modified::Today,
+        Modified::ThisWeek,
+        Modified::ThisMonth,
+        Modified::ThisYear,
+    ];
+
+    /// The value after `dm:`, also written to settings; `None` for any time.
+    pub fn token(&self) -> Option<String> {
+        Some(match self {
+            Self::Any => return None,
+            Self::Today => "today".into(),
+            Self::ThisWeek => "thisweek".into(),
+            Self::ThisMonth => "thismonth".into(),
+            Self::ThisYear => "thisyear".into(),
+            Self::Range { from, to } => match (from.trim(), to.trim()) {
+                ("", "") => return None,
+                (from, to) if from == to => from.to_string(),
+                (from, to) => format!("{from}..{to}"),
+            },
+        })
+    }
+
+    /// Reads a [`Modified::token`] back, as stored in settings. Blank or
+    /// `any` is any time.
+    pub fn parse(value: &str) -> Option<Self> {
+        let value = value.trim().to_ascii_lowercase();
+        match value.as_str() {
+            "" | "any" => return Some(Self::Any),
+            "today" => return Some(Self::Today),
+            "thisweek" => return Some(Self::ThisWeek),
+            "thismonth" => return Some(Self::ThisMonth),
+            "thisyear" => return Some(Self::ThisYear),
+            _ => {}
+        }
+        let (from, to) = value
+            .split_once("..")
+            .unwrap_or((value.as_str(), value.as_str()));
+        let from = parse_date_input(from).ok()?.unwrap_or_default();
+        let to = parse_date_input(to).ok()?.unwrap_or_default();
+        if from.is_empty() && to.is_empty() {
+            return None;
+        }
+        Some(Self::Range { from, to })
+    }
+
+    /// The position of this choice in the Filters window's segments.
+    pub fn index(&self) -> usize {
+        Self::PRESETS
+            .iter()
+            .position(|preset| preset == self)
+            .unwrap_or(Self::PRESETS.len())
+    }
+
+    /// How the filter summary describes it; empty for any time.
+    pub fn label(&self) -> String {
+        match self {
+            Self::Any => String::new(),
+            Self::Today => "Modified today".into(),
+            Self::ThisWeek => "Modified this week".into(),
+            Self::ThisMonth => "Modified this month".into(),
+            Self::ThisYear => "Modified this year".into(),
+            Self::Range { from, to } => match (from.trim(), to.trim()) {
+                ("", "") => String::new(),
+                (from, "") => format!("Modified since {from}"),
+                ("", to) => format!("Modified until {to}"),
+                (from, to) if from == to => format!("Modified {from}"),
+                (from, to) => format!("Modified {from} to {to}"),
+            },
+        }
+    }
+}
+
+/// Checks one custom date bound from the Filters window: a single date or
+/// date word, not a range or comparison. Blank is no limit.
+pub fn parse_date_input(input: &str) -> Result<Option<String>, String> {
+    let value = input.trim().to_ascii_lowercase();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let clock = feather_core::date::Clock::system();
+    if value.contains("..")
+        || value.starts_with(['<', '>', '='])
+        || feather_core::date::parse_date_filter(&value, &clock).is_none()
+    {
+        return Err(format!(
+            "invalid date: {} (use a date like 2026-11-11, 2026-11, or 2026)",
+            input.trim()
+        ));
+    }
+    Ok(Some(value))
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct FilterSet {
     pub kind: KindFilter,
@@ -188,6 +304,7 @@ pub struct FilterSet {
     pub min_size: Option<u64>,
     pub max_size: Option<u64>,
     pub match_mode: MatchMode,
+    pub modified: Modified,
 }
 
 impl FilterSet {
@@ -196,6 +313,7 @@ impl FilterSet {
             && self.extensions.is_empty()
             && self.min_size.is_none()
             && self.max_size.is_none()
+            && self.modified.token().is_none()
     }
 
     pub fn category(&self) -> Category {
@@ -214,6 +332,7 @@ impl FilterSet {
         kind_and_extensions
             + usize::from(self.min_size.is_some() || self.max_size.is_some())
             + usize::from(self.match_mode != MatchMode::Anywhere)
+            + usize::from(self.modified.token().is_some())
     }
 
     /// Combines the user's search text with the structured filters. The
@@ -240,6 +359,9 @@ impl FilterSet {
         }
         if self.match_mode != MatchMode::Anywhere {
             parts.push(format!("match:{}", self.match_mode.as_str()));
+        }
+        if let Some(token) = self.modified.token() {
+            parts.push(format!("dm:{token}"));
         }
         parts.join(" ")
     }
@@ -269,6 +391,10 @@ impl FilterSet {
         }
         if self.match_mode != MatchMode::Anywhere {
             parts.push(self.match_mode.label().to_string());
+        }
+        let modified = self.modified.label();
+        if !modified.is_empty() {
+            parts.push(modified);
         }
         parts.join(" | ")
     }
@@ -334,6 +460,11 @@ mod dialog {
     const MIN_SIZE: Id = "min_size";
     const MAX_SIZE: Id = "max_size";
     const MATCH: Id = "match";
+    const MODIFIED: Id = "modified";
+    const MODIFIED_FROM: Id = "modified_from";
+    const MODIFIED_TO: Id = "modified_to";
+    /// The segment for custom dates, after the presets.
+    const CUSTOM_DATES: usize = Modified::PRESETS.len();
     const APPLY: Id = "apply";
     const RESET: Id = "reset";
     const CANCEL: Id = "cancel";
@@ -379,6 +510,35 @@ mod dialog {
                     );
                 }
             }
+            let modified = match Modified::PRESETS.get(form.selected(MODIFIED)) {
+                Some(preset) => preset.clone(),
+                None => {
+                    let from = match parse_date_input(&form.text(MODIFIED_FROM)) {
+                        Ok(from) => from.unwrap_or_default(),
+                        Err(error) => return fail(form, MODIFIED_FROM, error),
+                    };
+                    let to = match parse_date_input(&form.text(MODIFIED_TO)) {
+                        Ok(to) => to.unwrap_or_default(),
+                        Err(error) => return fail(form, MODIFIED_TO, error),
+                    };
+                    let range = Modified::Range { from, to };
+                    // A range that ends before it starts would hide
+                    // everything without saying why.
+                    let empty = range.token().is_some_and(|token| {
+                        let clock = feather_core::date::Clock::system();
+                        feather_core::date::parse_date_filter(&token, &clock)
+                            .is_none_or(|range| range.start >= range.end)
+                    });
+                    if empty {
+                        return fail(
+                            form,
+                            MODIFIED_FROM,
+                            "The start date is after the end date.".into(),
+                        );
+                    }
+                    range
+                }
+            };
             form.set_error(None);
             self.result = Some(FilterSet {
                 kind,
@@ -386,6 +546,7 @@ mod dialog {
                 min_size,
                 max_size,
                 match_mode,
+                modified,
             });
             Action::Accept
         }
@@ -401,6 +562,9 @@ mod dialog {
                     form.set_text(EXTENSIONS, "");
                     form.set_text(MIN_SIZE, "");
                     form.set_text(MAX_SIZE, "");
+                    form.set_selected(MODIFIED, 0);
+                    form.set_text(MODIFIED_FROM, "");
+                    form.set_text(MODIFIED_TO, "");
                     form.set_error(None);
                     Action::Stay
                 }
@@ -470,6 +634,43 @@ mod dialog {
             "No maximum",
             false,
         );
+        form.heading("Date modified");
+        form.segments(
+            MODIFIED,
+            "Modified",
+            Some("Folders count by their own date."),
+            vec![
+                option("Any"),
+                option("Today"),
+                option("This week"),
+                option("This month"),
+                option("This year"),
+                option("Custom"),
+            ],
+            initial.modified.index(),
+        );
+        let (from, to) = match &initial.modified {
+            Modified::Range { from, to } => (from.as_str(), to.as_str()),
+            _ => ("", ""),
+        };
+        form.field(
+            MODIFIED_FROM,
+            "From",
+            Some("Like 2026-11-11, 2026-11, or 2026. Blank means no limit."),
+            from,
+            "No start",
+            false,
+        );
+        form.only_when(MODIFIED_FROM, MODIFIED, CUSTOM_DATES);
+        form.field(
+            MODIFIED_TO,
+            "To",
+            Some("Includes the whole day, month, or year."),
+            to,
+            "No end",
+            false,
+        );
+        form.only_when(MODIFIED_TO, MODIFIED, CUSTOM_DATES);
         form.button(RESET, "Reset", ButtonStyle::Quiet);
         form.button(CANCEL, "Cancel", ButtonStyle::Secondary);
         form.button(APPLY, "Apply", ButtonStyle::Primary);
@@ -502,10 +703,21 @@ mod dialog {
     ) -> Result<(), String> {
         open(parent, &initial, look)?.capture(path)
     }
+
+    /// Captures the window scrolled down by `scroll` pixels.
+    pub fn capture_at(
+        parent: HWND,
+        initial: FilterSet,
+        look: Look,
+        path: &Path,
+        scroll: f32,
+    ) -> Result<(), String> {
+        open(parent, &initial, look)?.capture_at(path, scroll)
+    }
 }
 
 #[cfg(windows)]
-pub use dialog::{capture, show};
+pub use dialog::{capture, capture_at, show};
 
 #[cfg(test)]
 mod tests {
@@ -539,6 +751,7 @@ mod tests {
             min_size: Some(1024),
             max_size: Some(2048),
             match_mode: MatchMode::Anywhere,
+            modified: Modified::Any,
         };
         assert_eq!(
             filters.compose("report"),
@@ -563,6 +776,147 @@ mod tests {
         let query = feather_core::Query::parse(&starting.compose("report"));
         assert_eq!(query.match_mode(), MatchMode::StartsWith);
         assert!(query.warnings().is_empty(), "{:?}", query.warnings());
+    }
+
+    #[test]
+    fn modified_dates_compose_into_a_dm_token() {
+        let cases = [
+            (Modified::Today, "dm:today", "Modified today"),
+            (Modified::ThisWeek, "dm:thisweek", "Modified this week"),
+            (Modified::ThisMonth, "dm:thismonth", "Modified this month"),
+            (Modified::ThisYear, "dm:thisyear", "Modified this year"),
+            (
+                Modified::Range {
+                    from: "2026-01-01".into(),
+                    to: "2026-03-31".into(),
+                },
+                "dm:2026-01-01..2026-03-31",
+                "Modified 2026-01-01 to 2026-03-31",
+            ),
+            (
+                Modified::Range {
+                    from: "2026-01".into(),
+                    to: String::new(),
+                },
+                "dm:2026-01..",
+                "Modified since 2026-01",
+            ),
+            (
+                Modified::Range {
+                    from: String::new(),
+                    to: "2025".into(),
+                },
+                "dm:..2025",
+                "Modified until 2025",
+            ),
+            (
+                Modified::Range {
+                    from: "2026-11".into(),
+                    to: "2026-11".into(),
+                },
+                "dm:2026-11",
+                "Modified 2026-11",
+            ),
+        ];
+        for (modified, token, label) in cases {
+            let filters = FilterSet {
+                modified: modified.clone(),
+                ..FilterSet::default()
+            };
+            assert!(!filters.is_empty(), "{modified:?}");
+            assert_eq!(filters.compose("report"), format!("report {token}"));
+            assert_eq!(filters.compose(""), token);
+            assert_eq!(filters.summary(), label);
+            assert_eq!(filters.active_categories(), 1);
+            // The query parser accepts every composed token...
+            let query = feather_core::Query::parse(&filters.compose("report"));
+            assert!(query.warnings().is_empty(), "{:?}", query.warnings());
+            assert!(query.has_dates());
+            // ...and the settings value reads back to the same choice.
+            let stored = modified.token().unwrap();
+            let back = Modified::parse(&stored).unwrap();
+            assert_eq!(back.token().as_deref(), Some(stored.as_str()));
+        }
+
+        let any = FilterSet::default();
+        assert_eq!(any.modified.token(), None);
+        assert!(!any.compose("").contains("dm:"));
+        let blank = Modified::Range {
+            from: " ".into(),
+            to: String::new(),
+        };
+        assert_eq!(blank.token(), None);
+        assert_eq!(blank.label(), "");
+
+        // All filters together.
+        let all = FilterSet {
+            kind: KindFilter::Files,
+            extensions: vec!["pdf".into()],
+            min_size: Some(1024),
+            max_size: None,
+            match_mode: MatchMode::StartsWith,
+            modified: Modified::ThisMonth,
+        };
+        assert_eq!(
+            all.compose("report"),
+            "report type:file ext:pdf size:>=1024 match:starts dm:thismonth"
+        );
+        assert_eq!(all.active_categories(), 5);
+        assert_eq!(
+            all.summary(),
+            "Files | pdf | >= 1.0 KB | Starts with | Modified this month"
+        );
+    }
+
+    #[test]
+    fn modified_settings_values_parse() {
+        for preset in Modified::PRESETS {
+            let stored = preset.token().unwrap_or_default();
+            assert_eq!(Modified::parse(&stored), Some(preset.clone()));
+        }
+        assert_eq!(Modified::parse("any"), Some(Modified::Any));
+        assert_eq!(Modified::parse(" Today "), Some(Modified::Today));
+        assert_eq!(
+            Modified::parse("lastweek"),
+            Some(Modified::Range {
+                from: "lastweek".into(),
+                to: "lastweek".into()
+            })
+        );
+        assert_eq!(
+            Modified::parse("..2026-06"),
+            Some(Modified::Range {
+                from: String::new(),
+                to: "2026-06".into()
+            })
+        );
+        for bad in ["soon", "2026-13", "..", "2026..later", ">2026"] {
+            assert_eq!(Modified::parse(bad), None, "{bad}");
+        }
+        assert_eq!(Modified::Today.index(), 1);
+        assert_eq!(Modified::Any.index(), 0);
+        assert_eq!(
+            Modified::Range {
+                from: "2026".into(),
+                to: String::new()
+            }
+            .index(),
+            Modified::PRESETS.len()
+        );
+    }
+
+    #[test]
+    fn date_input_accepts_single_dates_only() {
+        assert_eq!(parse_date_input(""), Ok(None));
+        assert_eq!(
+            parse_date_input(" 2026-11-11 "),
+            Ok(Some("2026-11-11".into()))
+        );
+        assert_eq!(parse_date_input("2026"), Ok(Some("2026".into())));
+        assert_eq!(parse_date_input("Yesterday"), Ok(Some("yesterday".into())));
+        for bad in ["2026-02-30", "soon", "2025..2026", ">2026", "=2026"] {
+            assert!(parse_date_input(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

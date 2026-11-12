@@ -57,8 +57,7 @@ This repository follows `../build-plan-feather.md`.
   desktop it will produce a blank or fail; it is a developer/desktop tool.
 - The empty-query list is capped at the configured result limit (50,000 by
   default) instead of mapping all entries virtually.
-- Date filters are parsed but not applied. The Filters window has no date
-  pickers.
+- Date filters (`dm:`) cover the modification date only; no calendar picker.
 - No icons yet; the columns are text only.
 - The UI opens at 1,100x700 by default and restores a saved placement when
   Remember window is enabled. There is no DPI scaling yet.

@@ -31,6 +31,26 @@ const SYNTAX: &[(&str, &str)] = &[
         "match:starts report",
         "Words must start or end the name: match:starts, match:ends",
     ),
+    (
+        "dm:today",
+        "Modified today; also yesterday, thisweek, lastweek, thismonth, lastmonth, thisyear, lastyear",
+    ),
+    (
+        "dm:last7days",
+        "Modified in the last 7 days, today included; also 24hours, 30min, 2weeks",
+    ),
+    (
+        "dm:2026-11",
+        "Modified in that year, month, or day: 2026, 2026-11, 2026-11-11",
+    ),
+    (
+        "dm:2026-01..2026-03",
+        "A range, both ends included; leave a side open: dm:2026-06.., dm:..2025",
+    ),
+    (
+        "dm:>=2026-06",
+        "From June on; > is after it, < before it, <= up to its end. date: works too",
+    ),
 ];
 
 const KEYS: &[(&str, &str)] = &[
@@ -50,9 +70,16 @@ const BLOCKS: &[Block] = &[
     Block::Rows(KEYS),
     Block::Heading("Filters"),
     Block::Text(
-        "Filters narrows results by kind, extension, size, and where typed words must \
-         appear on top of what you type. The categories in the sidebar are quick presets \
-         for the same filters. Use Reset in the Filters window to clear them.",
+        "Filters narrows results by kind, extension, size, date modified, and where typed \
+         words must appear on top of what you type. The categories in the sidebar are quick \
+         presets for the same filters. Use Reset in the Filters window to clear them.",
+    ),
+    Block::Heading("Dates"),
+    Block::Text(
+        "Dates are read in this computer's time zone, and weeks start on the first day of \
+         the week set in Windows. Folders are matched by their own date modified, which \
+         changes when items are added to or removed from them. Items whose date is unknown \
+         never match a date filter. Several dm: filters must all match.",
     ),
     Block::Heading("Settings"),
     Block::Text(
@@ -62,8 +89,8 @@ const BLOCKS: &[Block] = &[
     ),
     Block::Heading("Not supported yet"),
     Block::Text(
-        "Searching inside files and regular expressions are not available. Date filters \
-         (dm: and date:) show a warning and are ignored.",
+        "Searching inside files and regular expressions are not available. Dates created \
+         and accessed are not indexed, and !dm: is not supported.",
     ),
 ];
 

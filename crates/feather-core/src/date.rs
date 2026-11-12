@@ -59,7 +59,7 @@ impl Clock {
     }
 
     /// Local wall-clock seconds (as if local time were UTC) for a UTC time.
-    fn to_local(&self, utc: i64) -> i64 {
+    fn local_of(&self, utc: i64) -> i64 {
         match self.zone {
             Zone::Fixed(minutes) => utc + i64::from(minutes) * 60,
             Zone::Local => local::to_local(utc),
@@ -67,7 +67,7 @@ impl Clock {
     }
 
     /// The UTC time of a local wall-clock time.
-    fn to_utc(&self, local: i64) -> i64 {
+    fn utc_of(&self, local: i64) -> i64 {
         match self.zone {
             Zone::Fixed(minutes) => local - i64::from(minutes) * 60,
             Zone::Local => local::to_utc(local),
@@ -76,12 +76,12 @@ impl Clock {
 
     /// Today as days since 1970-01-01, in local time.
     fn today(&self) -> i64 {
-        self.to_local(self.now_unix()).div_euclid(DAY)
+        self.local_of(self.now_unix()).div_euclid(DAY)
     }
 
     /// Local midnight starting `day` (days since 1970-01-01), in UTC.
     fn midnight(&self, day: i64) -> i64 {
-        self.to_utc(day * DAY)
+        self.utc_of(day * DAY)
     }
 }
 
@@ -415,12 +415,13 @@ mod local {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 mod local {
     use super::{civil_from_days, DAY};
-    use std::os::raw::{c_char, c_int, c_long};
+    use std::os::raw::{c_char, c_int};
 
-    /// `struct tm` as glibc and musl lay it out.
+    /// `struct tm` as glibc and musl lay it out on 64-bit targets, where
+    /// `long` and `time_t` are 64 bits.
     #[repr(C)]
     struct Tm {
         tm_sec: c_int,
@@ -432,13 +433,13 @@ mod local {
         tm_wday: c_int,
         tm_yday: c_int,
         tm_isdst: c_int,
-        tm_gmtoff: c_long,
+        tm_gmtoff: i64,
         tm_zone: *const c_char,
     }
 
     extern "C" {
-        fn localtime_r(time: *const c_long, out: *mut Tm) -> *mut Tm;
-        fn mktime(tm: *mut Tm) -> c_long;
+        fn localtime_r(time: *const i64, out: *mut Tm) -> *mut Tm;
+        fn mktime(tm: *mut Tm) -> i64;
     }
 
     fn empty() -> Tm {
@@ -458,12 +459,12 @@ mod local {
     }
 
     pub fn to_local(utc: i64) -> i64 {
-        let time = utc as c_long;
+        let time = utc;
         let mut tm = empty();
         if unsafe { localtime_r(&time, &mut tm) }.is_null() {
             return utc;
         }
-        utc + tm.tm_gmtoff as i64
+        utc + tm.tm_gmtoff
     }
 
     pub fn to_utc(local: i64) -> i64 {
@@ -483,12 +484,12 @@ mod local {
         if utc == -1 {
             local
         } else {
-            utc as i64
+            utc
         }
     }
 }
 
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(not(any(windows, all(target_os = "linux", target_pointer_width = "64"))))]
 mod local {
     pub fn to_local(utc: i64) -> i64 {
         utc
@@ -754,6 +755,6 @@ mod tests {
         // Converting there and back lands where it started, away from
         // daylight-saving changes.
         let noon = days_from_civil(2026, 6, 15) * DAY + 12 * 3600;
-        assert_eq!(clock.to_local(clock.to_utc(noon)), noon);
+        assert_eq!(clock.local_of(clock.utc_of(noon)), noon);
     }
 }
