@@ -422,6 +422,19 @@ impl Shell {
 }
 
 /// Asks before deleting for good. True to go ahead.
+/// Asks before opening many results at once.
+pub fn confirm_open_many(owner: windows_sys::Win32::Foundation::HWND, count: usize) -> bool {
+    let answer = unsafe {
+        MessageBoxW(
+            Some(HWND(owner)),
+            &HSTRING::from(format!("Open all {count} selected items?")),
+            windows::core::w!("Feather"),
+            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+        )
+    };
+    answer == IDYES
+}
+
 pub fn confirm_permanent_delete(
     owner: windows_sys::Win32::Foundation::HWND,
     paths: &[String],

@@ -43,6 +43,7 @@ fn scenarios_write_screenshots() {
         "10-quick-filter.png",
         "11-scope.png",
         "38-folder-sizes.png",
+        "39-multi-select.png",
     ] {
         let path = screenshots.join(name);
         let metadata = std::fs::metadata(&path).expect("screenshot missing");

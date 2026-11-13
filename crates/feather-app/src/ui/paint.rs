@@ -38,6 +38,7 @@ pub struct RowView {
     pub selected: bool,
 }
 
+#[derive(Clone)]
 pub struct DetailsView {
     pub name: String,
     pub kind: String,
@@ -104,6 +105,9 @@ pub struct Frame<'a> {
     pub hovers: Vec<(Hit, f32)>,
     /// Screen top of the sliding selection highlight in the result list.
     pub row_pill: Option<f32>,
+    /// Several results are selected: each is filled, and the sliding
+    /// highlight only rings the focused one.
+    pub multi: bool,
     /// Sliding highlights behind the selected sidebar entries.
     pub nav_pills: Vec<Rect>,
     /// Fades the details pane in after the selection changes.
@@ -630,9 +634,17 @@ fn paint_list(p: &Painter, icons: &mut IconCache, frame: &Frame) {
             p.fill_round(rect, 10.0, pal.hover.fade(level));
         }
     }
+    if frame.multi {
+        for row in frame.rows.iter().filter(|row| row.selected) {
+            let rect = Rect::new(list.l, row.top, row_right, row.top + ROW_H);
+            p.fill_round(rect, 10.0, pal.row_selected());
+        }
+    }
     if let Some(top) = frame.row_pill {
         let pill = Rect::new(list.l, top, row_right, top + ROW_H);
-        p.fill_round(pill, 10.0, pal.row_selected());
+        if !frame.multi {
+            p.fill_round(pill, 10.0, pal.row_selected());
+        }
         p.stroke_round(pill, 10.0, pal.accent.fade(0.35), 1.0);
     }
     for row in &frame.rows {
@@ -822,7 +834,15 @@ fn paint_details(p: &Painter, icons: &mut IconCache, frame: &Frame) {
     for (button, label, primary) in [
         (Button::Open, "Open", true),
         (Button::Reveal, "Show in folder", false),
-        (Button::CopyPath, "Copy path", false),
+        (
+            Button::CopyPath,
+            if frame.multi {
+                "Copy paths"
+            } else {
+                "Copy path"
+            },
+            false,
+        ),
     ] {
         let Some(rect) = frame.layout.button(button) else {
             continue;

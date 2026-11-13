@@ -45,20 +45,23 @@ impl Drop for MenuGuard {
     }
 }
 
-/// Shows the full shell menu at the current cursor position. When the shell
-/// path cannot be used, a small native menu with the essential actions is
-/// shown instead.
+/// Shows the full shell menu for `paths` (one item or many, from any
+/// folders) at the current cursor position. When the shell path cannot be
+/// used, a small native menu with the essential actions is shown instead.
 pub fn show(
     parent: windows_sys::Win32::Foundation::HWND,
-    path: &str,
+    paths: &[String],
     use_shell: bool,
 ) -> Result<(), String> {
+    if paths.is_empty() {
+        return Ok(());
+    }
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
     }
     let owner = HWND(parent);
     if use_shell {
-        match unsafe { show_shell(owner, path) } {
+        match unsafe { show_shell(owner, paths) } {
             Ok(()) => return Ok(()),
             // The menu was shown and a command was chosen: its failure is
             // reported, never followed by a second menu.
@@ -66,7 +69,68 @@ pub fn show(
             Err(Failure::Menu(error)) => eprintln!("shell context menu: {error}"),
         }
     }
-    unsafe { show_fallback(owner, path) }
+    unsafe { show_fallback(owner, paths) }
+}
+
+/// Absolute item lists for `paths`, freed when dropped.
+struct Pidls(Vec<*mut ITEMIDLIST>);
+
+impl Pidls {
+    unsafe fn parse(paths: &[String]) -> Result<Pidls, String> {
+        let mut pidls = Pidls(Vec::with_capacity(paths.len()));
+        for path in paths {
+            let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
+            SHParseDisplayName(&HSTRING::from(path.as_str()), None, &mut pidl, 0, None)
+                .map_err(|error| format!("{path}: {error}"))?;
+            pidls.0.push(pidl);
+        }
+        Ok(pidls)
+    }
+
+    fn as_const(&self) -> Vec<*const ITEMIDLIST> {
+        self.0
+            .iter()
+            .map(|&pidl| pidl as *const ITEMIDLIST)
+            .collect()
+    }
+}
+
+impl Drop for Pidls {
+    fn drop(&mut self) {
+        for &pidl in &self.0 {
+            unsafe { CoTaskMemFree(Some(pidl as *const c_void)) };
+        }
+    }
+}
+
+/// Drags `paths` out of Feather, into Explorer, a chat or a mail, with the
+/// shell's own drag image and copy/move/link choice.
+pub fn drag_out(
+    parent: windows_sys::Win32::Foundation::HWND,
+    paths: &[String],
+) -> Result<(), String> {
+    use windows::Win32::System::Com::IDataObject;
+    use windows::Win32::System::Ole::{DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE};
+    use windows::Win32::UI::Shell::{SHCreateDataObject, SHDoDragDrop};
+    if paths.is_empty() {
+        return Ok(());
+    }
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let pidls = Pidls::parse(paths)?;
+        // Absolute item lists under the desktop: items from different
+        // folders travel together, like Explorer's search results.
+        let data: IDataObject = SHCreateDataObject(None, Some(&pidls.as_const()), None)
+            .map_err(|error| format!("Couldn't start dragging: {error}"))?;
+        SHDoDragDrop(
+            Some(HWND(parent)),
+            &data,
+            None,
+            DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK,
+        )
+        .map(|_| ())
+        .map_err(|error| format!("Dragging failed: {error}"))
+    }
 }
 
 /// Called from the main window procedure while a shell menu is open. Returns
@@ -107,23 +171,46 @@ enum Failure {
 /// from it when invoked.
 const FIRST_COMMAND: u32 = 1;
 
-unsafe fn show_shell(owner: HWND, path: &str) -> Result<(), Failure> {
-    let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
-    SHParseDisplayName(&HSTRING::from(path), None, &mut pidl, 0, None)
-        .map_err(|error| Failure::Menu(format!("SHParseDisplayName failed: {error}")))?;
-    let result = show_shell_pidl(owner, pidl);
-    CoTaskMemFree(Some(pidl as *const c_void));
-    result
+unsafe fn show_shell(owner: HWND, paths: &[String]) -> Result<(), Failure> {
+    let pidls = Pidls::parse(paths).map_err(Failure::Menu)?;
+    let context = menu_for(owner, &pidls, paths)
+        .map_err(|error| Failure::Menu(format!("GetUIObjectOf(IContextMenu) failed: {error}")))?;
+    show_shell_menu(owner, context)
 }
 
-unsafe fn show_shell_pidl(owner: HWND, pidl: *mut ITEMIDLIST) -> Result<(), Failure> {
-    let mut child: *mut ITEMIDLIST = std::ptr::null_mut();
-    let parent: IShellFolder = SHBindToParent(pidl, Some(&mut child))
-        .map_err(|error| Failure::Menu(format!("SHBindToParent failed: {error}")))?;
-    let context: IContextMenu = parent
-        .GetUIObjectOf(owner, &[child as *const ITEMIDLIST], None)
-        .map_err(|error| Failure::Menu(format!("GetUIObjectOf(IContextMenu) failed: {error}")))?;
+/// The shell's menu object for the items: from their folder when they
+/// share one (the same menu Explorer shows there), else from the desktop
+/// with absolute item lists, which mixes folders like search results.
+unsafe fn menu_for(
+    owner: HWND,
+    pidls: &Pidls,
+    paths: &[String],
+) -> windows::core::Result<IContextMenu> {
+    let parent_of = |path: &str| {
+        std::path::Path::new(path)
+            .parent()
+            .map(|parent| parent.to_string_lossy().to_lowercase())
+    };
+    let first = parent_of(&paths[0]);
+    let shared = first.is_some() && paths.iter().all(|path| parent_of(path) == first);
+    if shared {
+        let mut children = Vec::with_capacity(pidls.0.len());
+        let mut folder: Option<IShellFolder> = None;
+        for &pidl in &pidls.0 {
+            let mut child: *mut ITEMIDLIST = std::ptr::null_mut();
+            let parent: IShellFolder = SHBindToParent(pidl, Some(&mut child))?;
+            folder.get_or_insert(parent);
+            children.push(child as *const ITEMIDLIST);
+        }
+        if let Some(folder) = folder {
+            return folder.GetUIObjectOf(owner, &children, None);
+        }
+    }
+    let desktop = windows::Win32::UI::Shell::SHGetDesktopFolder()?;
+    desktop.GetUIObjectOf(owner, &pidls.as_const(), None)
+}
 
+unsafe fn show_shell_menu(owner: HWND, context: IContextMenu) -> Result<(), Failure> {
     let menu = CreatePopupMenu()
         .map_err(|error| Failure::Menu(format!("CreatePopupMenu failed: {error}")))?;
     context
@@ -179,7 +266,7 @@ unsafe fn show_shell_pidl(owner: HWND, pidl: *mut ITEMIDLIST) -> Result<(), Fail
     Ok(())
 }
 
-unsafe fn show_fallback(owner: HWND, path: &str) -> Result<(), String> {
+unsafe fn show_fallback(owner: HWND, paths: &[String]) -> Result<(), String> {
     let menu = CreatePopupMenu().map_err(|error| format!("CreatePopupMenu failed: {error}"))?;
     let _ = AppendMenuW(menu, MF_STRING, ID_OPEN, windows::core::w!("Open"));
     let _ = AppendMenuW(
@@ -192,7 +279,11 @@ unsafe fn show_fallback(owner: HWND, path: &str) -> Result<(), String> {
         menu,
         MF_STRING,
         ID_COPY_PATH,
-        windows::core::w!("Copy full path"),
+        if paths.len() > 1 {
+            windows::core::w!("Copy full paths")
+        } else {
+            windows::core::w!("Copy full path")
+        },
     );
 
     let mut point = POINT::default();
@@ -209,12 +300,22 @@ unsafe fn show_fallback(owner: HWND, path: &str) -> Result<(), String> {
     let _ = PostMessageW(Some(owner), WM_NULL, WPARAM(0), LPARAM(0));
     let _ = DestroyMenu(menu);
 
+    let mut result = Ok(());
     match command.0 as usize {
-        ID_OPEN => open_path(owner, path),
-        ID_OPEN_FOLDER => open_containing_folder(owner, path),
-        ID_COPY_PATH => copy_path(owner, path),
-        _ => Ok(()),
+        ID_OPEN => {
+            for path in paths {
+                result = result.and(open_path(owner, path));
+            }
+        }
+        ID_OPEN_FOLDER => {
+            for path in paths {
+                result = result.and(open_containing_folder(owner, path));
+            }
+        }
+        ID_COPY_PATH => result = copy_path(owner, &paths.join("\r\n")),
+        _ => {}
     }
+    result
 }
 
 unsafe fn open_path(owner: HWND, path: &str) -> Result<(), String> {

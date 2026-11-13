@@ -22,6 +22,7 @@ mod model;
 mod paint;
 pub(crate) mod picker;
 mod screenshot;
+mod selection;
 mod setup;
 mod shortcuts;
 mod sort;
@@ -140,6 +141,15 @@ enum Drag {
     Text,
     /// Moving the scrollbar thumb from a starting pointer y and scroll offset.
     Thumb { start_y: f32, start_scroll: f64 },
+    /// Pressed on a result: past a few pixels the selection is dragged out
+    /// of Feather. `collapse` picks just this row on release, for a plain
+    /// click inside a selection of several (kept while dragging them).
+    Row {
+        row: usize,
+        x: f32,
+        y: f32,
+        collapse: bool,
+    },
     /// Holding a sidebar tab; past a few pixels it lifts and reorders.
     Nav {
         index: usize,
@@ -182,6 +192,14 @@ pub struct Ui {
     nav_rects: Vec<Rect>,
     scroll: f64,
     selected: Option<usize>,
+    /// The results picked with Ctrl, Shift and Ctrl+A. With none, the
+    /// focused row (`selected`) alone is the selection.
+    marks: selection::Selection,
+    /// What `marks` covers in the current results, worked out again when
+    /// either changes (`marks_key`).
+    marks_count: usize,
+    marks_summary: Option<paint::DetailsView>,
+    marks_key: Option<(u64, u64, usize, u64)>,
     hover: Hit,
     pressed: Hit,
     drag: Drag,
@@ -371,6 +389,10 @@ impl Ui {
             nav_rects: Vec::new(),
             scroll: 0.0,
             selected: None,
+            marks: selection::Selection::default(),
+            marks_count: 0,
+            marks_summary: None,
+            marks_key: None,
             hover: Hit::None,
             pressed: Hit::None,
             drag: Drag::None,
@@ -1308,6 +1330,8 @@ impl Ui {
         self.model = model;
         if !quiet {
             self.epoch += 1;
+            // A rebuilt index numbers its entries anew.
+            self.marks.clear();
         }
         self.rename = None;
         if self.sort_column != sort::COLUMN_NAME || !self.sort_ascending {
@@ -1636,6 +1660,11 @@ impl Ui {
         self.search_key = self.search_key();
         self.set_scroll(0.0, false);
         self.set_selected(None);
+        // Picked items stay picked while they're found again; "all" means
+        // the items it covered.
+        self.marks
+            .pin_all(self.model.result_count(), self.model.ids.iter());
+        self.marks.anchor = None;
         let mut model = std::mem::take(&mut self.model);
         self.query = self.submit_to(&self.controller, &mut model, text, &self.index);
         self.model = model;
@@ -1986,6 +2015,289 @@ impl Ui {
         self.index.resolve_path(entry_ref)
     }
 
+    // ----- Selecting several ---------------------------------------------------
+
+    /// Whether the picked results are the selection (rather than just the
+    /// focused row).
+    fn multi(&self) -> bool {
+        self.marks.is_marked() && self.marks_count > 0
+    }
+
+    fn row_marked(&self, row: usize) -> bool {
+        if self.multi() {
+            self.model
+                .ids
+                .get(row)
+                .is_some_and(|entry| self.marks.contains(entry))
+        } else {
+            self.selected == Some(row)
+        }
+    }
+
+    /// How many results are selected.
+    fn selection_count(&self) -> usize {
+        if self.multi() {
+            self.marks_count
+        } else {
+            usize::from(self.selected.is_some())
+        }
+    }
+
+    /// The selected results' paths, in list order.
+    fn selected_paths(&self) -> Vec<String> {
+        if !self.multi() {
+            return self
+                .selected
+                .and_then(|row| self.path_of(row))
+                .into_iter()
+                .collect();
+        }
+        self.model
+            .ids
+            .iter()
+            .filter(|&entry| self.marks.contains(entry))
+            .filter_map(|entry| self.index.resolve_path(entry))
+            .collect()
+    }
+
+    /// Counts what the picked results cover and sums them up for the
+    /// details pane, when the picks or the results changed.
+    fn refresh_marks(&mut self) {
+        let key = (
+            self.marks.version,
+            self.epoch,
+            self.model.result_count(),
+            self.model.current_generation,
+        );
+        if self.marks_key == Some(key) {
+            return;
+        }
+        self.marks_key = Some(key);
+        self.marks_summary = None;
+        self.marks_count = 0;
+        if !self.marks.is_marked() {
+            return;
+        }
+        // Types and folders for up to this many; past it, counts and size.
+        const DETAILED: usize = 50_000;
+        let mut count = 0usize;
+        let (mut files, mut folders, mut bytes) = (0u64, 0u64, 0u64);
+        let mut kinds: Vec<(String, usize)> = Vec::new();
+        let mut folder: Option<Option<String>> = None;
+        for (row, entry_ref) in self.model.ids.iter().enumerate() {
+            if !self.marks.contains(entry_ref) {
+                continue;
+            }
+            count += 1;
+            let entry = self.index.entry(entry_ref);
+            if entry.is_dir() {
+                folders += 1;
+            } else {
+                files += 1;
+            }
+            bytes = bytes.saturating_add(entry.size);
+            if count <= DETAILED {
+                let kind = self.cell_text(row, 4).unwrap_or_default();
+                match kinds.iter_mut().find(|(name, _)| *name == kind) {
+                    Some((_, seen)) => *seen += 1,
+                    None => kinds.push((kind, 1)),
+                }
+                let here = self.cell_text(row, 1).unwrap_or_default();
+                folder = match folder {
+                    None => Some(Some(here)),
+                    Some(Some(same)) if same.eq_ignore_ascii_case(&here) => Some(Some(same)),
+                    _ => Some(None),
+                };
+            }
+        }
+        self.marks_count = count;
+        if count < 2 {
+            return;
+        }
+        kinds.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let mut kind = kinds
+            .iter()
+            .take(3)
+            .map(|(name, seen)| {
+                if kinds.len() == 1 {
+                    name.clone()
+                } else {
+                    format!("{name} ({})", group_digits(*seen as u64))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        if kinds.len() > 3 {
+            kind.push_str(&format!(", {} more types", kinds.len() - 3));
+        }
+        if count > DETAILED {
+            kind.clear();
+        }
+        let plural = |n: u64, one: &str, many: &str| {
+            format!("{} {}", group_digits(n), if n == 1 { one } else { many })
+        };
+        let items = match (folders, files) {
+            (0, files) => plural(files, "file", "files"),
+            (folders, 0) => plural(folders, "folder", "folders"),
+            (folders, files) => format!(
+                "{}, {}",
+                plural(folders, "folder", "folders"),
+                plural(files, "file", "files")
+            ),
+        };
+        let icon = self
+            .selected
+            .and_then(|row| self.model.ids.get(row))
+            .map(|entry_ref| {
+                let entry = self.index.entry(entry_ref);
+                let name = String::from_utf16_lossy(entry.name_display);
+                self.icons.index_for(&name, entry.is_dir())
+            })
+            .unwrap_or(-1);
+        self.marks_summary = Some(paint::DetailsView {
+            name: format!("{} items selected", group_digits(count as u64)),
+            kind,
+            size: size_details(bytes, self.settings.size_format),
+            items,
+            modified: String::new(),
+            folder: match folder {
+                Some(Some(folder)) => folder,
+                _ if count > DETAILED => String::new(),
+                _ => "Various folders".into(),
+            },
+            icon,
+        });
+    }
+
+    /// A plain click or arrow key: just this row.
+    fn select_single(&mut self, row: usize) {
+        self.marks.clear();
+        self.select_row(row);
+        self.marks.anchor = self.selected;
+    }
+
+    /// Shift+click or Shift+arrows: from the anchor to `row`, after what
+    /// was selected when `add` (Ctrl held too).
+    fn extend_to(&mut self, row: usize, add: bool) {
+        let count = self.model.result_count();
+        if count == 0 {
+            return;
+        }
+        let row = row.min(count - 1);
+        let anchor = self
+            .marks
+            .anchor
+            .or(self.selected)
+            .unwrap_or(row)
+            .min(count - 1);
+        if add && !self.marks.is_marked() {
+            if let Some(entry) = self.selected.and_then(|focus| self.model.ids.get(focus)) {
+                self.marks.only(entry);
+            }
+        }
+        let (from, to) = (anchor.min(row), anchor.max(row));
+        let entries: Vec<_> = (from..=to)
+            .filter_map(|at| self.model.ids.get(at))
+            .collect();
+        self.marks.range(entries.into_iter(), add);
+        self.marks.anchor = Some(anchor);
+        self.select_row(row);
+    }
+
+    /// Ctrl+click: this row in or out, the rest kept.
+    fn toggle_row(&mut self, row: usize) {
+        let Some(entry) = self.model.ids.get(row) else {
+            return;
+        };
+        if !self.marks.is_marked() {
+            if let Some(focus) = self.selected.and_then(|focus| self.model.ids.get(focus)) {
+                self.marks.only(focus);
+                if focus == entry {
+                    // The only selected item clicked: it stays the focus.
+                    self.marks.toggle(entry);
+                    self.marks.toggle(entry);
+                }
+            }
+        }
+        self.marks.toggle(entry);
+        self.select_row(row);
+        self.marks.anchor = Some(row);
+    }
+
+    /// The arrow keys and friends: move, or with Shift, grow the range.
+    fn go_to_row(&mut self, row: usize) {
+        if key_down(VK_SHIFT) {
+            self.extend_to(row, false);
+        } else {
+            self.select_single(row);
+        }
+    }
+
+    fn select_all_results(&mut self) {
+        if self.model.result_count() > 0 {
+            self.marks.select_all();
+            self.marks.anchor = Some(0);
+            if self.selected.is_none() {
+                self.set_selected(Some(0));
+            }
+        }
+    }
+
+    /// Opens every selected result, asking first when there are many.
+    fn open_selected(&mut self, reveal: bool) {
+        if !self.multi() {
+            if let Some(row) = self.selected {
+                if reveal {
+                    self.open_row(row, true);
+                } else {
+                    self.activate_row(row);
+                }
+            }
+            return;
+        }
+        let paths = self.selected_paths();
+        if paths.len() > 15 && !fileops::confirm_open_many(self.hwnd, paths.len()) {
+            return;
+        }
+        for path in &paths {
+            let result = if reveal {
+                context_menu::reveal_item(self.hwnd, path)
+            } else {
+                context_menu::open_item(self.hwnd, path)
+            };
+            if let Err(error) = result {
+                self.set_notice(format!("Could not open {path}: {error}"));
+                break;
+            }
+        }
+    }
+
+    /// Ctrl+Shift+C and the details pane's Copy path: every selected path,
+    /// one per line.
+    fn copy_selected_paths(&mut self) {
+        let paths = self.selected_paths();
+        if paths.is_empty() {
+            return;
+        }
+        match context_menu::copy_text(self.hwnd, &paths.join("\r\n")) {
+            Ok(()) if paths.len() == 1 => self.set_notice("Copied the full path".to_string()),
+            Ok(()) => self.set_notice(format!("Copied {} paths", group_digits(paths.len() as u64))),
+            Err(error) => self.set_notice(format!("Could not copy: {error}")),
+        }
+    }
+
+    /// Drags the selection out to Explorer or another app.
+    fn drag_selection(&mut self) {
+        let paths = self.selected_paths();
+        if paths.is_empty() {
+            return;
+        }
+        if let Err(error) = context_menu::drag_out(self.hwnd, &paths) {
+            self.set_notice(error);
+        }
+        self.refresh_soon(&paths);
+    }
+
     fn set_selected(&mut self, row: Option<usize>) {
         let had_selection = self.selected.is_some();
         self.selected = row.filter(|&row| row < self.model.result_count());
@@ -2016,7 +2328,7 @@ impl Ui {
         }
         let current = self.selected.map(|row| row as isize).unwrap_or(-1);
         let next = (current + delta).clamp(0, count as isize - 1);
-        self.select_row(next as usize);
+        self.go_to_row(next as usize);
     }
 
     fn page_rows(&self) -> isize {
@@ -2051,27 +2363,26 @@ impl Ui {
         self.open_row(row, reveal);
     }
 
-    fn copy_row_path(&mut self, row: usize) {
-        if let Some(path) = self.path_of(row) {
-            match context_menu::copy_text(self.hwnd, &path) {
-                Ok(()) => self.set_notice("Copied the full path".to_string()),
-                Err(error) => self.set_notice(format!("Could not copy: {error}")),
-            }
-        }
-    }
-
     fn show_context_menu(&mut self, row: usize) {
-        self.select_row(row);
+        // As in Explorer: inside the selection, the menu is for all of it;
+        // elsewhere, for that row alone.
+        self.refresh_marks();
+        if self.row_marked(row) {
+            self.select_row(row);
+        } else {
+            self.select_single(row);
+        }
+        self.refresh_marks();
         unsafe {
             UpdateWindow(self.hwnd);
         }
-        if let Some(path) = self.path_of(row) {
-            if let Err(error) =
-                context_menu::show(self.hwnd, &path, self.settings.use_shell_context_menu)
-            {
-                self.set_notice(format!("Context menu failed: {error}"));
-            }
+        let paths = self.selected_paths();
+        if let Err(error) =
+            context_menu::show(self.hwnd, &paths, self.settings.use_shell_context_menu)
+        {
+            self.set_notice(format!("Context menu failed: {error}"));
         }
+        self.refresh_soon(&paths);
     }
 
     // ----- File management ----------------------------------------------------
@@ -2109,15 +2420,21 @@ impl Ui {
 
     /// Copy (or cut) the selected result to the clipboard as a file.
     fn copy_selected(&mut self, cut: bool) {
-        let Some((path, _)) = self.selected_item() else {
+        let paths = self.selected_paths();
+        let Some(first) = paths.first() else {
             return;
         };
-        let name = path.rsplit('\\').next().unwrap_or(&path).to_string();
-        match fileops::set_clipboard_files(self.hwnd, std::slice::from_ref(&path), cut) {
+        let what = if paths.len() == 1 {
+            let name = first.rsplit('\\').next().unwrap_or(first);
+            format!("\u{201c}{name}\u{201d}")
+        } else {
+            format!("{} items", group_digits(paths.len() as u64))
+        };
+        match fileops::set_clipboard_files(self.hwnd, &paths, cut) {
             Ok(()) if cut => self.set_notice(format!(
-                "Cut \u{201c}{name}\u{201d}. Paste it into a folder here or in Explorer."
+                "Cut {what}. Paste into a folder here or in Explorer."
             )),
-            Ok(()) => self.set_notice(format!("Copied \u{201c}{name}\u{201d}")),
+            Ok(()) => self.set_notice(format!("Copied {what}")),
             Err(error) => self.set_notice(format!("Could not copy: {error}")),
         }
     }
@@ -2161,10 +2478,10 @@ impl Ui {
     /// Delete moves the selected result to the Recycle Bin; Shift+Delete
     /// deletes it for good after asking.
     fn delete_selected(&mut self, permanently: bool) {
-        let Some((path, _)) = self.selected_item() else {
+        let paths = self.selected_paths();
+        let Some(path) = paths.first().cloned() else {
             return;
         };
-        let paths = vec![path.clone()];
         let shell = fileops::Shell::new(self.hwnd);
         let result = if permanently {
             if !fileops::confirm_permanent_delete(self.hwnd, &paths) {
@@ -2174,9 +2491,14 @@ impl Ui {
         } else {
             shell.recycle(&paths)
         };
-        let name = path.rsplit('\\').next().unwrap_or(&path).to_string();
+        let name = if paths.len() == 1 {
+            path.rsplit('\\').next().unwrap_or(&path).to_string()
+        } else {
+            format!("{} items", group_digits(paths.len() as u64))
+        };
         match result {
             Ok(fileops::Outcome::Done) => {
+                self.marks.clear();
                 self.set_notice(if permanently {
                     format!("Deleted \u{201c}{name}\u{201d}")
                 } else {
@@ -2453,21 +2775,9 @@ impl Ui {
             Button::Theme => self.toggle_theme(),
             Button::Details => self.toggle_details(),
             Button::Sidebar => self.toggle_sidebar(),
-            Button::Open => {
-                if let Some(row) = self.selected {
-                    self.open_row(row, false);
-                }
-            }
-            Button::Reveal => {
-                if let Some(row) = self.selected {
-                    self.open_row(row, true);
-                }
-            }
-            Button::CopyPath => {
-                if let Some(row) = self.selected {
-                    self.copy_row_path(row);
-                }
-            }
+            Button::Open => self.open_selected(false),
+            Button::Reveal => self.open_selected(true),
+            Button::CopyPath => self.copy_selected_paths(),
             Button::SortName => self.toggle_sort(sort::COLUMN_NAME),
             Button::SortSize => self.toggle_sort(sort::COLUMN_SIZE),
             Button::SortModified => self.toggle_sort(sort::COLUMN_MODIFIED),
@@ -3050,6 +3360,21 @@ impl Ui {
                     self.invalidate();
                 }
             }
+            Drag::Row {
+                x: from_x,
+                y: from_y,
+                ..
+            } => {
+                if (x - from_x).abs() > 5.0 || (y - from_y).abs() > 5.0 {
+                    self.drag = Drag::None;
+                    self.pressed = Hit::None;
+                    unsafe {
+                        ReleaseCapture();
+                    }
+                    self.drag_selection();
+                    self.invalidate();
+                }
+            }
             Drag::None => {
                 let hit = self.hit_at(x, y);
                 self.set_hover(hit);
@@ -3083,7 +3408,28 @@ impl Ui {
             }
             Hit::Row(row) => {
                 self.list_focus = true;
-                self.select_row(row);
+                let control = key_down(VK_CONTROL);
+                let mut collapse = false;
+                if shift {
+                    self.extend_to(row, control);
+                } else if control {
+                    self.toggle_row(row);
+                } else if self.multi() && self.row_marked(row) {
+                    // Kept for dragging them all; a click alone picks it.
+                    self.select_row(row);
+                    collapse = true;
+                } else {
+                    self.select_single(row);
+                }
+                self.drag = Drag::Row {
+                    row,
+                    x,
+                    y,
+                    collapse,
+                };
+                unsafe {
+                    SetCapture(self.hwnd);
+                }
             }
             Hit::ScrollThumb => {
                 self.drag = Drag::Thumb {
@@ -3148,6 +3494,13 @@ impl Ui {
             self.set_hover(hit);
             return;
         }
+        if let Drag::Row { row, collapse, .. } = drag {
+            if collapse {
+                self.select_single(row);
+            }
+            self.invalidate();
+            return;
+        }
         let was_dragging = !matches!(drag, Drag::None | Drag::Nav { .. });
         if was_dragging {
             self.invalidate();
@@ -3208,8 +3561,8 @@ impl Ui {
         match key {
             VK_LEFT => self.field.move_left(shift, control),
             VK_RIGHT => self.field.move_right(shift, control),
-            VK_HOME if control => self.select_row(0),
-            VK_END if control => self.select_row(usize::MAX),
+            VK_HOME if control => self.go_to_row(0),
+            VK_END if control => self.go_to_row(usize::MAX),
             VK_HOME => self.field.home(shift),
             VK_END => self.field.end(shift),
             VK_BACK => edited = self.field.backspace(control),
@@ -3226,15 +3579,7 @@ impl Ui {
             VK_DOWN => self.move_selection(1),
             VK_PRIOR => self.move_selection(-self.page_rows()),
             VK_NEXT => self.move_selection(self.page_rows()),
-            VK_RETURN => {
-                if let Some(row) = self.selected {
-                    if control {
-                        self.open_row(row, true);
-                    } else {
-                        self.activate_row(row);
-                    }
-                }
-            }
+            VK_RETURN => self.open_selected(control),
             VK_APPS => {
                 if let Some(row) = self.selected {
                     self.show_context_menu(row);
@@ -3245,7 +3590,14 @@ impl Ui {
                     self.show_context_menu(row);
                 }
             }
-            _ if control && key == b'A' as u16 => self.field.select_all(),
+            _ if control && key == b'A' as u16 => {
+                if self.list_focus {
+                    self.select_all_results();
+                } else {
+                    self.field.select_all();
+                }
+            }
+            _ if control && shift && key == b'C' as u16 => self.copy_selected_paths(),
             _ if control && key == b'C' as u16 => {
                 if !self.list_focus && self.field.has_selection() {
                     let _ = context_menu::copy_text(self.hwnd, &self.field.selected_text());
@@ -3313,6 +3665,7 @@ impl Ui {
     fn build_frame(&mut self, opaque: bool, cache_icons: bool) -> FrameData {
         let now = Instant::now();
         self.tick();
+        self.refresh_marks();
         self.sync_motion(now);
         let list = self.layout.list;
         let count = self.model.result_count();
@@ -3337,31 +3690,38 @@ impl Ui {
                 size: self.cell_text(row, 2).unwrap_or_default(),
                 modified: self.cell_text(row, 3).unwrap_or_default(),
                 icon,
-                selected: self.selected == Some(row),
+                selected: self.row_marked(row),
             });
         }
 
         let rename = self.rename_view();
-        let details = self.selected.and_then(|row| {
-            let entry_ref = self.model.ids.get(row)?;
-            let entry = self.index.entry(entry_ref);
-            let name = String::from_utf16_lossy(entry.name_display);
-            let is_dir = entry.is_dir();
-            let totals = self.index.folder_totals(entry_ref);
-            Some(DetailsView {
-                icon: self.icons.index_for(&name, is_dir),
-                kind: self.cell_text(row, 4).unwrap_or_default(),
-                size: if is_dir && totals.is_none() {
-                    String::new()
-                } else {
-                    size_details(entry.size, self.settings.size_format)
-                },
-                items: totals
-                    .map(|(_, items)| item_count_text(items))
-                    .unwrap_or_default(),
-                modified: self.cell_text(row, 3).unwrap_or_default(),
-                folder: self.cell_text(row, 1).unwrap_or_default(),
-                name,
+        let summary = if self.multi() && self.marks_count > 1 {
+            self.marks_summary.clone()
+        } else {
+            None
+        };
+        let details = summary.or_else(|| {
+            self.selected.and_then(|row| {
+                let entry_ref = self.model.ids.get(row)?;
+                let entry = self.index.entry(entry_ref);
+                let name = String::from_utf16_lossy(entry.name_display);
+                let is_dir = entry.is_dir();
+                let totals = self.index.folder_totals(entry_ref);
+                Some(DetailsView {
+                    icon: self.icons.index_for(&name, is_dir),
+                    kind: self.cell_text(row, 4).unwrap_or_default(),
+                    size: if is_dir && totals.is_none() {
+                        String::new()
+                    } else {
+                        size_details(entry.size, self.settings.size_format)
+                    },
+                    items: totals
+                        .map(|(_, items)| item_count_text(items))
+                        .unwrap_or_default(),
+                    modified: self.cell_text(row, 3).unwrap_or_default(),
+                    folder: self.cell_text(row, 1).unwrap_or_default(),
+                    name,
+                })
             })
         });
 
@@ -3418,6 +3778,7 @@ impl Ui {
             .first()
             .map(|warning| format!("Warning: {warning}"));
         let items = self.index.item_count();
+        let picked = self.selection_count();
         let (notice, index_text) = match &self.indexer {
             // The first index: say what is being read.
             Some(indexer) if items == 0 => (
@@ -3433,6 +3794,14 @@ impl Ui {
                 warning.unwrap_or_else(|| self.notice.clone()),
                 format!("{} items", group_digits(items)),
             ),
+        };
+        let index_text = if picked > 1 {
+            format!(
+                "{index_text} \u{b7} {} selected",
+                group_digits(picked as u64)
+            )
+        } else {
+            index_text
         };
         // Entries pushed aside by a dragged tab, and the tab itself under
         // the pointer.
@@ -3503,6 +3872,7 @@ impl Ui {
             row_pill: self
                 .selected
                 .map(|_| list.t + (self.motion.row_top(now) - self.scroll) as f32),
+            multi: self.multi(),
             nav_pills,
             details_opacity: self.motion.details_opacity(now),
             rows,
@@ -3582,6 +3952,7 @@ impl Ui {
             pressed: self.pressed,
             hovers: data.hovers,
             row_pill: data.row_pill,
+            multi: data.multi,
             nav_pills: data.nav_pills,
             details_opacity: data.details_opacity,
             search: data.search,
@@ -3750,6 +4121,7 @@ struct FrameData {
     palette: Palette,
     hovers: Vec<(Hit, f32)>,
     row_pill: Option<f32>,
+    multi: bool,
     nav_pills: Vec<Rect>,
     details_opacity: f32,
     rows: Vec<RowView>,
@@ -4873,6 +5245,43 @@ pub fn run_scenarios(index: Arc<IndexSet>, screenshots: &Path) -> Result<(), Str
     }
     report.push_str(&format!(
         "38-folder-sizes: rows={count} size={size_cell} items={items} screenshot={}\n",
+        path.display()
+    ));
+
+    // Several results: a click, Ctrl+click and Shift+click, then Ctrl+A.
+    let (picked, all, paths) = unsafe {
+        ui_ref(hwnd)
+            .map(|ui| {
+                ui.select_single(0);
+                ui.toggle_row(2);
+                ui.extend_to(5, true);
+                ui.refresh_marks();
+                let picked = ui.selection_count();
+                let paths = ui.selected_paths().len();
+                ui.select_all_results();
+                ui.refresh_marks();
+                let all = (ui.selection_count(), ui.result_count());
+                ui.select_single(0);
+                ui.toggle_row(2);
+                ui.extend_to(5, true);
+                ui.refresh_marks();
+                (picked, all, paths)
+            })
+            .unwrap_or_default()
+    };
+    if picked != 5 || paths != 5 || all.0 != all.1 {
+        return Err(format!(
+            "scenario 39-multi-select: picked {picked} (5), paths {paths}, all {all:?}"
+        ));
+    }
+    let path = screenshots.join("39-multi-select.png");
+    unsafe {
+        if let Some(ui) = ui_ref(hwnd) {
+            ui.capture(&path)?;
+        }
+    }
+    report.push_str(&format!(
+        "39-multi-select: picked={picked} all={all:?} screenshot={}\n",
         path.display()
     ));
 

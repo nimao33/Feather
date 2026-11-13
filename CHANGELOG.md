@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### New
+
+- **Select several results**, as in Explorer: Ctrl+click, Shift+click,
+  Shift+arrows and Ctrl+A (in the list; in the search box it still selects
+  the text). Right-click shows Explorer's menu for all of them; drag them
+  out to Explorer or another app; Ctrl+C, Ctrl+X, Del, Shift+Del and Enter
+  work on all of them, and Ctrl+Shift+C copies every path. F2 renames the
+  focused one. The details pane sums them up (count, total size, types,
+  folder) and the bottom bar shows how many are selected. Picks stay
+  picked while you keep typing, as long as they're still found.
+
 ## 1.1.0
 
 ### New
