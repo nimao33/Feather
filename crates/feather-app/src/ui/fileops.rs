@@ -6,6 +6,7 @@
 //! the items on the clipboard as files (`CF_HDROP` plus "Preferred
 //! DropEffect"), so pasting in Explorer copies or moves them.
 
+use std::cell::RefCell;
 use std::ffi::c_void;
 
 use windows::core::HSTRING;
@@ -32,6 +33,239 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     MessageBoxW, IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_YESNO,
 };
+
+// ----- Undo ---------------------------------------------------------------
+
+/// What one file operation did, item by item, as Windows reported it.
+#[derive(Default)]
+pub struct Changes {
+    /// Renamed, moved or copied: the path before and the path it has now
+    /// (for a copy, the source and the new copy).
+    pub placed: Vec<(String, String)>,
+    /// Moved to the Recycle Bin: where it was, and its file in the bin
+    /// (`$Recycle.Bin\…\$R…`).
+    pub binned: Vec<(String, String)>,
+}
+
+/// A file operation Feather did, which Ctrl+Z can take back.
+pub enum Undoable {
+    /// Renamed or moved (before, after).
+    Moved(Vec<(String, String)>),
+    /// Copied (source, copy).
+    Copied(Vec<(String, String)>),
+    /// Recycled (where it was, its file in the bin).
+    Recycled(Vec<(String, String)>),
+}
+
+impl Undoable {
+    /// What the last operation did, if it can be taken back.
+    pub fn from_changes(changes: Changes, copy: bool) -> Option<Undoable> {
+        if !changes.binned.is_empty() {
+            Some(Undoable::Recycled(changes.binned))
+        } else if changes.placed.is_empty() {
+            None
+        } else if copy {
+            Some(Undoable::Copied(changes.placed))
+        } else {
+            Some(Undoable::Moved(changes.placed))
+        }
+    }
+
+    /// "the rename", "moving 3 items" and the like, for notices.
+    pub fn describe(&self) -> String {
+        let (count, one, many) = match self {
+            Undoable::Moved(pairs) => {
+                let renamed = pairs.iter().all(|(before, after)| {
+                    crate::text::parent_path(before)
+                        .eq_ignore_ascii_case(&crate::text::parent_path(after))
+                });
+                if renamed {
+                    (pairs.len(), "the rename", "renaming")
+                } else {
+                    (pairs.len(), "the move", "moving")
+                }
+            }
+            Undoable::Copied(pairs) => (pairs.len(), "the copy", "copying"),
+            Undoable::Recycled(items) => (items.len(), "the delete", "deleting"),
+        };
+        if count == 1 {
+            one.to_string()
+        } else {
+            format!("{many} {count} items")
+        }
+    }
+
+    /// Every path the operation touched, before and after, to refresh.
+    pub fn paths(&self) -> Vec<String> {
+        match self {
+            Undoable::Moved(pairs) | Undoable::Copied(pairs) => pairs
+                .iter()
+                .flat_map(|(before, after)| [before.clone(), after.clone()])
+                .collect(),
+            Undoable::Recycled(items) => items.iter().map(|(path, _)| path.clone()).collect(),
+        }
+    }
+}
+
+thread_local! {
+    /// What the last operation on this thread did ([`last_changes`]).
+    static LAST: RefCell<Changes> = RefCell::new(Changes::default());
+}
+
+/// What the last [`Shell`] operation did, for undo.
+pub fn last_changes() -> Changes {
+    LAST.with(|last| std::mem::take(&mut *last.borrow_mut()))
+}
+
+fn item_path(item: Option<&IShellItem>) -> Option<String> {
+    use windows::Win32::UI::Shell::SIGDN_FILESYSPATH;
+    let item = item?;
+    unsafe {
+        let name = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let text = name.to_string().ok();
+        CoTaskMemFree(Some(name.0 as *const c_void));
+        text
+    }
+}
+
+/// Hears where each item went while Windows works.
+#[windows::core::implement(IFileOperationProgressSink)]
+struct Progress;
+
+#[allow(non_snake_case)]
+impl windows::Win32::UI::Shell::IFileOperationProgressSink_Impl for Progress_Impl {
+    fn StartOperations(&self) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn FinishOperations(&self, _: windows::core::HRESULT) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn PreRenameItem(
+        &self,
+        _: u32,
+        _: windows::core::Ref<IShellItem>,
+        _: &windows::core::PCWSTR,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn PostRenameItem(
+        &self,
+        _: u32,
+        item: windows::core::Ref<IShellItem>,
+        _: &windows::core::PCWSTR,
+        result: windows::core::HRESULT,
+        created: windows::core::Ref<IShellItem>,
+    ) -> windows::core::Result<()> {
+        placed(item.as_ref(), result, created.as_ref());
+        Ok(())
+    }
+    fn PreMoveItem(
+        &self,
+        _: u32,
+        _: windows::core::Ref<IShellItem>,
+        _: windows::core::Ref<IShellItem>,
+        _: &windows::core::PCWSTR,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn PostMoveItem(
+        &self,
+        _: u32,
+        item: windows::core::Ref<IShellItem>,
+        _: windows::core::Ref<IShellItem>,
+        _: &windows::core::PCWSTR,
+        result: windows::core::HRESULT,
+        created: windows::core::Ref<IShellItem>,
+    ) -> windows::core::Result<()> {
+        placed(item.as_ref(), result, created.as_ref());
+        Ok(())
+    }
+    fn PreCopyItem(
+        &self,
+        _: u32,
+        _: windows::core::Ref<IShellItem>,
+        _: windows::core::Ref<IShellItem>,
+        _: &windows::core::PCWSTR,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn PostCopyItem(
+        &self,
+        _: u32,
+        item: windows::core::Ref<IShellItem>,
+        _: windows::core::Ref<IShellItem>,
+        _: &windows::core::PCWSTR,
+        result: windows::core::HRESULT,
+        created: windows::core::Ref<IShellItem>,
+    ) -> windows::core::Result<()> {
+        placed(item.as_ref(), result, created.as_ref());
+        Ok(())
+    }
+    fn PreDeleteItem(
+        &self,
+        _: u32,
+        _: windows::core::Ref<IShellItem>,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn PostDeleteItem(
+        &self,
+        _: u32,
+        item: windows::core::Ref<IShellItem>,
+        result: windows::core::HRESULT,
+        created: windows::core::Ref<IShellItem>,
+    ) -> windows::core::Result<()> {
+        // Recycled items come back as their place in the bin; deleted for
+        // good, there is none.
+        if let (true, Some(path), Some(binned)) = (
+            result.is_ok(),
+            item_path(item.as_ref()),
+            item_path(created.as_ref()),
+        ) {
+            LAST.with(|last| last.borrow_mut().binned.push((path, binned)));
+        }
+        Ok(())
+    }
+    fn PreNewItem(
+        &self,
+        _: u32,
+        _: windows::core::Ref<IShellItem>,
+        _: &windows::core::PCWSTR,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn PostNewItem(
+        &self,
+        _: u32,
+        _: windows::core::Ref<IShellItem>,
+        _: &windows::core::PCWSTR,
+        _: &windows::core::PCWSTR,
+        _: u32,
+        _: windows::core::HRESULT,
+        _: windows::core::Ref<IShellItem>,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn UpdateProgress(&self, _: u32, _: u32) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn ResetTimer(&self) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn PauseTimer(&self) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn ResumeTimer(&self) -> windows::core::Result<()> {
+        Ok(())
+    }
+}
+
+fn placed(item: Option<&IShellItem>, result: windows::core::HRESULT, created: Option<&IShellItem>) {
+    if let (true, Some(before), Some(after)) = (result.is_ok(), item_path(item), item_path(created))
+    {
+        LAST.with(|last| last.borrow_mut().placed.push((before, after)));
+    }
+}
 
 /// `DROPEFFECT_COPY | DROPEFFECT_LINK`, what Explorer's Copy offers.
 pub const EFFECT_COPY: u32 = 1 | 4;
@@ -327,7 +561,13 @@ impl Shell {
     }
 
     unsafe fn run(&self, operation: &IFileOperation) -> Result<Outcome, String> {
+        LAST.with(|last| *last.borrow_mut() = Changes::default());
+        let sink: IFileOperationProgressSink = Progress.into();
+        let cookie = operation.Advise(&sink).ok();
         let performed = operation.PerformOperations();
+        if let Some(cookie) = cookie {
+            let _ = operation.Unadvise(cookie);
+        }
         let aborted = operation
             .GetAnyOperationsAborted()
             .map(|aborted| aborted.as_bool())
@@ -391,6 +631,96 @@ impl Shell {
         }
     }
 
+    /// Moves or copies each item to the exact path given (folder and name),
+    /// for undo and redo.
+    pub fn place(&self, moves: &[(String, String)], copy: bool) -> Result<Outcome, String> {
+        unsafe {
+            let operation = self.operation(FOF_ALLOWUNDO)?;
+            for (from, to) in moves {
+                let item = shell_item(from)?;
+                let folder = shell_item(&crate::text::parent_path(to))?;
+                let name = HSTRING::from(to.rsplit('\\').next().unwrap_or(to));
+                if copy {
+                    operation.CopyItem(&item, &folder, &name, None::<&IFileOperationProgressSink>)
+                } else {
+                    operation.MoveItem(&item, &folder, &name, None::<&IFileOperationProgressSink>)
+                }
+                .map_err(|error| error.message())?;
+            }
+            self.run(&operation)
+        }
+    }
+
+    /// Puts items back from the Recycle Bin where they were, with the
+    /// bin's own Restore.
+    pub fn restore(&self, binned: &[(String, String)]) -> Result<Outcome, String> {
+        use windows::core::PCSTR;
+        use windows::Win32::UI::Shell::{
+            BHID_EnumItems, BHID_SFUIObject, FOLDERID_RecycleBinFolder, IContextMenu,
+            IEnumShellItems, SHGetKnownFolderItem, CMF_NORMAL, CMINVOKECOMMANDINFO,
+            KF_FLAG_DEFAULT,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::{CreatePopupMenu, DestroyMenu};
+        const CMIC_MASK_FLAG_NO_UI: u32 = 0x400;
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            // Restore is a verb of the Recycle Bin's own entries, so find
+            // the entry for each file in the bin.
+            let bin: IShellItem =
+                SHGetKnownFolderItem(&FOLDERID_RecycleBinFolder, KF_FLAG_DEFAULT, None)
+                    .map_err(|error| error.message())?;
+            let entries: IEnumShellItems = bin
+                .BindToHandler(None, &BHID_EnumItems)
+                .map_err(|error| error.message())?;
+            let mut found: Vec<(&str, IShellItem)> = Vec::new();
+            loop {
+                let mut next = [None];
+                let mut fetched = 0u32;
+                if entries.Next(&mut next, Some(&mut fetched)).is_err() || fetched == 0 {
+                    break;
+                }
+                let Some(entry) = next[0].take() else {
+                    break;
+                };
+                if let Some(file) = item_path(Some(&entry)) {
+                    if let Some((original, _)) = binned
+                        .iter()
+                        .find(|(_, binned)| binned.eq_ignore_ascii_case(&file))
+                    {
+                        found.push((original, entry));
+                    }
+                }
+                if found.len() == binned.len() {
+                    break;
+                }
+            }
+            if found.is_empty() {
+                return Err("It isn't in the Recycle Bin anymore.".into());
+            }
+            for (path, item) in found {
+                let menu: IContextMenu = item
+                    .BindToHandler(None, &BHID_SFUIObject)
+                    .map_err(|error| format!("{path}: {}", error.message()))?;
+                // Some handlers only know their verbs once asked for a menu.
+                if let Ok(popup) = CreatePopupMenu() {
+                    let _ = menu.QueryContextMenu(popup, 0, 1, 0x7fff, CMF_NORMAL);
+                    let _ = DestroyMenu(popup);
+                }
+                let info = CMINVOKECOMMANDINFO {
+                    cbSize: std::mem::size_of::<CMINVOKECOMMANDINFO>() as u32,
+                    fMask: if self.silent { CMIC_MASK_FLAG_NO_UI } else { 0 },
+                    hwnd: HWND(self.owner),
+                    lpVerb: PCSTR(c"undelete".as_ptr() as *const u8),
+                    nShow: 1,
+                    ..Default::default()
+                };
+                menu.InvokeCommand(&info)
+                    .map_err(|error| format!("{path}: {}", error.message()))?;
+            }
+            Ok(Outcome::Done)
+        }
+    }
+
     /// Copies or moves items into `folder`. Windows shows its progress and
     /// asks about name conflicts. Copying into the folder the items are
     /// already in makes "name - Copy" files, as Explorer does.
@@ -421,7 +751,6 @@ impl Shell {
     }
 }
 
-/// Asks before deleting for good. True to go ahead.
 /// Asks before opening many results at once.
 pub fn confirm_open_many(owner: windows_sys::Win32::Foundation::HWND, count: usize) -> bool {
     let answer = unsafe {
@@ -435,6 +764,7 @@ pub fn confirm_open_many(owner: windows_sys::Win32::Foundation::HWND, count: usi
     answer == IDYES
 }
 
+/// Asks before deleting for good. True to go ahead.
 pub fn confirm_permanent_delete(
     owner: windows_sys::Win32::Foundation::HWND,
     paths: &[String],
@@ -603,6 +933,32 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "puts a scratch file in the real Recycle Bin and back"]
+    fn recycled_items_come_back() {
+        let dir = temp_dir("bin");
+        let shell = Shell {
+            owner: std::ptr::null_mut(),
+            silent: true,
+        };
+        let file = dir.join(format!("feather-undo-test-{}.txt", std::process::id()));
+        std::fs::write(&file, b"back").unwrap();
+        let path = file.to_string_lossy().to_string();
+        assert_eq!(
+            shell.recycle(std::slice::from_ref(&path)),
+            Ok(Outcome::Done)
+        );
+        assert!(!file.exists());
+        let Some(Undoable::Recycled(items)) = Undoable::from_changes(last_changes(), false) else {
+            panic!("the delete wasn't reported");
+        };
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].0, path);
+        assert_eq!(shell.restore(&items), Ok(Outcome::Done));
+        assert_eq!(std::fs::read(&file).unwrap(), b"back");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn shell_operations_rename_copy_move_and_delete() {
         let dir = temp_dir("shell");
         let shell = Shell {
@@ -620,10 +976,24 @@ mod tests {
         assert_eq!(shell.rename(&text(&file), "final.txt"), Ok(Outcome::Done));
         let renamed = from.join("final.txt");
         assert!(renamed.is_file() && !file.exists());
+        // Undo puts the old name back, redo the new one.
+        let Some(Undoable::Moved(pairs)) = Undoable::from_changes(last_changes(), false) else {
+            panic!("the rename wasn't reported");
+        };
+        assert_eq!(pairs, vec![(text(&file), text(&renamed))]);
+        let back: Vec<_> = pairs.iter().map(|(a, b)| (b.clone(), a.clone())).collect();
+        assert_eq!(shell.place(&back, false), Ok(Outcome::Done));
+        assert!(file.is_file() && !renamed.exists());
+        assert_eq!(shell.place(&pairs, false), Ok(Outcome::Done));
+        assert!(renamed.is_file() && !file.exists());
 
         let pasted = vec![text(&renamed)];
         assert_eq!(shell.paste(&pasted, &text(&to), false), Ok(Outcome::Done));
         assert!(to.join("final.txt").is_file() && renamed.is_file());
+        let Some(Undoable::Copied(copies)) = Undoable::from_changes(last_changes(), true) else {
+            panic!("the copy wasn't reported");
+        };
+        assert_eq!(copies, vec![(text(&renamed), text(&to.join("final.txt")))]);
         // Copying into the same folder makes a second copy beside it.
         assert_eq!(shell.paste(&pasted, &text(&from), false), Ok(Outcome::Done));
         assert_eq!(std::fs::read_dir(&from).unwrap().count(), 2);

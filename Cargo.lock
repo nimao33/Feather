@@ -329,6 +329,7 @@ dependencies = [
  "rustls",
  "tiny-skia",
  "windows",
+ "windows-core",
  "windows-numerics",
  "windows-sys 0.61.2",
  "x11rb",

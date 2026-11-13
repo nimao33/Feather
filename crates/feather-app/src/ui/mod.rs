@@ -105,6 +105,8 @@ const TIMER_CARET: usize = 3;
 const TIMER_TRIM: usize = 4;
 /// The least time between two live updates of the visible results.
 const LIVE_EVERY: Duration = Duration::from_secs(3);
+/// How long after Feather's own file operation live updates skip that wait.
+const LIVE_HURRY: Duration = Duration::from_secs(6);
 /// Checks once a second whether a game or other full-screen app is in
 /// front, to set the shortcut aside while it is.
 const TIMER_FULLSCREEN: usize = 9;
@@ -289,6 +291,13 @@ pub struct Ui {
     /// When the last live snapshot was shown: changes are taken in at most
     /// every few seconds, so a busy drive doesn't keep the list moving.
     live_shown: Option<Instant>,
+    /// Feather itself just changed files: live updates come in as soon as
+    /// they arrive for a few seconds, without the usual wait.
+    live_hurry: Option<Instant>,
+    /// File operations Ctrl+Z can take back, newest last, and those Ctrl+Y
+    /// can do again.
+    undo: Vec<fileops::Undoable>,
+    redo: Vec<fileops::Undoable>,
     /// A live snapshot was taken in while hidden; search it when shown.
     live_stale: bool,
     /// The live overlay is large: fold it into a new base when idle.
@@ -447,6 +456,9 @@ impl Ui {
             live_off: false,
             live_pending: None,
             live_shown: None,
+            live_hurry: None,
+            undo: Vec::new(),
+            redo: Vec::new(),
             live_stale: false,
             fold_wanted: false,
             pending_rebuild: Vec::new(),
@@ -1060,10 +1072,12 @@ impl Ui {
         }
         // Live changes wait while a rename is being typed, and come in at
         // most every few seconds while the window is shown.
+        let hurry = self.live_hurry.is_some_and(|at| at.elapsed() < LIVE_HURRY);
         let calm = self.rename.is_none()
-            && self
-                .live_shown
-                .is_none_or(|at| at.elapsed() >= LIVE_EVERY || !self.is_shown());
+            && (hurry
+                || self
+                    .live_shown
+                    .is_none_or(|at| at.elapsed() >= LIVE_EVERY || !self.is_shown()));
         if self.swap.is_none() && calm {
             if let Some(set) = self.live_pending.take() {
                 self.live_shown = Some(Instant::now());
@@ -2400,6 +2414,12 @@ impl Ui {
     /// change journal reports the change within about a second, without a
     /// rebuild.
     fn refresh_soon(&mut self, paths: &[String]) {
+        // The change journal reports it within about a second; that
+        // snapshot is shown at once. One waiting from before the change
+        // would bring back what was just deleted for a moment, and the
+        // next one holds everything it had.
+        self.live_hurry = Some(Instant::now());
+        self.live_pending = None;
         let roots = indexer::outermost_roots(&self.settings.index_roots);
         let live = self.live.is_some();
         for path in paths {
@@ -2415,6 +2435,134 @@ impl Ui {
         }
         if !self.refresh_roots.is_empty() {
             self.refresh_at = Some(Instant::now());
+        }
+    }
+
+    /// Remembers what the operation that just ran did, for Ctrl+Z.
+    fn record(&mut self, copy: bool) {
+        if let Some(done) = fileops::Undoable::from_changes(fileops::last_changes(), copy) {
+            self.undo.push(done);
+            if self.undo.len() > 50 {
+                self.undo.remove(0);
+            }
+            self.redo.clear();
+        }
+    }
+
+    /// Ctrl+Z: takes back Feather's last rename, move, copy or delete.
+    fn undo_last(&mut self) {
+        let Some(done) = self.undo.pop() else {
+            self.set_notice("Nothing to undo".into());
+            return;
+        };
+        let shell = fileops::Shell::new(self.hwnd);
+        let result = match &done {
+            fileops::Undoable::Moved(pairs) => {
+                let back: Vec<_> = pairs
+                    .iter()
+                    .map(|(before, after)| (after.clone(), before.clone()))
+                    .collect();
+                shell.place(&back, false)
+            }
+            fileops::Undoable::Copied(pairs) => {
+                let copies: Vec<_> = pairs.iter().map(|(_, copy)| copy.clone()).collect();
+                shell.recycle(&copies)
+            }
+            fileops::Undoable::Recycled(items) => shell.restore(items),
+        };
+        let _ = fileops::last_changes();
+        let what = done.describe();
+        self.refresh_soon(&done.paths());
+        match result {
+            Ok(fileops::Outcome::Done) => {
+                self.set_notice(format!("Undid {what}. Ctrl+Y does it again."));
+                self.redo.push(done);
+            }
+            Ok(fileops::Outcome::Aborted) => {}
+            Err(error) => self.set_notice(format!("Couldn't undo {what}: {error}")),
+        }
+    }
+
+    /// Ctrl+Y: does again what Ctrl+Z took back.
+    fn redo_last(&mut self) {
+        let Some(done) = self.redo.pop() else {
+            self.set_notice("Nothing to redo".into());
+            return;
+        };
+        let shell = fileops::Shell::new(self.hwnd);
+        let copy = matches!(done, fileops::Undoable::Copied(_));
+        let result = match &done {
+            fileops::Undoable::Moved(pairs) => shell.place(pairs, false),
+            fileops::Undoable::Copied(pairs) => shell.place(pairs, true),
+            fileops::Undoable::Recycled(items) => {
+                let paths: Vec<_> = items.iter().map(|(path, _)| path.clone()).collect();
+                shell.recycle(&paths)
+            }
+        };
+        let what = done.describe();
+        self.refresh_soon(&done.paths());
+        match result {
+            Ok(fileops::Outcome::Done) => {
+                // The new places (a new spot in the bin, say) are what the
+                // next Ctrl+Z takes back.
+                if let Some(again) = fileops::Undoable::from_changes(fileops::last_changes(), copy)
+                {
+                    self.undo.push(again);
+                }
+                self.set_notice(format!("Redid {what}"));
+            }
+            Ok(fileops::Outcome::Aborted) => {
+                let _ = fileops::last_changes();
+            }
+            Err(error) => {
+                let _ = fileops::last_changes();
+                self.set_notice(format!("Couldn't redo {what}: {error}"));
+            }
+        }
+    }
+
+    /// Takes deleted results out of the list at once, before the change
+    /// journal confirms it.
+    fn drop_rows(&mut self, gone: &std::collections::HashSet<feather_core::EntryRef>) {
+        if gone.is_empty() {
+            return;
+        }
+        let first = self
+            .model
+            .ids
+            .iter()
+            .position(|entry| gone.contains(&entry));
+        let kept: Vec<_> = self
+            .model
+            .ids
+            .iter()
+            .filter(|entry| !gone.contains(entry))
+            .collect();
+        let removed = self.model.ids.len() - kept.len();
+        self.model.ids = crate::rows::Rows::from_refs(kept);
+        self.model.total = self.model.total.saturating_sub(removed as u64);
+        self.marks.clear();
+        self.rename = None;
+        let count = self.model.result_count();
+        match first {
+            Some(row) if count > 0 => self.select_single(row.min(count - 1)),
+            _ => self.set_selected(None),
+        }
+    }
+
+    /// The selected results' entries.
+    fn selected_entries(&self) -> std::collections::HashSet<feather_core::EntryRef> {
+        if self.multi() {
+            self.model
+                .ids
+                .iter()
+                .filter(|&entry| self.marks.contains(entry))
+                .collect()
+        } else {
+            self.selected
+                .and_then(|row| self.model.ids.get(row))
+                .into_iter()
+                .collect()
         }
     }
 
@@ -2461,12 +2609,14 @@ impl Ui {
                     format!("{count} items")
                 };
                 let verb = if files.cut { "Moved" } else { "Pasted" };
-                self.set_notice(format!("{verb} {what} into {folder}"));
+                self.set_notice(format!("{verb} {what} into {folder}. Ctrl+Z undoes it."));
+                self.record(!files.cut);
                 let mut changed = files.paths.clone();
                 changed.push(folder);
                 self.refresh_soon(&changed);
             }
             Ok(fileops::Outcome::Aborted) => {
+                self.record(!files.cut);
                 let mut changed = files.paths.clone();
                 changed.push(folder);
                 self.refresh_soon(&changed);
@@ -2482,6 +2632,7 @@ impl Ui {
         let Some(path) = paths.first().cloned() else {
             return;
         };
+        let gone = self.selected_entries();
         let shell = fileops::Shell::new(self.hwnd);
         let result = if permanently {
             if !fileops::confirm_permanent_delete(self.hwnd, &paths) {
@@ -2498,15 +2649,20 @@ impl Ui {
         };
         match result {
             Ok(fileops::Outcome::Done) => {
-                self.marks.clear();
+                self.record(false);
+                self.drop_rows(&gone);
                 self.set_notice(if permanently {
                     format!("Deleted \u{201c}{name}\u{201d}")
                 } else {
-                    format!("Moved \u{201c}{name}\u{201d} to the Recycle Bin")
+                    format!("Moved \u{201c}{name}\u{201d} to the Recycle Bin. Ctrl+Z puts it back.")
                 });
                 self.refresh_soon(&paths);
             }
-            Ok(fileops::Outcome::Aborted) => {}
+            Ok(fileops::Outcome::Aborted) => {
+                // Some may be gone already.
+                self.record(false);
+                self.refresh_soon(&paths);
+            }
             Err(error) => self.set_notice(format!("Could not delete {name}: {error}")),
         }
     }
@@ -2573,7 +2729,10 @@ impl Ui {
         match result {
             Ok(fileops::Outcome::Done) => {
                 let new_path = format!("{}\\{name}", parent_path(&rename.path));
-                self.set_notice(format!("Renamed to \u{201c}{name}\u{201d}"));
+                self.set_notice(format!(
+                    "Renamed to \u{201c}{name}\u{201d}. Ctrl+Z undoes it."
+                ));
+                self.record(false);
                 self.reselect = Some(new_path.clone());
                 self.refresh_soon(&[rename.path, new_path]);
             }
@@ -3598,6 +3757,14 @@ impl Ui {
                 }
             }
             _ if control && shift && key == b'C' as u16 => self.copy_selected_paths(),
+            // Undo and redo Feather's own file operations, from the list.
+            _ if control && self.list_focus && key == b'Z' as u16 && !shift => self.undo_last(),
+            _ if control
+                && self.list_focus
+                && (key == b'Y' as u16 || (key == b'Z' as u16 && shift)) =>
+            {
+                self.redo_last()
+            }
             _ if control && key == b'C' as u16 => {
                 if !self.list_focus && self.field.has_selection() {
                     let _ = context_menu::copy_text(self.hwnd, &self.field.selected_text());

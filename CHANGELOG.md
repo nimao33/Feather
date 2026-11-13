@@ -12,6 +12,15 @@
   focused one. The details pane sums them up (count, total size, types,
   folder) and the bottom bar shows how many are selected. Picks stay
   picked while you keep typing, as long as they're still found.
+- **Undo and redo.** Ctrl+Z takes back Feather's last rename, move, paste
+  or delete (deleted items come back from the Recycle Bin); Ctrl+Y or
+  Ctrl+Shift+Z does it again. Up to 50 steps.
+
+### Changed
+
+- Deleting from Feather takes the items out of the list at once, and
+  after any rename, move or paste the results update as soon as Windows
+  reports the change instead of waiting a few seconds.
 
 ## 1.1.0
 
